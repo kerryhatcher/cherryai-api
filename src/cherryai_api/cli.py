@@ -11,6 +11,8 @@ sessions_app = typer.Typer(help="Inspect chat sessions.")
 app.add_typer(sessions_app, name="sessions")
 wiki_app = typer.Typer(help="Inspect the wiki.")
 app.add_typer(wiki_app, name="wiki")
+feedback_app = typer.Typer(help="Inspect feedback (bugs, features, user stories).")
+app.add_typer(feedback_app, name="feedback")
 
 
 @app.command()
@@ -95,6 +97,60 @@ def wiki_search(query: str) -> None:
     """Full-text search the wiki and print matching pages."""
     from cherryai_api.db import build_database
     from cherryai_api.wiki import format_search_results, search_entries
+
+    async def _run() -> None:
+        db = build_database()
+        await db.connect()
+        try:
+            hits = await search_entries(db.pool, query)
+        finally:
+            await db.close()
+        typer.echo(format_search_results(hits))
+
+    asyncio.run(_run())
+
+
+@feedback_app.command("list")
+def feedback_list(
+    status: str = typer.Option(None, "--status", help="Filter by status."),
+    type: str = typer.Option(None, "--type", help="Filter by type."),
+    priority: str = typer.Option(None, "--priority", help="Filter by priority."),
+) -> None:
+    """List feedback entries, newest-updated first."""
+    from cherryai_api.db import build_database
+    from cherryai_api.feedback import list_entries
+
+    async def _run() -> None:
+        db = build_database()
+        await db.connect()
+        try:
+            entries = await list_entries(
+                db.pool, type=type, status=status, priority=priority
+            )
+        finally:
+            await db.close()
+        if not entries:
+            typer.echo("No feedback entries yet.")
+            return
+        for entry in entries:
+            tags = f"  [{', '.join(entry.tags)}]" if entry.tags else ""
+            typer.echo(
+                f"#{entry.id}  {entry.updated_at:%Y-%m-%d %H:%M}  "
+                f"[{entry.type}/{entry.status}/{entry.priority}]  {entry.title}{tags}"
+            )
+
+    try:
+        asyncio.run(_run())
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+
+@feedback_app.command("search")
+def feedback_search(query: str) -> None:
+    """Full-text search feedback and print matching entries."""
+    from cherryai_api.db import build_database
+    from cherryai_api.feedback import format_search_results, search_entries
 
     async def _run() -> None:
         db = build_database()
