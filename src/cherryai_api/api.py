@@ -173,10 +173,7 @@ async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
                         if final:
                             yield {"event": "token", "data": final}
                     if not final:
-                        final = (
-                            "The model returned an empty response — "
-                            "please try again."
-                        )
+                        final = "The model returned an empty response — please try again."
                     await db.add_message(session_id, "assistant", final)
                     _remember_turn_in_background(memory, prompt, final)
                     yield {"event": "done", "data": json.dumps({"content": final})}

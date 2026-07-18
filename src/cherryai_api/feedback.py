@@ -52,13 +52,11 @@ CREATE INDEX IF NOT EXISTS feedback_entries_search_idx
 
 _SEARCH_LIMIT = 10
 _HEADLINE_OPTS = (
-    "StartSel=<mark>, StopSel=</mark>, "
-    "MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
+    "StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
 )
 _MARK_RE = re.compile(r"</?mark>")
 _ENTRY_COLUMNS = (
-    "id, title, tags, type, status, priority, body, investigation, plan, "
-    "created_at, updated_at"
+    "id, title, tags, type, status, priority, body, investigation, plan, created_at, updated_at"
 )
 
 
@@ -166,9 +164,7 @@ async def list_entries(
 
 async def get_entry(pool: asyncpg.Pool, id: int) -> FeedbackEntry | None:
     """Return the full entry for an id, or None if it does not exist."""
-    row = await pool.fetchrow(
-        f"SELECT {_ENTRY_COLUMNS} FROM feedback_entries WHERE id = $1", id
-    )
+    row = await pool.fetchrow(f"SELECT {_ENTRY_COLUMNS} FROM feedback_entries WHERE id = $1", id)
     return FeedbackEntry(**dict(row)) if row else None
 
 
@@ -199,9 +195,7 @@ async def create_entry(pool: asyncpg.Pool, data: FeedbackCreate) -> FeedbackEntr
     return FeedbackEntry(**dict(row))
 
 
-async def update_entry(
-    pool: asyncpg.Pool, id: int, data: FeedbackUpdate
-) -> FeedbackEntry | None:
+async def update_entry(pool: asyncpg.Pool, id: int, data: FeedbackUpdate) -> FeedbackEntry | None:
     """Update the provided fields of an entry, bumping updated_at.
 
     Returns None if the id does not exist; raises :class:`ValueError` on a
@@ -314,9 +308,7 @@ async def list_feedback(
     priority: str | None = None,
 ) -> list[dict]:
     try:
-        entries = await list_entries(
-            _pool(request), type=type, status=status, priority=priority
-        )
+        entries = await list_entries(_pool(request), type=type, status=status, priority=priority)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return [entry.model_dump(mode="json") for entry in entries]

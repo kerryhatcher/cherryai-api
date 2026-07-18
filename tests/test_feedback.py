@@ -136,18 +136,14 @@ async def test_empty_title_raises(pool) -> None:
 
 async def test_create_invalid_type_raises(pool) -> None:
     with pytest.raises(ValueError):
-        await create_entry(
-            pool, FeedbackCreate(title=_unique_title("Bad Type"), type="epic")
-        )
+        await create_entry(pool, FeedbackCreate(title=_unique_title("Bad Type"), type="epic"))
 
 
 async def test_create_invalid_priority_raises(pool) -> None:
     with pytest.raises(ValueError):
         await create_entry(
             pool,
-            FeedbackCreate(
-                title=_unique_title("Bad Priority"), type="bug", priority="urgent"
-            ),
+            FeedbackCreate(title=_unique_title("Bad Priority"), type="bug", priority="urgent"),
         )
 
 
@@ -160,9 +156,7 @@ async def test_update_invalid_status_raises(pool) -> None:
 
 
 async def test_update_never_changes_id(pool) -> None:
-    created = await create_entry(
-        pool, FeedbackCreate(title=_unique_title("Stable Id"), type="bug")
-    )
+    created = await create_entry(pool, FeedbackCreate(title=_unique_title("Stable Id"), type="bug"))
     updated = await update_entry(
         pool, created.id, FeedbackUpdate(title=_unique_title("Renamed Entirely"))
     )
@@ -174,9 +168,7 @@ async def test_update_never_changes_id(pool) -> None:
 
 
 async def test_list_filters_by_type(pool) -> None:
-    bug = await create_entry(
-        pool, FeedbackCreate(title=_unique_title("Filter Bug"), type="bug")
-    )
+    bug = await create_entry(pool, FeedbackCreate(title=_unique_title("Filter Bug"), type="bug"))
     feature = await create_entry(
         pool, FeedbackCreate(title=_unique_title("Filter Feature"), type="feature")
     )
@@ -206,9 +198,7 @@ async def test_list_filters_by_priority(pool) -> None:
     )
     critical = await create_entry(
         pool,
-        FeedbackCreate(
-            title=_unique_title("Critical Priority"), type="bug", priority="critical"
-        ),
+        FeedbackCreate(title=_unique_title("Critical Priority"), type="bug", priority="critical"),
     )
     ids = [item.id for item in await list_entries(pool, priority="critical")]
     assert critical.id in ids

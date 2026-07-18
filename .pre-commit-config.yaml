@@ -1,0 +1,20 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: uv-audit
+        name: uv audit (dependency vulnerabilities)
+        # --ignore-until-fixed: suppressed only while no fixed release exists;
+        # resurfaces automatically once a fix ships.
+        # GHSA-w8v5-vhqr-4h9v: diskcache pickle deserialization (via cognee),
+        # no fix available as of 2026-07-18.
+        entry: uv audit --preview-features audit-command --ignore-until-fixed GHSA-w8v5-vhqr-4h9v
+        language: system
+        pass_filenames: false
+        files: ^(uv\.lock|pyproject\.toml)$

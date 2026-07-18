@@ -85,9 +85,7 @@ def wiki_list() -> None:
             return
         for entry in entries:
             tags = f"  [{', '.join(entry.tags)}]" if entry.tags else ""
-            typer.echo(
-                f"{entry.slug}  {entry.updated_at:%Y-%m-%d %H:%M}  {entry.title}{tags}"
-            )
+            typer.echo(f"{entry.slug}  {entry.updated_at:%Y-%m-%d %H:%M}  {entry.title}{tags}")
 
     asyncio.run(_run())
 
@@ -124,9 +122,7 @@ def feedback_list(
         db = build_database()
         await db.connect()
         try:
-            entries = await list_entries(
-                db.pool, type=type, status=status, priority=priority
-            )
+            entries = await list_entries(db.pool, type=type, status=status, priority=priority)
         finally:
             await db.close()
         if not entries:

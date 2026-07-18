@@ -176,12 +176,8 @@ def build_agent(
         """Fetch a URL and return its readable text, truncated sensibly."""
         logger.bind(url=url).debug("web_fetch")
         try:
-            async with httpx.AsyncClient(
-                timeout=_HTTP_TIMEOUT, follow_redirects=True
-            ) as client:
-                response = await client.get(
-                    url, headers={"User-Agent": "CherryAI/0.1 (+demo)"}
-                )
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
+                response = await client.get(url, headers={"User-Agent": "CherryAI/0.1 (+demo)"})
                 response.raise_for_status()
                 text = response.text
         except Exception as error:
@@ -245,9 +241,7 @@ def build_agent(
         return format_feedback_results(hits)
 
     @agent.tool_plain
-    async def create_feedback(
-        title: str, type: str, priority: str, description: str
-    ) -> str:
+    async def create_feedback(title: str, type: str, priority: str, description: str) -> str:
         """File a new bug, feature, or user story.
 
         Only call this when the user explicitly asks to file/record/track
@@ -296,9 +290,7 @@ async def stream_turn(
     """
     token = _memory_search_state.set({"count": 0})
     try:
-        async with agent.run_stream(
-            prompt, message_history=message_history or []
-        ) as result:
+        async with agent.run_stream(prompt, message_history=message_history or []) as result:
             async for delta in result.stream_text(delta=True):
                 yield ("token", delta)
             final = await result.get_output()

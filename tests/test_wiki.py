@@ -114,9 +114,7 @@ async def test_get_unknown_returns_none(pool) -> None:
 
 
 async def test_update_unknown_returns_none(pool) -> None:
-    result = await update_entry(
-        pool, "ztest-does-not-exist", WikiUpdate(body="nope")
-    )
+    result = await update_entry(pool, "ztest-does-not-exist", WikiUpdate(body="nope"))
     assert result is None
 
 

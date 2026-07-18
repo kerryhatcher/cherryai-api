@@ -87,8 +87,7 @@ class Database:
     async def create_session(self, title: str) -> Session:
         title = (title or "New chat").strip()[:_SESSION_TITLE_MAX] or "New chat"
         row = await self.pool.fetchrow(
-            "INSERT INTO sessions (id, title) VALUES ($1, $2) "
-            "RETURNING id, title, created_at",
+            "INSERT INTO sessions (id, title) VALUES ($1, $2) RETURNING id, title, created_at",
             uuid.uuid4(),
             title,
         )
@@ -114,9 +113,7 @@ class Database:
         )
         return [Message(**dict(row)) for row in rows]
 
-    async def add_message(
-        self, session_id: uuid.UUID, role: str, content: str
-    ) -> Message:
+    async def add_message(self, session_id: uuid.UUID, role: str, content: str) -> Message:
         row = await self.pool.fetchrow(
             "INSERT INTO messages (id, session_id, role, content) "
             "VALUES ($1, $2, $3, $4) "
@@ -136,9 +133,7 @@ class Database:
 
     async def set_title(self, session_id: uuid.UUID, title: str) -> None:
         title = (title or "New chat").strip()[:_SESSION_TITLE_MAX] or "New chat"
-        await self.pool.execute(
-            "UPDATE sessions SET title = $2 WHERE id = $1", session_id, title
-        )
+        await self.pool.execute("UPDATE sessions SET title = $2 WHERE id = $1", session_id, title)
 
 
 def make_session_title(first_user_message: str) -> str:

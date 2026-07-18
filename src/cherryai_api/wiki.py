@@ -36,8 +36,7 @@ CREATE INDEX IF NOT EXISTS wiki_entries_search_idx
 
 _SEARCH_LIMIT = 10
 _HEADLINE_OPTS = (
-    "StartSel=<mark>, StopSel=</mark>, "
-    "MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
+    "StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
 )
 _MARK_RE = re.compile(r"</?mark>")
 _ENTRY_COLUMNS = "id, slug, title, tags, body, created_at, updated_at"
@@ -114,17 +113,14 @@ async def ensure_wiki_table(pool: asyncpg.Pool) -> None:
 async def list_entries(pool: asyncpg.Pool) -> list[WikiListItem]:
     """Return all entries, newest-updated first, without bodies."""
     rows = await pool.fetch(
-        "SELECT id, slug, title, tags, updated_at FROM wiki_entries "
-        "ORDER BY updated_at DESC"
+        "SELECT id, slug, title, tags, updated_at FROM wiki_entries ORDER BY updated_at DESC"
     )
     return [WikiListItem(**dict(row)) for row in rows]
 
 
 async def get_entry(pool: asyncpg.Pool, slug: str) -> WikiEntry | None:
     """Return the full entry for a slug, or None if it does not exist."""
-    row = await pool.fetchrow(
-        f"SELECT {_ENTRY_COLUMNS} FROM wiki_entries WHERE slug = $1", slug
-    )
+    row = await pool.fetchrow(f"SELECT {_ENTRY_COLUMNS} FROM wiki_entries WHERE slug = $1", slug)
     return WikiEntry(**dict(row)) if row else None
 
 
@@ -155,9 +151,7 @@ async def create_entry(pool: asyncpg.Pool, data: WikiCreate) -> WikiEntry:
     return WikiEntry(**dict(row))
 
 
-async def update_entry(
-    pool: asyncpg.Pool, slug: str, data: WikiUpdate
-) -> WikiEntry | None:
+async def update_entry(pool: asyncpg.Pool, slug: str, data: WikiUpdate) -> WikiEntry | None:
     """Update the provided fields of an entry, bumping updated_at.
 
     The slug never changes so wikilinks stay stable. Returns None if the slug

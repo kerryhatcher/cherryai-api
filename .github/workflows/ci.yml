@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Ruff lint
+        run: uv run ruff check
+      - name: Ruff format check
+        run: uv run ruff format --check
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+      # --ignore-until-fixed: suppressed only while no fixed release exists.
+      # GHSA-w8v5-vhqr-4h9v: diskcache pickle deserialization (via cognee),
+      # no fix available as of 2026-07-18.
+      - name: uv audit
+        run: uv audit --preview-features audit-command --ignore-until-fixed GHSA-w8v5-vhqr-4h9v
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: cherryai
+          POSTGRES_PASSWORD: cherryai_dev
+          POSTGRES_DB: cherryai
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cherryai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://cherryai:cherryai_dev@localhost:5432/cherryai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run tests
+        run: uv run pytest
