@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cherryai-postgres
+    environment:
+      POSTGRES_DB: cherryai
+      POSTGRES_USER: cherryai
+      POSTGRES_PASSWORD: cherryai_dev
+    ports:
+      # Host 5442 -> container 5432 (5432 is taken by other services on this host).
+      - "5442:5432"
+    volumes:
+      - cherryai_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cherryai -d cherryai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5
+    container_name: cherryai-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/cherryai_dev
+    ports:
+      # Host 7484/7697 -> container 7474/7687 (defaults are taken on this host).
+      - "7484:7474"
+      - "7697:7687"
+    volumes:
+      - cherryai_neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  cherryai_pgdata:
+  cherryai_neo4jdata:
