@@ -1,0 +1,58 @@
+"""Application configuration loaded from environment and a project .env file."""
+
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """CherryAI API configuration.
+
+    Values come from the environment or a project-local ``.env`` file. Secrets
+    are never rendered in ``repr`` output so they cannot leak into logs.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- Language model (OpenRouter is the only supported chat provider) ---
+    openrouter_api_key: str = Field(default="", repr=False)
+    openrouter_model: str = "openrouter/free"
+
+    # --- Web search / fetch tools ---
+    tavily_api_key: str = Field(default="", repr=False)
+    brave_api_key: str = Field(default="", repr=False)
+
+    # --- Datastores ---
+    database_url: str = Field(
+        default="postgresql://cherryai:cherryai_dev@localhost:5432/cherryai",
+        repr=False,
+    )
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = Field(default="cherryai_dev", repr=False)
+
+    # --- Cognee memory ---
+    cognee_root_directory: str = "./.cognee"
+    cognee_dataset: str = "cherryai_chat_history"
+    cognee_session_id: str = "cherryai-chat"
+    # Small result set keeps recall focused on the current question.
+    cognee_recall_top_k: int = 3
+
+    # --- HTTP server ---
+    cors_origin: str = "http://localhost:5173"
+
+    @property
+    def asyncpg_dsn(self) -> str:
+        """Return a DSN asyncpg accepts (it rejects the ``+driver`` suffix)."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return a cached Settings instance so the .env is parsed once."""
+    return Settings()
