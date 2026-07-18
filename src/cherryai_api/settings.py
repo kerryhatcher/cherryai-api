@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # Small result set keeps recall focused on the current question.
     cognee_recall_top_k: int = 3
 
+    # --- Chat fact extraction (local Ollama; saves into the permanent Cognee graph) ---
+    fact_extraction_enabled: bool = True
+    fact_extraction_model: str = "qwen3:8b"
+    ollama_local_base_url: str = "http://localhost:11434/v1"
+
     # --- HTTP server ---
     # Comma-separated list of allowed browser origins.
     cors_origins: str = "http://localhost:5173"

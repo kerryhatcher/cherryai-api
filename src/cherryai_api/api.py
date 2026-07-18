@@ -17,6 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.agent import build_agent, run_turn, stream_turn
 from cherryai_api.db import build_database, make_session_title
+from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
@@ -47,6 +48,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.memory = memory
     app.state.workflows = workflows
     app.state.agent = agent
+    if settings.fact_extraction_enabled:
+        app.state.fact_extractor_agent = build_extractor_agent(settings)
+        app.state.fact_judge_agent = build_judge_agent(settings)
+    else:
+        app.state.fact_extractor_agent = None
+        app.state.fact_judge_agent = None
     logger.info("CherryAI API started")
     try:
         yield
@@ -138,6 +145,27 @@ def _remember_turn_in_background(memory, prompt: str, answer: str) -> None:
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _extract_facts_in_background(extractor_agent, judge_agent, memory, message: str) -> None:
+    """Extract and save durable facts from a user message without blocking the reply.
+
+    A no-op when fact extraction is disabled (agents are None). Any failure is
+    logged and swallowed by `extract_and_save_facts` itself; this wrapper only
+    guards against the task-spawning step failing.
+    """
+    if extractor_agent is None or judge_agent is None:
+        return
+
+    async def _run() -> None:
+        try:
+            await extract_and_save_facts(extractor_agent, judge_agent, memory, message)
+        except Exception as error:
+            logger.warning(f"Fact extraction pipeline failed: {error}")
+
+    task = asyncio.create_task(_run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 @app.post("/api/sessions/{session_id}/messages")
 async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
     """Persist the user message and stream the assistant reply as SSE."""
@@ -157,6 +185,9 @@ async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
     await db.add_message(session_id, "user", prompt)
     if was_empty:
         await db.set_title(session_id, make_session_title(prompt))
+    _extract_facts_in_background(
+        app.state.fact_extractor_agent, app.state.fact_judge_agent, memory, prompt
+    )
 
     history = await _load_history(db, session_id, exclude_last_user=prompt)
 

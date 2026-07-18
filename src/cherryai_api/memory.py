@@ -96,6 +96,9 @@ import cognee  # noqa: E402  (configuration above must run before this import)
 from cognee.modules.data.exceptions.exceptions import (  # noqa: E402
     DatasetNotFoundError,
 )
+from cognee.modules.users.exceptions.exceptions import (  # noqa: E402
+    PermissionDeniedError,
+)
 
 
 class CogneeMemory:
@@ -117,6 +120,42 @@ class CogneeMemory:
             # knowledge-graph extraction pipeline for chat turns.
             self_improvement=False,
         )
+
+    async def remember_fact(self, fact: str) -> None:
+        """Persist a durable fact into the permanent knowledge graph.
+
+        Unlike ``remember_turn``, no ``session_id`` is passed: Cognee runs
+        the full add + cognify pipeline into the durable graph dataset
+        rather than the fast session-only path used for chat turns.
+        """
+        _ = await cognee.remember(
+            fact,
+            dataset_name=self.dataset,
+            node_set=["user_facts"],
+        )
+
+    async def recall_facts(self, query: str) -> str:
+        """Recall existing durable facts similar to a candidate fact.
+
+        Facts live in the graph dataset only (no session_id), so this
+        queries that scope alone. Before the very first fact is ever saved,
+        the dataset does not exist yet, and Cognee raises
+        ``DatasetNotFoundError`` or, if backend access control has not
+        finished provisioning it, ``PermissionDeniedError`` — both mean "no
+        similar facts".
+        """
+        try:
+            results = await cognee.recall(
+                query,
+                datasets=[self.dataset],
+                scope=["graph"],
+                only_context=True,
+                auto_route=False,
+                top_k=self.top_k,
+            )
+        except (DatasetNotFoundError, PermissionDeniedError):
+            return _NO_SIMILAR_FACTS
+        return _format_results(results, empty_message=_NO_SIMILAR_FACTS)
 
     async def _recall(self, query: str, scope: list[str]) -> str:
         results = await cognee.recall(
@@ -143,7 +182,12 @@ class CogneeMemory:
             return await self._recall(query, ["session"])
 
 
-def _format_results(results: Sequence[Any]) -> str:
+_NO_SIMILAR_FACTS = "No similar facts were found."
+
+
+def _format_results(
+    results: Sequence[Any], empty_message: str = "No relevant chat history was found."
+) -> str:
     """Convert Cognee's typed recall responses into tool-friendly text."""
     memories: list[str] = []
     for result in results:
@@ -154,7 +198,7 @@ def _format_results(results: Sequence[Any]) -> str:
                 break
         else:
             memories.append(str(result))
-    return "\n\n".join(memories) if memories else "No relevant chat history was found."
+    return "\n\n".join(memories) if memories else empty_message
 
 
 def build_memory() -> CogneeMemory:
