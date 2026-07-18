@@ -9,6 +9,8 @@ import typer
 app = typer.Typer(help="CherryAI API management commands.", no_args_is_help=True)
 sessions_app = typer.Typer(help="Inspect chat sessions.")
 app.add_typer(sessions_app, name="sessions")
+wiki_app = typer.Typer(help="Inspect the wiki.")
+app.add_typer(wiki_app, name="wiki")
 
 
 @app.command()
@@ -59,6 +61,49 @@ def sessions_list() -> None:
             return
         for session in sessions:
             typer.echo(f"{session.id}  {session.created_at:%Y-%m-%d %H:%M}  {session.title}")
+
+    asyncio.run(_run())
+
+
+@wiki_app.command("list")
+def wiki_list() -> None:
+    """List wiki pages, newest-updated first."""
+    from cherryai_api.db import build_database
+    from cherryai_api.wiki import list_entries
+
+    async def _run() -> None:
+        db = build_database()
+        await db.connect()
+        try:
+            entries = await list_entries(db.pool)
+        finally:
+            await db.close()
+        if not entries:
+            typer.echo("No wiki pages yet.")
+            return
+        for entry in entries:
+            tags = f"  [{', '.join(entry.tags)}]" if entry.tags else ""
+            typer.echo(
+                f"{entry.slug}  {entry.updated_at:%Y-%m-%d %H:%M}  {entry.title}{tags}"
+            )
+
+    asyncio.run(_run())
+
+
+@wiki_app.command("search")
+def wiki_search(query: str) -> None:
+    """Full-text search the wiki and print matching pages."""
+    from cherryai_api.db import build_database
+    from cherryai_api.wiki import format_search_results, search_entries
+
+    async def _run() -> None:
+        db = build_database()
+        await db.connect()
+        try:
+            hits = await search_entries(db.pool, query)
+        finally:
+            await db.close()
+        typer.echo(format_search_results(hits))
 
     asyncio.run(_run())
 

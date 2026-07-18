@@ -19,6 +19,7 @@ from cherryai_api.agent import build_agent, run_turn, stream_turn
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
+from cherryai_api.wiki import router as wiki_router
 
 
 class CreateSessionRequest(BaseModel):
@@ -36,7 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     database = build_database()
     await database.connect()
     memory = build_memory()
-    agent = build_agent(settings, memory=memory)
+    agent = build_agent(settings, memory=memory, database=database)
     app.state.settings = settings
     app.state.db = database
     app.state.memory = memory
@@ -57,6 +58,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(wiki_router)
 
 
 async def _neo4j_reachable() -> bool:
