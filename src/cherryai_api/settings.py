@@ -44,7 +44,12 @@ class Settings(BaseSettings):
     cognee_recall_top_k: int = 3
 
     # --- HTTP server ---
-    cors_origin: str = "http://localhost:5173"
+    # Comma-separated list of allowed browser origins.
+    cors_origins: str = "http://localhost:5173"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def asyncpg_dsn(self) -> str:
