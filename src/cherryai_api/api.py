@@ -15,7 +15,7 @@ from loguru import logger
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from cherryai_api.agent import build_agent, stream_turn
+from cherryai_api.agent import build_agent, run_turn, stream_turn
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
@@ -97,8 +97,9 @@ async def list_sessions() -> list[dict]:
 
 
 @app.post("/api/sessions", status_code=201)
-async def create_session(body: CreateSessionRequest) -> dict:
-    session = await app.state.db.create_session(body.title or "New chat")
+async def create_session(body: CreateSessionRequest | None = None) -> dict:
+    title = body.title if body and body.title else "New chat"
+    session = await app.state.db.create_session(title)
     return session.model_dump(mode="json")
 
 
@@ -158,7 +159,20 @@ async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
                     collected.append(payload)
                     yield {"event": "token", "data": payload}
                 elif kind == "done":
-                    final = payload or "".join(collected)
+                    final = (payload or "".join(collected)).strip()
+                    if not final:
+                        # openrouter/free sometimes emits a whitespace-only
+                        # answer; one non-streamed retry usually recovers.
+                        logger.warning("Empty assistant reply; retrying turn")
+                        retry = await run_turn(agent, prompt, history)
+                        final = (retry.output or "").strip()
+                        if final:
+                            yield {"event": "token", "data": final}
+                    if not final:
+                        final = (
+                            "The model returned an empty response — "
+                            "please try again."
+                        )
                     await db.add_message(session_id, "assistant", final)
                     _remember_turn_in_background(memory, prompt, final)
                     yield {"event": "done", "data": json.dumps({"content": final})}
