@@ -11,6 +11,7 @@ import uuid
 import pytest
 
 from cherryai_api.feedback import (
+    EntryLocked,
     FeedbackCreate,
     FeedbackSearchHit,
     FeedbackUpdate,
@@ -162,6 +163,55 @@ async def test_update_never_changes_id(pool) -> None:
     )
     assert updated is not None
     assert updated.id == created.id
+
+
+# --- Workflow job lock (see workflows.py for the job runner itself) ----------
+
+
+async def test_update_raises_when_job_running(pool) -> None:
+    created = await create_entry(
+        pool, FeedbackCreate(title=_unique_title("Locked Update"), type="bug")
+    )
+    await pool.execute(
+        "UPDATE feedback_entries SET job_stage = 'triage', job_status = 'running' WHERE id = $1",
+        created.id,
+    )
+    with pytest.raises(EntryLocked):
+        await update_entry(pool, created.id, FeedbackUpdate(status="resolved"))
+
+
+async def test_delete_raises_when_job_running(pool) -> None:
+    created = await create_entry(
+        pool, FeedbackCreate(title=_unique_title("Locked Delete"), type="bug")
+    )
+    await pool.execute(
+        "UPDATE feedback_entries SET job_stage = 'plan', job_status = 'running' WHERE id = $1",
+        created.id,
+    )
+    with pytest.raises(EntryLocked):
+        await delete_entry(pool, created.id)
+
+
+async def test_update_succeeds_once_job_is_no_longer_running(pool) -> None:
+    created = await create_entry(
+        pool, FeedbackCreate(title=_unique_title("Unlocked After Failure"), type="bug")
+    )
+    await pool.execute(
+        "UPDATE feedback_entries SET job_stage = 'triage', job_status = 'failed', "
+        "job_error = 'boom' WHERE id = $1",
+        created.id,
+    )
+    updated = await update_entry(pool, created.id, FeedbackUpdate(status="resolved"))
+    assert updated is not None
+    assert updated.status == "resolved"
+
+
+async def test_job_fields_default_to_none(pool) -> None:
+    created = await create_entry(pool, FeedbackCreate(title=_unique_title("Fresh"), type="bug"))
+    assert created.job_stage is None
+    assert created.job_status is None
+    assert created.job_id is None
+    assert created.job_error is None
 
 
 # --- List filters --------------------------------------------------------

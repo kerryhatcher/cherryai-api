@@ -10,6 +10,7 @@ shared "document" abstraction between the two.
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime
 
 import asyncpg
@@ -56,8 +57,21 @@ _HEADLINE_OPTS = (
 )
 _MARK_RE = re.compile(r"</?mark>")
 _ENTRY_COLUMNS = (
-    "id, title, tags, type, status, priority, body, investigation, plan, created_at, updated_at"
+    "id, title, tags, type, status, priority, body, investigation, plan, created_at, "
+    "updated_at, job_stage, job_status, job_id, job_error"
 )
+_LIST_COLUMNS = (
+    "id, title, tags, type, status, priority, updated_at, job_stage, job_status, job_id, job_error"
+)
+
+
+class EntryLocked(Exception):
+    """Raised when attempting to update or delete an entry with a running job."""
+
+    def __init__(self, stage: str | None) -> None:
+        self.stage = stage
+        detail = f"Entry is locked by a running {stage} job" if stage else "Entry is locked"
+        super().__init__(detail)
 
 
 class FeedbackEntry(BaseModel):
@@ -74,6 +88,10 @@ class FeedbackEntry(BaseModel):
     plan: str
     created_at: datetime
     updated_at: datetime
+    job_stage: str | None = None
+    job_status: str | None = None
+    job_id: uuid.UUID | None = None
+    job_error: str | None = None
 
 
 class FeedbackListItem(BaseModel):
@@ -86,6 +104,10 @@ class FeedbackListItem(BaseModel):
     status: str
     priority: str
     updated_at: datetime
+    job_stage: str | None = None
+    job_status: str | None = None
+    job_id: uuid.UUID | None = None
+    job_error: str | None = None
 
 
 class FeedbackSearchHit(BaseModel):
@@ -155,8 +177,7 @@ async def list_entries(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
     rows = await pool.fetch(
-        "SELECT id, title, tags, type, status, priority, updated_at "
-        f"FROM feedback_entries {where} ORDER BY updated_at DESC",
+        f"SELECT {_LIST_COLUMNS} FROM feedback_entries {where} ORDER BY updated_at DESC",
         *params,
     )
     return [FeedbackListItem(**dict(row)) for row in rows]
@@ -199,7 +220,8 @@ async def update_entry(pool: asyncpg.Pool, id: int, data: FeedbackUpdate) -> Fee
     """Update the provided fields of an entry, bumping updated_at.
 
     Returns None if the id does not exist; raises :class:`ValueError` on a
-    blank title or an invalid type/status/priority.
+    blank title or an invalid type/status/priority, and :class:`EntryLocked`
+    if a workflow job is currently running against this entry.
     """
     title = data.title.strip() if data.title is not None else None
     if data.title is not None and not title:
@@ -210,6 +232,13 @@ async def update_entry(pool: asyncpg.Pool, id: int, data: FeedbackUpdate) -> Fee
         raise ValueError(f"Invalid status '{data.status}'")
     if data.priority is not None and data.priority not in _VALID_PRIORITIES:
         raise ValueError(f"Invalid priority '{data.priority}'")
+    current = await pool.fetchrow(
+        "SELECT job_status, job_stage FROM feedback_entries WHERE id = $1", id
+    )
+    if current is None:
+        return None
+    if current["job_status"] == "running":
+        raise EntryLocked(current["job_stage"])
     row = await pool.fetchrow(
         "UPDATE feedback_entries SET "
         "title = COALESCE($2, title), "
@@ -236,7 +265,18 @@ async def update_entry(pool: asyncpg.Pool, id: int, data: FeedbackUpdate) -> Fee
 
 
 async def delete_entry(pool: asyncpg.Pool, id: int) -> bool:
-    """Delete an entry; return True if a row was removed."""
+    """Delete an entry; return True if a row was removed.
+
+    Raises :class:`EntryLocked` if a workflow job is currently running
+    against this entry.
+    """
+    current = await pool.fetchrow(
+        "SELECT job_status, job_stage FROM feedback_entries WHERE id = $1", id
+    )
+    if current is None:
+        return False
+    if current["job_status"] == "running":
+        raise EntryLocked(current["job_stage"])
     result = await pool.execute("DELETE FROM feedback_entries WHERE id = $1", id)
     return result.endswith("1")
 
@@ -320,7 +360,22 @@ async def create_feedback(request: Request, body: FeedbackCreate) -> dict:
         entry = await create_entry(_pool(request), body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    _trigger_auto_triage(request, entry.id)
     return entry.model_dump(mode="json")
+
+
+def _trigger_auto_triage(request: Request, id: int) -> None:
+    """Fire-and-forget auto-triage right after a successful create.
+
+    Imported locally: workflows.py imports search_entries/format_search_results
+    from this module, so a top-level import here would be circular.
+    """
+    from cherryai_api.workflows import fire_and_forget_triage
+
+    workflows = getattr(request.app.state, "workflows", None)
+    if workflows is None:
+        return  # not configured (e.g. a minimal test app) — best-effort only
+    fire_and_forget_triage(workflows, _pool(request), id)
 
 
 @router.get("/{id}")
@@ -337,6 +392,8 @@ async def update_feedback(request: Request, id: int, body: FeedbackUpdate) -> di
         entry = await update_entry(_pool(request), id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except EntryLocked as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if entry is None:
         raise HTTPException(status_code=404, detail="Feedback entry not found")
     return entry.model_dump(mode="json")
@@ -344,5 +401,9 @@ async def update_feedback(request: Request, id: int, body: FeedbackUpdate) -> di
 
 @router.delete("/{id}", status_code=204)
 async def delete_feedback(request: Request, id: int) -> None:
-    if not await delete_entry(_pool(request), id):
+    try:
+        deleted = await delete_entry(_pool(request), id)
+    except EntryLocked as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if not deleted:
         raise HTTPException(status_code=404, detail="Feedback entry not found")
