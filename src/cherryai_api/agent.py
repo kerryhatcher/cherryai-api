@@ -22,6 +22,7 @@ from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory, build_memory
 from cherryai_api.settings import Settings, get_settings
 from cherryai_api.wiki import format_search_results, search_entries
+from cherryai_api.workflows import WorkflowRuntime, fire_and_forget_triage
 
 # Tracks how many times search_memory has run within a single agent turn so a
 # model cannot loop on recalled content. Mirrors hatchai's loop guard.
@@ -150,13 +151,15 @@ def build_agent(
     settings: Settings | None = None,
     memory: CogneeMemory | None = None,
     database: Database | None = None,
+    workflows: WorkflowRuntime | None = None,
 ) -> Agent[None, str]:
     """Build the CherryAI agent and register its six tools.
 
     ``database`` powers the read-only ``search_wiki``/``search_feedback``
     tools and the guardrailed ``create_feedback`` tool; when omitted (e.g.
     one-shot CLI smoke tests) those tools report themselves unavailable
-    instead.
+    instead. ``workflows`` (when given, alongside ``database``) fires
+    auto-triage after ``create_feedback`` succeeds.
     """
     settings = settings or get_settings()
     memory = memory or build_memory()
@@ -261,6 +264,8 @@ def build_agent(
         except Exception as error:
             logger.bind(title=title).warning(f"create_feedback failed: {error}")
             return f"create_feedback failed: {error}"
+        if workflows is not None:
+            fire_and_forget_triage(workflows, database.pool, entry.id)
         return f"Created #{entry.id} — /feedback/{entry.id}"
 
     return agent

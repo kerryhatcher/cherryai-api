@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     tavily_api_key: str = Field(default="", repr=False)
     brave_api_key: str = Field(default="", repr=False)
 
+    # --- Ollama cloud (feedback AI workflows: triage/investigate/plan) ---
+    ollama_base_url: str = "https://ollama.com/v1"
+    ollama_api_key: str = Field(default="", repr=False)
+    workflow_triage_model: str = "gpt-oss:20b"
+    workflow_investigate_model: str = "gpt-oss:120b"
+    workflow_plan_model: str = "kimi-k2.7-code"
+
     # --- Datastores ---
     database_url: str = Field(
         default="postgresql://cherryai:cherryai_dev@localhost:5432/cherryai",

@@ -21,6 +21,8 @@ from cherryai_api.feedback import router as feedback_router
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
 from cherryai_api.wiki import router as wiki_router
+from cherryai_api.workflows import build_workflow_runtime
+from cherryai_api.workflows import router as workflows_router
 
 
 class CreateSessionRequest(BaseModel):
@@ -38,10 +40,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     database = build_database()
     await database.connect()
     memory = build_memory()
-    agent = build_agent(settings, memory=memory, database=database)
+    workflows = build_workflow_runtime(settings, database, memory)
+    agent = build_agent(settings, memory=memory, database=database, workflows=workflows)
     app.state.settings = settings
     app.state.db = database
     app.state.memory = memory
+    app.state.workflows = workflows
     app.state.agent = agent
     logger.info("CherryAI API started")
     try:
@@ -61,6 +65,7 @@ app.add_middleware(
 )
 app.include_router(wiki_router)
 app.include_router(feedback_router)
+app.include_router(workflows_router)
 
 
 async def _neo4j_reachable() -> bool:

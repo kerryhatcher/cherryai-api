@@ -67,12 +67,16 @@ class Database:
         # Local imports keep db.py free of the routers' FastAPI deps.
         from cherryai_api.feedback import CREATE_FEEDBACK_TABLE
         from cherryai_api.wiki import CREATE_WIKI_TABLE
+        from cherryai_api.workflows import ensure_workflow_columns
 
         self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
         async with self._pool.acquire() as conn:
             await conn.execute(_CREATE_TABLES)
             await conn.execute(CREATE_WIKI_TABLE)
             await conn.execute(CREATE_FEEDBACK_TABLE)
+        # Job-state columns + stale-'running' cleanup (crash recovery); needs its
+        # own connection since ensure_workflow_columns acquires from the pool.
+        await ensure_workflow_columns(self._pool)
 
     async def close(self) -> None:
         if self._pool is not None:
