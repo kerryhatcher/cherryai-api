@@ -29,6 +29,7 @@ When working in this folder, all git operations (status, commit, push) apply to 
 ### Python and Dependencies
 
 - **Use `uv` exclusively.** Never call system `python` or `python3` directly. All commands must be prefixed with `uv run`.
+- **Never use pyenv.** Do not rely on pyenv shims or `.python-version` interpreters; `python3` must only ever be invoked via `uv run`.
 - **Managing packages:** Use `uv add <package>` to add dependencies and `uv add --dev <package>` for dev dependencies. Use `uv remove <package>` to remove.
 
 ### Code Quality
