@@ -64,13 +64,15 @@ class Database:
 
     async def connect(self) -> None:
         """Open the connection pool and create tables if needed."""
-        # Local import keeps db.py free of the wiki router's FastAPI deps.
+        # Local imports keep db.py free of the routers' FastAPI deps.
+        from cherryai_api.feedback import CREATE_FEEDBACK_TABLE
         from cherryai_api.wiki import CREATE_WIKI_TABLE
 
         self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
         async with self._pool.acquire() as conn:
             await conn.execute(_CREATE_TABLES)
             await conn.execute(CREATE_WIKI_TABLE)
+            await conn.execute(CREATE_FEEDBACK_TABLE)
 
     async def close(self) -> None:
         if self._pool is not None:

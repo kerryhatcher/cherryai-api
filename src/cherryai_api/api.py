@@ -17,6 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.agent import build_agent, run_turn, stream_turn
 from cherryai_api.db import build_database, make_session_title
+from cherryai_api.feedback import router as feedback_router
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
 from cherryai_api.wiki import router as wiki_router
@@ -59,6 +60,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(wiki_router)
+app.include_router(feedback_router)
 
 
 async def _neo4j_reachable() -> bool:
