@@ -46,6 +46,16 @@ Write and maintain tests for:
 
 Tests live in `tests/` and use pytest + pytest-asyncio. Run them before every commit.
 
+## Subagents and Model Economy
+
+When delegating work to subagents, always pick the cheapest model that can do the task well — cheaper models are usually faster as well as cheaper, so this saves both money and time:
+
+- **Haiku** — mechanical, low-judgment work: writing docs from a known outline, renames and file moves, boilerplate, simple lookups and summaries.
+- **Sonnet** — standard implementation against a clear spec or contract: CRUD endpoints, tests, routine refactors.
+- **Opus (or stronger)** — only high-judgment work: architecture, tricky integrations (e.g. Cognee/Pydantic AI wiring), debugging unknowns.
+
+Match the model to the task, not the project's importance. Prefer running independent tasks as parallel subagents.
+
 ## Secrets and Environment
 
 - **Never commit `.env` or `.env.local`** — these contain API keys and database credentials.
