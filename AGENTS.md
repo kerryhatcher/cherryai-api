@@ -75,3 +75,13 @@ Match the model to the task, not the project's importance. Prefer running indepe
 - **[CherryAI Planning Repo README](../README.md)** — Project requirements and architecture decisions
 - **[cherryai-web README](../cherryai-web/README.md)** — React frontend that consumes this API
 - **[Demo Design Spec](../docs/superpowers/specs/2026-07-18-cherryai-demo-design.md)** — Technical design and implementation plan
+
+## GitHub Actions
+
+- **Always pin actions to full commit SHAs, never git tags** (tags are mutable and can be repointed at malicious code; SHAs are immutable). Keep the human-readable version in a trailing comment:
+
+  ```yaml
+  - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+  ```
+
+  To resolve a tag to its SHA: `gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq '.object.sha'` (if `.object.type` is `tag` rather than `commit`, dereference the annotated tag object first).

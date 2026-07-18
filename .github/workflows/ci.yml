@@ -9,8 +9,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           enable-cache: true
       - name: Install dependencies
@@ -23,8 +23,8 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
       # --ignore-until-fixed: suppressed only while no fixed release exists.
       # GHSA-w8v5-vhqr-4h9v: diskcache pickle deserialization (via cognee),
       # no fix available as of 2026-07-18.
@@ -50,8 +50,8 @@ jobs:
     env:
       DATABASE_URL: postgresql://cherryai:cherryai_dev@localhost:5432/cherryai
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           enable-cache: true
       - name: Install dependencies
