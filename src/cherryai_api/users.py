@@ -80,6 +80,34 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         logger.info(f"User registered (pending approval): {user.email}")
 
 
+async def ensure_admin(session: AsyncSession, email: str, password: str) -> tuple[User, bool]:
+    """Create (or return) the bootstrap admin. Idempotent by email.
+
+    The bootstrap admin claims the legacy Cognee dataset so pre-auth
+    memories stay reachable (see the multi-user design spec, Section 4).
+    """
+    from fastapi_users.password import PasswordHelper
+    from sqlalchemy import select
+
+    existing = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
+    if existing is not None:
+        return existing, False
+    user = User(
+        email=email,
+        hashed_password=PasswordHelper().hash(password),
+        is_active=True,
+        is_superuser=True,
+        is_verified=True,
+        role=ROLE_ADMIN,
+        display_name="Admin",
+        memory_dataset=get_settings().cognee_dataset,
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user, True
+
+
 async def get_user_db(
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ) -> AsyncIterator[SQLAlchemyUserDatabase]:

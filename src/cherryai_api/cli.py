@@ -13,6 +13,8 @@ wiki_app = typer.Typer(help="Inspect the wiki.")
 app.add_typer(wiki_app, name="wiki")
 feedback_app = typer.Typer(help="Inspect feedback (bugs, features, user stories).")
 app.add_typer(feedback_app, name="feedback")
+users_app = typer.Typer(help="Manage user accounts.")
+app.add_typer(users_app, name="users")
 
 
 @app.command()
@@ -161,6 +163,147 @@ def feedback_search(query: str) -> None:
         typer.echo(format_search_results(hits))
 
     asyncio.run(_run())
+
+
+def _run_with_session(fn):
+    """Run an async callable with one SQLAlchemy session, then dispose."""
+    from cherryai_api.orm import async_session_maker, engine
+
+    async def _wrapped():
+        try:
+            async with async_session_maker() as session:
+                return await fn(session)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_wrapped())
+
+
+@users_app.command("bootstrap")
+def users_bootstrap(
+    email: str = typer.Option(None, "--email"),
+    password: str = typer.Option(None, "--password"),
+) -> None:
+    """Create the first admin account (idempotent)."""
+    from cherryai_api.settings import get_settings
+    from cherryai_api.users import ensure_admin
+
+    settings = get_settings()
+    email = email or settings.cherryai_admin_email or typer.prompt("Admin email")
+    password = (
+        password
+        or settings.cherryai_admin_password
+        or typer.prompt("Admin password", hide_input=True, confirmation_prompt=True)
+    )
+
+    async def _do(session):
+        return await ensure_admin(session, email, password)
+
+    user, created = _run_with_session(_do)
+    typer.echo(f"{'Created' if created else 'Already exists'}: {user.email} ({user.id})")
+
+
+@users_app.command("list")
+def users_list() -> None:
+    """List all accounts with role and status."""
+    from sqlalchemy import select
+
+    from cherryai_api.users import User
+
+    async def _do(session):
+        return list((await session.execute(select(User).order_by(User.created_at))).scalars())
+
+    for u in _run_with_session(_do):
+        status = "pending" if not u.is_verified else ("active" if u.is_active else "deactivated")
+        typer.echo(f"{u.id}  {u.email:35}  {u.role:10}  {status}")
+
+
+def _mutate_by_email(email: str, mutate) -> None:
+    from sqlalchemy import select
+
+    from cherryai_api.users import User
+
+    async def _do(session):
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
+        if user is None:
+            typer.echo(f"No user with email {email}", err=True)
+            raise typer.Exit(code=1)
+        mutate(user)
+        await session.commit()
+        return user
+
+    user = _run_with_session(_do)
+    typer.echo(
+        f"OK: {user.email} role={user.role} active={user.is_active} verified={user.is_verified}"
+    )
+
+
+@users_app.command("approve")
+def users_approve(email: str, role: str = typer.Option("chat", "--role")) -> None:
+    """Approve a pending account, assigning a role."""
+    from cherryai_api.users import ROLE_ADMIN, ROLES
+
+    if role not in ROLES:
+        typer.echo(f"Unknown role: {role}", err=True)
+        raise typer.Exit(code=1)
+
+    def _mutate(user):
+        user.is_verified = True
+        user.role = role
+        user.is_superuser = role == ROLE_ADMIN
+
+    _mutate_by_email(email, _mutate)
+
+
+@users_app.command("set-role")
+def users_set_role(email: str, role: str) -> None:
+    """Change an account's role."""
+    from cherryai_api.users import ROLE_ADMIN, ROLES
+
+    if role not in ROLES:
+        typer.echo(f"Unknown role: {role}", err=True)
+        raise typer.Exit(code=1)
+
+    def _mutate(user):
+        user.role = role
+        user.is_superuser = role == ROLE_ADMIN
+
+    _mutate_by_email(email, _mutate)
+
+
+@users_app.command("deactivate")
+def users_deactivate(email: str) -> None:
+    """Deactivate an account and revoke its sessions."""
+    from sqlalchemy import delete
+
+    from cherryai_api.users import AccessToken
+
+    def _mutate(user):
+        user.is_active = False
+
+    _mutate_by_email(email, _mutate)
+
+    async def _revoke(session):
+        # Separate pass: _mutate_by_email owns its own session lifecycle.
+        from sqlalchemy import select
+
+        from cherryai_api.users import User
+
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        await session.execute(delete(AccessToken).where(AccessToken.user_id == user.id))
+        await session.commit()
+
+    _run_with_session(_revoke)
+
+
+@users_app.command("reactivate")
+def users_reactivate(email: str) -> None:
+    """Reactivate a deactivated account."""
+
+    def _mutate(user):
+        user.is_active = True
+
+    _mutate_by_email(email, _mutate)
 
 
 def main() -> None:
