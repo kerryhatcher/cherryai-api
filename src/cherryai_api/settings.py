@@ -67,6 +67,20 @@ class Settings(BaseSettings):
     # kept). Relative paths resolve against the process working directory.
     log_dir: str = "logs"
 
+    # --- Authentication ---
+    # Secret for fastapi-users token machinery (reset/verify signing). Any
+    # long random string; MUST be overridden in production.
+    auth_secret: str = Field(default="dev-secret-change-me", repr=False)
+    # False for local http dev; True behind TLS in production.
+    auth_cookie_secure: bool = False
+    # Auth cookie/token lifetime. 14 days keeps the iOS PWA logged in.
+    auth_token_lifetime_seconds: int = 1209600
+    # Bootstrap admin for non-interactive deploys (read by migration 0002
+    # and `cherryai users bootstrap`). Field names map to env vars
+    # CHERRYAI_ADMIN_EMAIL / CHERRYAI_ADMIN_PASSWORD.
+    cherryai_admin_email: str = ""
+    cherryai_admin_password: str = Field(default="", repr=False)
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
