@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, fastapi_users_app
 from cherryai_api.db import build_database, make_session_title
@@ -90,6 +91,7 @@ app.include_router(
     prefix="/users",
     tags=["users"],
 )
+app.include_router(admin_router)
 
 
 async def _neo4j_reachable() -> bool:

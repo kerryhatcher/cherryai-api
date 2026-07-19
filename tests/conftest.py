@@ -74,6 +74,7 @@ async def auth_app(pool):
     """
     from fastapi import FastAPI
 
+    from cherryai_api.admin import router as admin_router
     from cherryai_api.auth import auth_backend, fastapi_users_app
     from cherryai_api.users import UserCreate, UserRead, UserUpdate
 
@@ -81,6 +82,7 @@ async def auth_app(pool):
     app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth")
     app.include_router(fastapi_users_app.get_register_router(UserRead, UserCreate), prefix="/auth")
     app.include_router(fastapi_users_app.get_users_router(UserRead, UserUpdate), prefix="/users")
+    app.include_router(admin_router)
     return app
 
 
