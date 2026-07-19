@@ -56,14 +56,23 @@ WHERE job_status = 'running';
 
 # Questions from the triage agent live in a marker-delimited section appended
 # to the body; reruns replace this section (or append/remove it) and never
-# touch the human-written text around it.
+# touch the human-written text around it. Reporters often type replies inline
+# inside that section, so reruns must first consolidate anything they wrote
+# into a second, persistent "answered" section instead of discarding it.
 TRIAGE_MARKER_START = "<!-- cherryai:triage -->"
 TRIAGE_MARKER_END = "<!-- /cherryai:triage -->"
 _TRIAGE_HEADER = "## Questions for the reporter"
-_TRIAGE_SECTION_RE = re.compile(
-    r"\n*" + re.escape(TRIAGE_MARKER_START) + r".*?" + re.escape(TRIAGE_MARKER_END) + r"\n*",
-    re.DOTALL,
-)
+ANSWERED_MARKER_START = "<!-- cherryai:triage-answered -->"
+ANSWERED_MARKER_END = "<!-- /cherryai:triage-answered -->"
+_ANSWERED_HEADER = "## Answered by the reporter"
+
+
+def _section_re(start: str, end: str) -> re.Pattern[str]:
+    return re.compile(r"\n*" + re.escape(start) + r"(.*?)" + re.escape(end) + r"\n*", re.DOTALL)
+
+
+_TRIAGE_SECTION_RE = _section_re(TRIAGE_MARKER_START, TRIAGE_MARKER_END)
+_ANSWERED_SECTION_RE = _section_re(ANSWERED_MARKER_START, ANSWERED_MARKER_END)
 
 
 class TriageResult(BaseModel):
@@ -73,6 +82,7 @@ class TriageResult(BaseModel):
     priority: Literal["low", "medium", "high", "critical"]
     tags: list[str] = Field(default_factory=list)
     questions: list[str] = Field(default_factory=list)
+    answered: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -99,6 +109,42 @@ async def ensure_workflow_columns(pool: asyncpg.Pool) -> None:
 def _strip_triage_section(body: str) -> str:
     """Return body with the triage marker section removed; human text untouched."""
     return _TRIAGE_SECTION_RE.sub("", body).rstrip()
+
+
+def _split_section(body: str, section_re: re.Pattern[str], header: str) -> tuple[str, str]:
+    """Remove a marker section from `body`; return (rest, section payload).
+
+    The payload is the section's inner text with the markers and `header`
+    stripped — for the questions section that is the generated bullets plus
+    any replies the reporter typed inline.
+    """
+    match = section_re.search(body)
+    if match is None:
+        return body, ""
+    content = match.group(1).strip()
+    if content.startswith(header):
+        content = content[len(header) :].strip()
+    return section_re.sub("", body).rstrip(), content
+
+
+def _has_reporter_content(questions_payload: str) -> bool:
+    """True if a questions-section payload contains reporter-typed lines.
+
+    A pristine generated section is only '- question' bullets; any other
+    non-blank line means the reporter wrote answers inline.
+    """
+    return any(
+        line.strip() and not line.lstrip().startswith("- ")
+        for line in questions_payload.splitlines()
+    )
+
+
+def _apply_answered_section(human_body: str, answered_text: str) -> str:
+    """Append the persistent answered-info section, or nothing if it is empty."""
+    if not answered_text:
+        return human_body
+    section = f"{ANSWERED_MARKER_START}\n{_ANSWERED_HEADER}\n{answered_text}\n{ANSWERED_MARKER_END}"
+    return f"{human_body}\n\n{section}" if human_body else section
 
 
 def _apply_triage_section(human_body: str, questions: list[str]) -> str:
@@ -161,10 +207,14 @@ TRIAGE_SYSTEM_PROMPT = (
     "You triage one feedback entry (a bug, feature request, or user story) for "
     "an internal tracker. Re-evaluate `type`, `priority`, and `tags` from "
     "scratch based on the current content below — do not just repeat the "
-    "existing values unless they still fit. If anything is ambiguous or "
-    "missing information you would need before acting on this entry, list "
-    "clarifying questions for the reporter in `questions`; otherwise return an "
-    "empty list."
+    "existing values unless they still fit. The reporter may have replied to "
+    "earlier questions, either inline inside the previous questions section or "
+    "in the already-answered summary. Consolidate EVERY piece of information "
+    "the reporter has provided into `answered` (one 'question — answer' item "
+    "each, preserving the reporter's meaning; carry forward all prior answered "
+    "items — never drop any). If anything is still ambiguous or missing, list "
+    "only genuinely unanswered clarifying questions in `questions`; otherwise "
+    "return an empty list."
 )
 
 INVESTIGATE_SYSTEM_PROMPT = (
@@ -234,13 +284,18 @@ def build_workflow_runtime(
 # --- Prompts for a specific entry -----------------------------------------------
 
 
-def _triage_prompt(entry: FeedbackEntry, stripped_body: str) -> str:
+def _triage_prompt(
+    entry: FeedbackEntry, human_body: str, answered: str, prior_questions: str
+) -> str:
     return (
         f"Title: {entry.title}\n"
         f"Current type: {entry.type}\n"
         f"Current priority: {entry.priority}\n"
         f"Current tags: {', '.join(entry.tags) or '(none)'}\n\n"
-        f"Body:\n{stripped_body or '(empty)'}\n\n"
+        f"Body:\n{human_body or '(empty)'}\n\n"
+        f"Already answered by the reporter:\n{answered or '(none)'}\n\n"
+        f"Previous questions to the reporter (may contain inline replies):\n"
+        f"{prior_questions or '(none)'}\n\n"
         f"Investigation notes:\n{entry.investigation or '(none)'}\n\n"
         f"Plan:\n{entry.plan or '(none)'}"
     )
@@ -362,10 +417,28 @@ async def _fail_job(pool: asyncpg.Pool, id: int, error: str) -> None:
 
 
 async def _run_triage(pool: asyncpg.Pool, runtime: WorkflowRuntime, entry: FeedbackEntry) -> None:
-    stripped_body = _strip_triage_section(entry.body)
-    result = await runtime.triage_agent.run(_triage_prompt(entry, stripped_body))
+    human_body, prior_answered = _split_section(entry.body, _ANSWERED_SECTION_RE, _ANSWERED_HEADER)
+    human_body, prior_questions = _split_section(human_body, _TRIAGE_SECTION_RE, _TRIAGE_HEADER)
+    result = await runtime.triage_agent.run(
+        _triage_prompt(entry, human_body, prior_answered, prior_questions)
+    )
     triage: TriageResult = result.output
-    new_body = _apply_triage_section(stripped_body, triage.questions)
+    if triage.answered:
+        answered_text = "\n".join(f"- {item}" for item in triage.answered)
+    else:
+        # Safety net: the agent reported nothing answered, but reporter-provided
+        # text must never be dropped — carry it forward verbatim instead.
+        preserved = [prior_answered] if prior_answered else []
+        if _has_reporter_content(prior_questions):
+            preserved.append(prior_questions)
+        answered_text = "\n\n".join(preserved)
+        if preserved:
+            logger.bind(feedback_id=entry.id).info(
+                "Triage preserved reporter content verbatim (agent returned no answered items)"
+            )
+    new_body = _apply_triage_section(
+        _apply_answered_section(human_body, answered_text), triage.questions
+    )
     await pool.execute(
         "UPDATE feedback_entries SET type = $2, priority = $3, tags = $4, body = $5, "
         "updated_at = now() WHERE id = $1",

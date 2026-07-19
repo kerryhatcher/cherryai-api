@@ -126,6 +126,45 @@ def test_rerun_replaces_not_duplicates_section() -> None:
     assert second.startswith("Human text.")
 
 
+def test_split_triage_section_returns_inline_reporter_replies() -> None:
+    body = (
+        "Human text.\n\n"
+        f"{workflows.TRIAGE_MARKER_START}\n## Questions for the reporter\n"
+        "- Q1?\nMy answer to Q1.\n- Q2?\n"
+        f"{workflows.TRIAGE_MARKER_END}"
+    )
+    rest, content = workflows._split_section(
+        body, workflows._TRIAGE_SECTION_RE, workflows._TRIAGE_HEADER
+    )
+    assert rest == "Human text."
+    assert "My answer to Q1." in content
+    assert "## Questions for the reporter" not in content
+
+
+def test_has_reporter_content_false_for_pristine_questions() -> None:
+    assert not workflows._has_reporter_content("- Q1?\n- Q2?")
+    assert not workflows._has_reporter_content("")
+
+
+def test_has_reporter_content_true_for_inline_answers() -> None:
+    assert workflows._has_reporter_content("- Q1?\nMy answer.\n- Q2?")
+
+
+def test_apply_answered_section_round_trips() -> None:
+    applied = workflows._apply_answered_section("Human text.", "- Q1? A: yes")
+    assert applied.startswith("Human text.")
+    assert workflows.ANSWERED_MARKER_START in applied
+    rest, content = workflows._split_section(
+        applied, workflows._ANSWERED_SECTION_RE, workflows._ANSWERED_HEADER
+    )
+    assert rest == "Human text."
+    assert content == "- Q1? A: yes"
+
+
+def test_apply_answered_section_empty_is_noop() -> None:
+    assert workflows._apply_answered_section("Human text.", "") == "Human text."
+
+
 # --- Model preflight -----------------------------------------------------------
 
 
@@ -246,10 +285,10 @@ async def test_ensure_workflow_columns_is_idempotent(pool) -> None:
     await workflows.ensure_workflow_columns(pool)  # must not raise
 
 
-# --- Triage write-back: full re-evaluate, prompt sees stripped body -----------
+# --- Triage write-back: full re-evaluate, prompt sees split sections -----------
 
 
-async def test_triage_prompt_receives_body_with_marker_stripped(pool, monkeypatch) -> None:
+async def test_triage_prompt_strips_markers_but_shows_prior_questions(pool, monkeypatch) -> None:
     monkeypatch.setattr(workflows, "_preflight_model", _noop_preflight)
     body = (
         f"Human text.\n\n{workflows.TRIAGE_MARKER_START}\nOld question?\n"
@@ -265,7 +304,7 @@ async def test_triage_prompt_receives_body_with_marker_stripped(pool, monkeypatc
 
     prompt = runtime.triage_agent.prompts[0]
     assert workflows.TRIAGE_MARKER_START not in prompt
-    assert "Old question?" not in prompt
+    assert "Old question?" in prompt  # shown so the agent can spot inline replies
     assert "Human text." in prompt
 
 
@@ -316,6 +355,109 @@ async def test_triage_with_no_questions_removes_marker_section(pool, monkeypatch
     updated = await get_entry(pool, entry.id)
     assert workflows.TRIAGE_MARKER_START not in updated.body
     assert updated.body == "Human text."
+
+
+def _body_with_inline_answers() -> str:
+    return (
+        "Human text.\n\n"
+        f"{workflows.TRIAGE_MARKER_START}\n## Questions for the reporter\n"
+        "- Which iOS version?\niOS 19.2 on an iPhone 15 Pro.\n- Which browser?\n"
+        f"{workflows.TRIAGE_MARKER_END}"
+    )
+
+
+async def test_triage_prompt_includes_inline_reporter_replies(pool, monkeypatch) -> None:
+    """The agent must SEE inline answers — the pre-fix code stripped them away."""
+    monkeypatch.setattr(workflows, "_preflight_model", _noop_preflight)
+    entry = await create_entry(
+        pool,
+        FeedbackCreate(
+            title=_unique_title("Sees Answers"), type="bug", body=_body_with_inline_answers()
+        ),
+    )
+    runtime = _make_runtime()
+
+    await workflows.start_job(pool, runtime, entry.id, "triage")
+    await _drain_background_tasks(runtime)
+
+    prompt = runtime.triage_agent.prompts[0]
+    assert "iOS 19.2 on an iPhone 15 Pro." in prompt
+
+
+async def test_rerun_triage_moves_answers_into_answered_section(pool, monkeypatch) -> None:
+    monkeypatch.setattr(workflows, "_preflight_model", _noop_preflight)
+    entry = await create_entry(
+        pool,
+        FeedbackCreate(
+            title=_unique_title("Answers Kept"), type="bug", body=_body_with_inline_answers()
+        ),
+    )
+    runtime = _make_runtime(
+        triage_output=TriageResult(
+            type="bug",
+            priority="high",
+            tags=[],
+            questions=["Does it happen on wifi only?"],
+            answered=["Which iOS version? — iOS 19.2 on an iPhone 15 Pro."],
+        )
+    )
+
+    await workflows.start_job(pool, runtime, entry.id, "triage")
+    await _drain_background_tasks(runtime)
+
+    updated = await get_entry(pool, entry.id)
+    assert updated.body.startswith("Human text.")
+    assert updated.body.count(workflows.ANSWERED_MARKER_START) == 1
+    assert "iOS 19.2 on an iPhone 15 Pro." in updated.body
+    assert "Does it happen on wifi only?" in updated.body
+    assert "- Which iOS version?\niOS 19.2" not in updated.body  # old Q&A block replaced
+
+
+async def test_rerun_triage_preserves_raw_replies_when_agent_reports_none(
+    pool, monkeypatch
+) -> None:
+    """Safety net: reporter text is never dropped even if the agent returns no answered items."""
+    monkeypatch.setattr(workflows, "_preflight_model", _noop_preflight)
+    entry = await create_entry(
+        pool,
+        FeedbackCreate(
+            title=_unique_title("Raw Preserved"), type="bug", body=_body_with_inline_answers()
+        ),
+    )
+    runtime = _make_runtime(
+        triage_output=TriageResult(type="bug", priority="low", tags=[], questions=["New?"])
+    )
+
+    await workflows.start_job(pool, runtime, entry.id, "triage")
+    await _drain_background_tasks(runtime)
+
+    updated = await get_entry(pool, entry.id)
+    assert "iOS 19.2 on an iPhone 15 Pro." in updated.body
+    assert updated.body.count(workflows.ANSWERED_MARKER_START) == 1
+    assert "New?" in updated.body
+
+
+async def test_rerun_triage_keeps_prior_answered_section_on_fallback(pool, monkeypatch) -> None:
+    monkeypatch.setattr(workflows, "_preflight_model", _noop_preflight)
+    body = (
+        "Human text.\n\n"
+        f"{workflows.ANSWERED_MARKER_START}\n## Answered by the reporter\n"
+        "- Old answer stays.\n"
+        f"{workflows.ANSWERED_MARKER_END}"
+    )
+    entry = await create_entry(
+        pool, FeedbackCreate(title=_unique_title("Answered Kept"), type="bug", body=body)
+    )
+    runtime = _make_runtime(
+        triage_output=TriageResult(type="bug", priority="low", tags=[], questions=[])
+    )
+
+    await workflows.start_job(pool, runtime, entry.id, "triage")
+    await _drain_background_tasks(runtime)
+
+    updated = await get_entry(pool, entry.id)
+    assert "Old answer stays." in updated.body
+    assert updated.body.count(workflows.ANSWERED_MARKER_START) == 1
 
 
 # --- Auto-triage fire-and-forget ----------------------------------------------
