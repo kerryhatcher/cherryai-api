@@ -18,19 +18,21 @@ from typing import Literal
 
 import asyncpg
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
+from cherryai_api.auth import current_verified_user
 from cherryai_api.db import Database
 from cherryai_api.feedback import FeedbackEntry, get_entry
 from cherryai_api.feedback import format_search_results as format_feedback_results
 from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory
 from cherryai_api.settings import Settings
+from cherryai_api.users import User
 from cherryai_api.wiki import format_search_results as format_wiki_results
 from cherryai_api.wiki import search_all_entries as search_wiki_entries
 
@@ -541,15 +543,27 @@ async def _trigger(request: Request, id: int, stage: str) -> dict:
 
 
 @router.post("/{id}/triage", status_code=202)
-async def trigger_triage(request: Request, id: int) -> dict:
+async def trigger_triage(
+    request: Request,
+    id: int,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     return await _trigger(request, id, "triage")
 
 
 @router.post("/{id}/investigate", status_code=202)
-async def trigger_investigate(request: Request, id: int) -> dict:
+async def trigger_investigate(
+    request: Request,
+    id: int,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     return await _trigger(request, id, "investigate")
 
 
 @router.post("/{id}/plan", status_code=202)
-async def trigger_plan(request: Request, id: int) -> dict:
+async def trigger_plan(
+    request: Request,
+    id: int,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     return await _trigger(request, id, "plan")

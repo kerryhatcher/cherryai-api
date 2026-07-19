@@ -1,4 +1,4 @@
-"""FastAPI HTTP surface for the CherryAI demo. Chat routes require auth."""
+"""FastAPI HTTP surface for CherryAI (cookie-authenticated, multi-user)."""
 
 from __future__ import annotations
 
