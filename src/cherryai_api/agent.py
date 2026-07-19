@@ -10,7 +10,14 @@ from contextvars import ContextVar
 import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
-from pydantic_ai import Agent
+from pydantic_ai import (
+    Agent,
+    AgentRunResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPartDelta,
+)
+from pydantic_ai.messages import TextPart
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 
@@ -291,14 +298,27 @@ async def stream_turn(
 ):
     """Yield ("token", delta) chunks then a final ("done", full_text) tuple.
 
-    The per-turn memory loop guard stays active for the whole stream.
+    Streams via ``run_stream_events`` (not ``run_stream``) so the agent graph
+    always runs to completion: when the model narrates text alongside tool
+    calls ("Let me check the wiki:"), the tools still run, their results go
+    back to the model, and "done" carries the real answer instead of the
+    narration. Narration text still streams as tokens; the "done" payload is
+    authoritative. The per-turn memory loop guard stays active for the whole
+    stream.
     """
     token = _memory_search_state.set({"count": 0})
     try:
-        async with agent.run_stream(prompt, message_history=message_history or []) as result:
-            async for delta in result.stream_text(delta=True):
-                yield ("token", delta)
-            final = await result.get_output()
+        final = ""
+        async with agent.run_stream_events(prompt, message_history=message_history or []) as events:
+            async for event in events:
+                if isinstance(event, AgentRunResultEvent):
+                    final = event.result.output
+                elif isinstance(event, PartStartEvent):
+                    if isinstance(event.part, TextPart) and event.part.content:
+                        yield ("token", event.part.content)
+                elif isinstance(event, PartDeltaEvent):
+                    if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
+                        yield ("token", event.delta.content_delta)
         yield ("done", final)
     finally:
         _memory_search_state.reset(token)
