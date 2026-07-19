@@ -274,26 +274,24 @@ def users_set_role(email: str, role: str) -> None:
 @users_app.command("deactivate")
 def users_deactivate(email: str) -> None:
     """Deactivate an account and revoke its sessions."""
-    from sqlalchemy import delete
+    from sqlalchemy import delete, select
 
-    from cherryai_api.users import AccessToken
+    from cherryai_api.users import AccessToken, User
 
-    def _mutate(user):
+    async def _do(session):
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
+        if user is None:
+            typer.echo(f"No user with email {email}", err=True)
+            raise typer.Exit(code=1)
         user.is_active = False
-
-    _mutate_by_email(email, _mutate)
-
-    async def _revoke(session):
-        # Separate pass: _mutate_by_email owns its own session lifecycle.
-        from sqlalchemy import select
-
-        from cherryai_api.users import User
-
-        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
         await session.execute(delete(AccessToken).where(AccessToken.user_id == user.id))
         await session.commit()
+        return user
 
-    _run_with_session(_revoke)
+    user = _run_with_session(_do)
+    typer.echo(
+        f"OK: {user.email} role={user.role} active={user.is_active} verified={user.is_verified}"
+    )
 
 
 @users_app.command("reactivate")
