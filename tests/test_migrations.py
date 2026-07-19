@@ -46,6 +46,10 @@ def upgrade(dsn: str, revision: str = "head") -> None:
     command.upgrade(alembic_config(dsn), revision)
 
 
+def downgrade(dsn: str, revision: str) -> None:
+    command.downgrade(alembic_config(dsn), revision)
+
+
 @pytest.mark.asyncio
 async def test_0001_creates_identity_tables(scratch_db):
     await asyncio.to_thread(upgrade, scratch_db, "0001")
@@ -135,6 +139,103 @@ async def test_0002_fails_loudly_without_admin_when_orphans_exist(scratch_db, mo
     monkeypatch.delenv("CHERRYAI_ADMIN_PASSWORD", raising=False)
     with pytest.raises(Exception, match="bootstrap"):
         await asyncio.to_thread(upgrade, scratch_db)
+
+
+@pytest.mark.asyncio
+async def test_0002_reuses_existing_admin(scratch_db, monkeypatch):
+    await asyncio.to_thread(upgrade, scratch_db, "0001")
+    conn = await asyncpg.connect(scratch_db)
+    admin_id = uuid.uuid4()
+    try:
+        from fastapi_users.password import PasswordHelper
+
+        hashed = PasswordHelper().hash("pw-ztest-existing")
+        await conn.execute(
+            'INSERT INTO "user" (id, email, hashed_password, is_active, '
+            "is_superuser, is_verified, role, display_name, memory_dataset) "
+            "VALUES ($1, $2, $3, true, true, true, 'admin', 'Admin', '')",
+            admin_id,
+            "ztest-existing-admin@example.com",
+            hashed,
+        )
+    finally:
+        await conn.close()
+    await _seed_legacy(scratch_db)
+    monkeypatch.delenv("CHERRYAI_ADMIN_EMAIL", raising=False)
+    monkeypatch.delenv("CHERRYAI_ADMIN_PASSWORD", raising=False)
+    await asyncio.to_thread(upgrade, scratch_db)
+    conn = await asyncpg.connect(scratch_db)
+    try:
+        user_count = await conn.fetchval('SELECT count(*) FROM "user"')
+        assert user_count == 1
+        session_owner = await conn.fetchval(
+            "SELECT user_id FROM sessions WHERE title = 'Ztest legacy chat'"
+        )
+        assert session_owner == admin_id
+        wiki_owner = await conn.fetchval(
+            "SELECT owner_id FROM wiki_entries WHERE slug = 'ztest-legacy'"
+        )
+        assert wiki_owner == admin_id
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_0002_downgrade_upgrade_round_trip(scratch_db, monkeypatch):
+    monkeypatch.setenv("CHERRYAI_ADMIN_EMAIL", "ztest-boot@example.com")
+    monkeypatch.setenv("CHERRYAI_ADMIN_PASSWORD", "pw-ztest-boot")
+    await asyncio.to_thread(upgrade, scratch_db, "0001")
+    await _seed_legacy(scratch_db)
+    await asyncio.to_thread(upgrade, scratch_db)
+    await asyncio.to_thread(downgrade, scratch_db, "0001")
+    await asyncio.to_thread(upgrade, scratch_db)
+    conn = await asyncpg.connect(scratch_db)
+    try:
+        session_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='sessions'"
+            )
+        }
+        assert "user_id" in session_cols
+        wiki_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='wiki_entries'"
+            )
+        }
+        assert "owner_id" in wiki_cols
+
+        a, b = uuid.uuid4(), uuid.uuid4()
+        from fastapi_users.password import PasswordHelper
+
+        hashed = PasswordHelper().hash("x")
+        for uid, email in ((a, "ztest-rt-a@example.com"), (b, "ztest-rt-b@example.com")):
+            await conn.execute(
+                'INSERT INTO "user" (id, email, hashed_password, is_active, '
+                "is_superuser, is_verified, role, display_name, memory_dataset) "
+                "VALUES ($1, $2, $3, true, false, true, 'chat', '', '')",
+                uid,
+                email,
+                hashed,
+            )
+        # Same slug under two different owners must both insert fine.
+        for uid in (a, b):
+            await conn.execute(
+                "INSERT INTO wiki_entries (id, slug, title, body, owner_id) "
+                "VALUES ($1, 'ztest-rt-dup', 'Ztest', '', $2)",
+                uuid.uuid4(),
+                uid,
+            )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                "INSERT INTO wiki_entries (id, slug, title, body, owner_id) "
+                "VALUES ($1, 'ztest-rt-dup', 'Ztest', '', $2)",
+                uuid.uuid4(),
+                a,
+            )
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio
