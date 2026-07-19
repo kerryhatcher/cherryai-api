@@ -310,3 +310,26 @@ async def test_rename_folder_rejects_result_exceeding_max_depth(pool) -> None:
             await rename_folder(pool, "zsrc", "za/zb")
     finally:
         await delete_entry(pool, deep.slug)
+
+
+@pytest.mark.asyncio
+async def test_rename_folder_rejecting_too_deep_leaves_shallow_page_untouched(pool) -> None:
+    shallow = await create_entry(
+        pool, WikiCreate(title=_unique_title("atomic shallow page"), folder="zatomic")
+    )
+    deep = await create_entry(
+        pool, WikiCreate(title=_unique_title("atomic deep page"), folder="zatomic/mid/leaf")
+    )
+    try:
+        # zatomic -> za/zb would push zatomic (1 level) to za/zb (fine) but
+        # zatomic/mid/leaf to za/zb/mid/leaf (4 levels, over the limit). The
+        # rename must reject the whole operation rather than moving the
+        # shallow page and leaving the deep one behind.
+        with pytest.raises(ValueError, match="levels of nesting"):
+            await rename_folder(pool, "zatomic", "za/zb")
+
+        assert (await get_entry(pool, shallow.slug)).folder == "zatomic"
+        assert (await get_entry(pool, deep.slug)).folder == "zatomic/mid/leaf"
+    finally:
+        for entry in (shallow, deep):
+            await delete_entry(pool, entry.slug)

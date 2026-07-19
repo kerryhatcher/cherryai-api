@@ -226,7 +226,15 @@ async def delete_entry(pool: asyncpg.Pool, slug: str) -> bool:
 
 
 async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
-    """Rewrite the folder prefix on a folder and every descendant.
+    """Rewrite the folder prefix on a folder and every descendant, atomically.
+
+    The depth check and the rewrite run as CTEs inside a single statement, so
+    they see one consistent snapshot of the table: a page inserted under
+    ``source`` between "check" and "write" can no longer slip past the depth
+    check and still get rewritten into a too-deep folder. The rename is also
+    all-or-nothing — if any matched page would exceed ``MAX_FOLDER_DEPTH``,
+    the ``UPDATE`` touches zero rows rather than moving the conforming pages
+    and skipping the rest.
 
     Returns the number of pages moved, or 0 when no page lives under ``source``.
     Raises :class:`ValueError` for an empty, identical, self-nesting, or
@@ -243,26 +251,42 @@ async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
     if dst.startswith(f"{src}/"):
         raise ValueError("Target folder must not be inside the source folder")
 
-    # LIKE with a '/' guard so 'zresearch' never matches 'zresearching'.
-    match = "folder = $1 OR folder LIKE $1 || '/%'"
-    deepest = await pool.fetchval(
-        "SELECT max(array_length(string_to_array(folder, '/'), 1)) "
-        f"FROM wiki_entries WHERE {match}",
-        src,
-    )
-    if deepest is None:
-        return 0
-    if deepest - len(src.split("/")) + len(dst.split("/")) > MAX_FOLDER_DEPTH:
-        raise ValueError(f"Renaming would exceed {MAX_FOLDER_DEPTH} levels of nesting")
-
-    result = await pool.execute(
-        "UPDATE wiki_entries "
-        "SET folder = $2 || substring(folder from length($1) + 1), updated_at = now() "
-        f"WHERE {match}",
+    # LIKE with a '/' guard so 'zresearch' never matches 'zresearching'. The
+    # UPDATE only fires when stats.too_deep = 0, so a single too-deep match
+    # blocks the write for every matched row, not just its own.
+    row = await pool.fetchrow(
+        """
+        WITH matched AS (
+            SELECT id, $2 || substring(folder from length($1) + 1) AS new_folder
+              FROM wiki_entries
+             WHERE folder = $1 OR folder LIKE $1 || '/%'
+        ),
+        stats AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE array_length(string_to_array(new_folder, '/'), 1) > $3
+                   ) AS too_deep
+              FROM matched
+        ),
+        updated AS (
+            UPDATE wiki_entries e
+               SET folder = m.new_folder, updated_at = now()
+              FROM matched m, stats s
+             WHERE e.id = m.id AND s.too_deep = 0
+            RETURNING e.id
+        )
+        SELECT s.total, s.too_deep, (SELECT count(*) FROM updated) AS moved
+          FROM stats s
+        """,
         src,
         dst,
+        MAX_FOLDER_DEPTH,
     )
-    return int(result.split()[-1])
+    if row["total"] == 0:
+        return 0
+    if row["too_deep"] > 0:
+        raise ValueError(f"Renaming would exceed {MAX_FOLDER_DEPTH} levels of nesting")
+    return row["moved"]
 
 
 async def search_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
