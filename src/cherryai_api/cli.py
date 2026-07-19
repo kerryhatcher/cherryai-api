@@ -85,7 +85,10 @@ def wiki_list() -> None:
             return
         for entry in entries:
             tags = f"  [{', '.join(entry.tags)}]" if entry.tags else ""
-            typer.echo(f"{entry.slug}  {entry.updated_at:%Y-%m-%d %H:%M}  {entry.title}{tags}")
+            location = f"  ({entry.folder})" if entry.folder else ""
+            typer.echo(
+                f"{entry.slug}  {entry.updated_at:%Y-%m-%d %H:%M}  {entry.title}{location}{tags}"
+            )
 
     asyncio.run(_run())
 

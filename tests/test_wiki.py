@@ -90,6 +90,7 @@ def test_format_search_results_strips_markup_and_links_by_path() -> None:
             slug="cherry-care",
             title="Cherry Care",
             tags=["orchard"],
+            folder="research",
             snippet="Water the <mark>cherry</mark> trees weekly.",
             rank=0.5,
         )
@@ -191,3 +192,60 @@ async def test_search_finds_seeded_entry(pool) -> None:
 
 async def test_search_blank_query_returns_no_hits(pool) -> None:
     assert await search_entries(pool, "   ") == []
+
+
+@pytest.mark.asyncio
+async def test_create_entry_normalizes_folder(pool) -> None:
+    entry = await create_entry(
+        pool, WikiCreate(title=_unique_title("folder create"), folder="Research / OCR ")
+    )
+    try:
+        assert entry.folder == "research/ocr"
+        fetched = await get_entry(pool, entry.slug)
+        assert fetched is not None and fetched.folder == "research/ocr"
+    finally:
+        await delete_entry(pool, entry.slug)
+
+
+@pytest.mark.asyncio
+async def test_create_entry_defaults_to_root(pool) -> None:
+    entry = await create_entry(pool, WikiCreate(title=_unique_title("root page")))
+    try:
+        assert entry.folder == ""
+    finally:
+        await delete_entry(pool, entry.slug)
+
+
+@pytest.mark.asyncio
+async def test_update_entry_moves_and_clears_folder(pool) -> None:
+    entry = await create_entry(
+        pool, WikiCreate(title=_unique_title("folder move"), folder="research")
+    )
+    try:
+        moved = await update_entry(pool, entry.slug, WikiUpdate(folder="ops/runbooks"))
+        assert moved is not None and moved.folder == "ops/runbooks"
+
+        # Omitting folder leaves it alone; "" explicitly moves the page to root.
+        untouched = await update_entry(pool, entry.slug, WikiUpdate(title="Ztest renamed"))
+        assert untouched is not None and untouched.folder == "ops/runbooks"
+
+        rooted = await update_entry(pool, entry.slug, WikiUpdate(folder=""))
+        assert rooted is not None and rooted.folder == ""
+    finally:
+        await delete_entry(pool, entry.slug)
+
+
+@pytest.mark.asyncio
+async def test_list_and_search_expose_folder(pool) -> None:
+    title = _unique_title("folder visible")
+    entry = await create_entry(
+        pool, WikiCreate(title=title, folder="research/ocr", body="Zqqx unique marker body")
+    )
+    try:
+        listed = [item for item in await list_entries(pool) if item.slug == entry.slug]
+        assert listed and listed[0].folder == "research/ocr"
+
+        hits = await search_entries(pool, "Zqqx")
+        assert hits and hits[0].folder == "research/ocr"
+    finally:
+        await delete_entry(pool, entry.slug)

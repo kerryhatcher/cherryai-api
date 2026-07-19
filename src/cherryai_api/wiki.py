@@ -41,7 +41,7 @@ _HEADLINE_OPTS = (
     "StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
 )
 _MARK_RE = re.compile(r"</?mark>")
-_ENTRY_COLUMNS = "id, slug, title, tags, body, created_at, updated_at"
+_ENTRY_COLUMNS = "id, slug, title, tags, body, folder, created_at, updated_at"
 
 
 class SlugExists(Exception):
@@ -60,6 +60,7 @@ class WikiEntry(BaseModel):
     title: str
     tags: list[str]
     body: str
+    folder: str
     created_at: datetime
     updated_at: datetime
 
@@ -71,6 +72,7 @@ class WikiListItem(BaseModel):
     slug: str
     title: str
     tags: list[str]
+    folder: str
     updated_at: datetime
 
 
@@ -80,6 +82,7 @@ class WikiSearchHit(BaseModel):
     slug: str
     title: str
     tags: list[str]
+    folder: str
     snippet: str
     rank: float
 
@@ -88,12 +91,14 @@ class WikiCreate(BaseModel):
     title: str
     tags: list[str] = []
     body: str = ""
+    folder: str = ""
 
 
 class WikiUpdate(BaseModel):
     title: str | None = None
     tags: list[str] | None = None
     body: str | None = None
+    folder: str | None = None
 
 
 def slugify(title: str) -> str:
@@ -137,7 +142,8 @@ async def ensure_wiki_table(pool: asyncpg.Pool) -> None:
 async def list_entries(pool: asyncpg.Pool) -> list[WikiListItem]:
     """Return all entries, newest-updated first, without bodies."""
     rows = await pool.fetch(
-        "SELECT id, slug, title, tags, updated_at FROM wiki_entries ORDER BY updated_at DESC"
+        "SELECT id, slug, title, tags, folder, updated_at "
+        "FROM wiki_entries ORDER BY updated_at DESC"
     )
     return [WikiListItem(**dict(row)) for row in rows]
 
@@ -160,15 +166,17 @@ async def create_entry(pool: asyncpg.Pool, data: WikiCreate) -> WikiEntry:
     slug = slugify(title)
     if not slug:
         raise ValueError("Title must contain at least one alphanumeric character")
+    folder = normalize_folder(data.folder)
     try:
         row = await pool.fetchrow(
-            f"INSERT INTO wiki_entries (id, slug, title, tags, body) "
-            f"VALUES ($1, $2, $3, $4, $5) RETURNING {_ENTRY_COLUMNS}",
+            f"INSERT INTO wiki_entries (id, slug, title, tags, body, folder) "
+            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_ENTRY_COLUMNS}",
             uuid.uuid4(),
             slug,
             title,
             list(data.tags),
             data.body,
+            folder,
         )
     except asyncpg.UniqueViolationError as error:
         raise SlugExists(slug) from error
@@ -184,17 +192,20 @@ async def update_entry(pool: asyncpg.Pool, slug: str, data: WikiUpdate) -> WikiE
     title = data.title.strip() if data.title is not None else None
     if data.title is not None and not title:
         raise ValueError("Title must not be empty")
+    folder = normalize_folder(data.folder) if data.folder is not None else None
     row = await pool.fetchrow(
         f"UPDATE wiki_entries SET "
         f"title = COALESCE($2, title), "
         f"tags = COALESCE($3, tags), "
         f"body = COALESCE($4, body), "
+        f"folder = COALESCE($5, folder), "
         f"updated_at = now() "
         f"WHERE slug = $1 RETURNING {_ENTRY_COLUMNS}",
         slug,
         title,
         list(data.tags) if data.tags is not None else None,
         data.body,
+        folder,
     )
     return WikiEntry(**dict(row)) if row else None
 
@@ -214,7 +225,7 @@ async def search_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
     if not query.strip():
         return []
     rows = await pool.fetch(
-        "SELECT slug, title, tags, "
+        "SELECT slug, title, tags, folder, "
         "ts_headline('english', title || ' ' || body, q, $2) AS snippet, "
         "ts_rank(search, q) AS rank "
         "FROM wiki_entries, websearch_to_tsquery('english', $1) AS q "
