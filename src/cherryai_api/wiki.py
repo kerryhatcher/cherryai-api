@@ -314,16 +314,18 @@ async def search_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
 def format_search_results(hits: list[WikiSearchHit]) -> str:
     """Render search hits as compact text for the agent's search_wiki tool.
 
-    One block per hit: title, the ``/wiki/{slug}`` path, and a plain-text
-    snippet (highlight markup stripped). Returns a short "no matches" line when
-    empty so the model always gets usable text.
+    One block per hit: title, the folder path when the page is not at the root,
+    the ``/wiki/{slug}`` path, and a plain-text snippet (highlight markup
+    stripped). Returns a short "no matches" line when empty so the model always
+    gets usable text.
     """
     if not hits:
         return "No wiki pages matched."
     lines: list[str] = []
     for hit in hits:
         snippet = " ".join(_MARK_RE.sub("", hit.snippet).split())
-        lines.append(f"{hit.title} (/wiki/{hit.slug})\n{snippet}")
+        folder = f"  {hit.folder}\n" if hit.folder else ""
+        lines.append(f"{hit.title}\n{folder}  /wiki/{hit.slug}\n  {snippet}")
     return "\n\n".join(lines)
 
 

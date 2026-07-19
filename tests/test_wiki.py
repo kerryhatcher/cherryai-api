@@ -103,6 +103,36 @@ def test_format_search_results_strips_markup_and_links_by_path() -> None:
     assert "Water the cherry trees weekly." in text
 
 
+def test_format_search_results_includes_folder() -> None:
+    hits = [
+        WikiSearchHit(
+            slug="ocr-survey",
+            title="OCR Survey",
+            tags=[],
+            folder="research/ocr",
+            snippet="AGPL-<mark>3.0</mark> poses risk",
+            rank=0.9,
+        )
+    ]
+    assert format_search_results(hits) == (
+        "OCR Survey\n  research/ocr\n  /wiki/ocr-survey\n  AGPL-3.0 poses risk"
+    )
+
+
+def test_format_search_results_omits_folder_line_at_root() -> None:
+    hits = [
+        WikiSearchHit(
+            slug="demo-notes",
+            title="Demo Notes",
+            tags=[],
+            folder="",
+            snippet="a snippet",
+            rank=0.5,
+        )
+    ]
+    assert format_search_results(hits) == "Demo Notes\n  /wiki/demo-notes\n  a snippet"
+
+
 # --- Database-backed CRUD ----------------------------------------------------
 
 
