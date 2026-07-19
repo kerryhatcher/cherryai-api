@@ -27,6 +27,7 @@ _TEST_TITLE_PREFIX = "Ztest "
 async def _clean_test_rows(pool) -> None:
     await pool.execute("DELETE FROM wiki_entries WHERE slug LIKE $1", f"{_TEST_SLUG_PREFIX}%")
     await pool.execute("DELETE FROM feedback_entries WHERE title LIKE $1", f"{_TEST_TITLE_PREFIX}%")
+    await pool.execute("DELETE FROM sessions WHERE title LIKE 'Ztest%'")
     try:
         await pool.execute("DELETE FROM \"user\" WHERE email LIKE 'ztest-%'")
     except asyncpg.UndefinedTableError:

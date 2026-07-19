@@ -13,6 +13,7 @@ from cherryai_api.settings import get_settings
 
 _SESSION_TITLE_MAX = 60
 
+# Frozen: schema evolution now lives in migrations/ (see 0002).
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS sessions (
     id UUID PRIMARY KEY,
@@ -36,6 +37,7 @@ class Session(BaseModel):
 
     id: uuid.UUID
     title: str
+    user_id: uuid.UUID
     created_at: datetime
 
 
@@ -88,26 +90,39 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchval("SELECT 1") == 1
 
-    async def create_session(self, title: str) -> Session:
+    async def create_session(self, title: str, user_id: uuid.UUID) -> Session:
         title = (title or "New chat").strip()[:_SESSION_TITLE_MAX] or "New chat"
         row = await self.pool.fetchrow(
-            "INSERT INTO sessions (id, title) VALUES ($1, $2) RETURNING id, title, created_at",
+            "INSERT INTO sessions (id, title, user_id) VALUES ($1, $2, $3) "
+            "RETURNING id, title, user_id, created_at",
             uuid.uuid4(),
             title,
+            user_id,
         )
         return Session(**dict(row))
 
-    async def list_sessions(self) -> list[Session]:
+    async def list_sessions(self, user_id: uuid.UUID) -> list[Session]:
         rows = await self.pool.fetch(
-            "SELECT id, title, created_at FROM sessions ORDER BY created_at DESC"
+            "SELECT id, title, user_id, created_at FROM sessions "
+            "WHERE user_id = $1 ORDER BY created_at DESC",
+            user_id,
         )
         return [Session(**dict(row)) for row in rows]
 
-    async def get_session(self, session_id: uuid.UUID) -> Session | None:
+    async def get_session(self, session_id: uuid.UUID, user_id: uuid.UUID) -> Session | None:
         row = await self.pool.fetchrow(
-            "SELECT id, title, created_at FROM sessions WHERE id = $1", session_id
+            "SELECT id, title, user_id, created_at FROM sessions WHERE id = $1 AND user_id = $2",
+            session_id,
+            user_id,
         )
         return Session(**dict(row)) if row else None
+
+    async def list_all_sessions(self) -> list[Session]:
+        """Admin view: every session across all users."""
+        rows = await self.pool.fetch(
+            "SELECT id, title, user_id, created_at FROM sessions ORDER BY created_at DESC"
+        )
+        return [Session(**dict(row)) for row in rows]
 
     async def list_messages(self, session_id: uuid.UUID) -> list[Message]:
         rows = await self.pool.fetch(

@@ -50,21 +50,24 @@ def chat(prompt: str) -> None:
 
 @sessions_app.command("list")
 def sessions_list() -> None:
-    """List recent chat sessions, newest first."""
+    """List recent chat sessions across all users, newest first (admin tool)."""
     from cherryai_api.db import build_database
 
     async def _run() -> None:
         db = build_database()
         await db.connect()
         try:
-            sessions = await db.list_sessions()
+            sessions = await db.list_all_sessions()
         finally:
             await db.close()
         if not sessions:
             typer.echo("No sessions yet.")
             return
         for session in sessions:
-            typer.echo(f"{session.id}  {session.created_at:%Y-%m-%d %H:%M}  {session.title}")
+            typer.echo(
+                f"{session.id}  {session.created_at:%Y-%m-%d %H:%M}  "
+                f"user={session.user_id}  {session.title}"
+            )
 
     asyncio.run(_run())
 

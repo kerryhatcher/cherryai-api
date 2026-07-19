@@ -1,4 +1,4 @@
-"""FastAPI HTTP surface for the CherryAI demo (no auth, by design)."""
+"""FastAPI HTTP surface for the CherryAI demo. Chat routes require auth."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
@@ -17,7 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import build_agent, run_turn, stream_turn, strip_leaked_reasoning
-from cherryai_api.auth import auth_backend, fastapi_users_app
+from cherryai_api.auth import auth_backend, fastapi_users_app, require_chat
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
@@ -25,7 +25,7 @@ from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
 from cherryai_api.telemetry import setup_telemetry
-from cherryai_api.users import UserCreate, UserRead, UserUpdate
+from cherryai_api.users import User, UserCreate, UserRead, UserUpdate
 from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
 from cherryai_api.workflows import router as workflows_router
@@ -126,21 +126,27 @@ async def health() -> dict:
 
 
 @app.get("/api/sessions")
-async def list_sessions() -> list[dict]:
-    sessions = await app.state.db.list_sessions()
+async def list_sessions(user: User = Depends(require_chat)) -> list[dict]:  # noqa: B008
+    sessions = await app.state.db.list_sessions(user.id)
     return [s.model_dump(mode="json") for s in sessions]
 
 
 @app.post("/api/sessions", status_code=201)
-async def create_session(body: CreateSessionRequest | None = None) -> dict:
+async def create_session(
+    body: CreateSessionRequest | None = None,
+    user: User = Depends(require_chat),  # noqa: B008
+) -> dict:
     title = body.title if body and body.title else "New chat"
-    session = await app.state.db.create_session(title)
+    session = await app.state.db.create_session(title, user.id)
     return session.model_dump(mode="json")
 
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_messages(session_id: uuid.UUID) -> list[dict]:
-    session = await app.state.db.get_session(session_id)
+async def get_messages(
+    session_id: uuid.UUID,
+    user: User = Depends(require_chat),  # noqa: B008
+) -> list[dict]:
+    session = await app.state.db.get_session(session_id, user.id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     messages = await app.state.db.list_messages(session_id)
@@ -186,13 +192,17 @@ def _extract_facts_in_background(extractor_agent, judge_agent, memory, message: 
 
 
 @app.post("/api/sessions/{session_id}/messages")
-async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
+async def send_message(
+    session_id: uuid.UUID,
+    body: SendMessageRequest,
+    user: User = Depends(require_chat),  # noqa: B008
+):
     """Persist the user message and stream the assistant reply as SSE."""
     db = app.state.db
     memory = app.state.memory
     agent = app.state.agent
 
-    session = await db.get_session(session_id)
+    session = await db.get_session(session_id, user.id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
