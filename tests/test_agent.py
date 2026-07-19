@@ -74,3 +74,39 @@ async def test_stream_turn_answers_from_tool_results_despite_narration():
     assert kind == "done"
     assert final == FINAL_ANSWER
     assert tool_calls == ["Stephanie Hatcher"]
+
+
+def _build_echo_agent(reply: str) -> Agent[None, str]:
+    """An agent whose model always answers with ``reply`` verbatim."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(reply)])
+
+    async def stream_respond(messages: list[ModelMessage], info: AgentInfo):
+        yield reply
+
+    return Agent(FunctionModel(function=respond, stream_function=stream_respond))
+
+
+async def _final_payload(agent: Agent[None, str]) -> str:
+    events = [event async for event in stream_turn(agent, "who is Stephanie Hatcher")]
+    kind, final = events[-1]
+    assert kind == "done"
+    return final
+
+
+async def test_stream_turn_strips_leaked_thought_header():
+    agent = _build_echo_agent("thought\nBased on the wiki, Stephanie is Kerry's wife.")
+    assert await _final_payload(agent) == "Based on the wiki, Stephanie is Kerry's wife."
+
+
+async def test_stream_turn_strips_leaked_think_block():
+    agent = _build_echo_agent(
+        "<think>The user wants the wiki entry.</think>\nStephanie is Kerry's wife."
+    )
+    assert await _final_payload(agent) == "Stephanie is Kerry's wife."
+
+
+async def test_stream_turn_keeps_ordinary_answers_untouched():
+    agent = _build_echo_agent("Thoughtful gardens need thought and care.")
+    assert await _final_payload(agent) == "Thoughtful gardens need thought and care."

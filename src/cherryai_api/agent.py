@@ -5,6 +5,7 @@ Every tool returns an error string to the model on failure instead of raising,
 so a flaky search or fetch never crashes an agent run.
 """
 
+import re
 from contextvars import ContextVar
 
 import httpx
@@ -18,8 +19,8 @@ from pydantic_ai import (
     TextPartDelta,
 )
 from pydantic_ai.messages import TextPart
-from pydantic_ai.models.openrouter import OpenRouterModel
-from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.ollama import OllamaProvider
 
 from cherryai_api.db import Database
 from cherryai_api.feedback import FeedbackCreate
@@ -144,13 +145,30 @@ async def run_web_search(query: str, settings: Settings) -> str:
     return "web_search is unavailable: no Tavily or Brave API key is configured."
 
 
-def build_model(settings: Settings) -> OpenRouterModel:
-    """Build the OpenRouter chat model, the only supported provider."""
-    if not settings.openrouter_api_key:
-        raise ValueError("OPENROUTER_API_KEY is missing from .env")
-    return OpenRouterModel(
-        settings.openrouter_model,
-        provider=OpenRouterProvider(api_key=settings.openrouter_api_key),
+# Some models leak reasoning into their text output instead of the proper
+# thinking channel: a bare "thought"/"thinking" header line or an inline
+# <think>...</think> block. Strip both before a reply reaches the user.
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.IGNORECASE | re.DOTALL)
+_THOUGHT_HEADER_RE = re.compile(r"^(?:thought|thoughts|thinking)\s*:?\s*\n", re.IGNORECASE)
+
+
+def strip_leaked_reasoning(text: str) -> str:
+    """Remove reasoning markers a model leaked into its visible answer."""
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _THOUGHT_HEADER_RE.sub("", cleaned.lstrip())
+    return cleaned.strip()
+
+
+def build_model(settings: Settings) -> OpenAIChatModel:
+    """Build the chat model, served by Ollama cloud."""
+    if not settings.ollama_api_key:
+        raise ValueError("OLLAMA_API_KEY is missing from .env")
+    return OpenAIChatModel(
+        settings.chat_model,
+        provider=OllamaProvider(
+            base_url=settings.ollama_base_url,
+            api_key=settings.ollama_api_key,
+        ),
     )
 
 
@@ -319,6 +337,6 @@ async def stream_turn(
                 elif isinstance(event, PartDeltaEvent):
                     if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
                         yield ("token", event.delta.content_delta)
-        yield ("done", final)
+        yield ("done", strip_leaked_reasoning(final))
     finally:
         _memory_search_state.reset(token)

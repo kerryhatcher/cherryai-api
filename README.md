@@ -12,7 +12,7 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 
 ### Architecture Highlights
 
-- **AI Model**: OpenRouter's `openrouter/free` model via Pydantic AI
+- **AI Model**: Ollama cloud's `gpt-oss:120b` model via Pydantic AI
 - **Memory Layer**: Cognee configured for fast session learning using:
   - PostgreSQL (pgvector) for vector embeddings (similarity search)
   - Neo4j for graph-structured knowledge and relationships
@@ -27,7 +27,7 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 - **Python 3.13+** (managed via `uv`)
 - **Docker** and **docker-compose** (for PostgreSQL with pgvector and Neo4j)
 - **API Keys**: 
-  - `OPENROUTER_API_KEY` — from OpenRouter (free tier available)
+  - `OLLAMA_API_KEY` — from Ollama cloud (serves the chat agent and feedback workflows)
   - `TAVILY_API_KEY` — from Tavily for web search (free tier available)
   - `BRAVE_API_KEY` — from Brave Search (fallback, free tier available)
 
@@ -39,7 +39,7 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 
    ```bash
    # AI Model
-   OPENROUTER_API_KEY=your_key_here
+   OLLAMA_API_KEY=your_key_here
 
    # Web Search (primary and fallback)
    TAVILY_API_KEY=your_key_here
@@ -174,7 +174,7 @@ src/cherryai_api/
 
 - **`settings.py`**: Loads and validates environment configuration via Pydantic Settings. Env vars must be set *before* importing the memory module.
 - **`memory.py`**: Configures Cognee with PostgreSQL (pgvector) + Neo4j. Provides `remember()` and `recall()` methods for storing and retrieving learned facts.
-- **`agent.py`**: Defines the Pydantic AI agent with the system prompt and three tools (web_search, web_fetch, search_memory). Uses `OpenRouterModel` and `OpenRouterProvider`.
+- **`agent.py`**: Defines the Pydantic AI agent with the system prompt and three tools (web_search, web_fetch, search_memory). Uses `OpenAIChatModel` with `OllamaProvider` (Ollama cloud).
 - **`db.py`**: SQLAlchemy-based async session/message store. Persists all chat turns to Postgres.
 - **`api.py`**: FastAPI application. Exposes `/api/health`, `/api/sessions/*`, and `/api/sessions/*/messages` endpoints with SSE streaming support.
 - **`cli.py`**: Typer CLI. Commands: `serve`, `chat`, `sessions list`.

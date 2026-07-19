@@ -7,7 +7,7 @@ from cherryai_api.settings import Settings
 
 def _settings(tavily: str = "", brave: str = "") -> Settings:
     return Settings(
-        openrouter_api_key="x",
+        ollama_api_key="x",
         tavily_api_key=tavily,
         brave_api_key=brave,
     )

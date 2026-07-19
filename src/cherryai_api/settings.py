@@ -19,17 +19,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- Language model (OpenRouter is the only supported chat provider) ---
-    openrouter_api_key: str = Field(default="", repr=False)
-    openrouter_model: str = "openrouter/free"
-
     # --- Web search / fetch tools ---
     tavily_api_key: str = Field(default="", repr=False)
     brave_api_key: str = Field(default="", repr=False)
 
-    # --- Ollama cloud (feedback AI workflows: triage/investigate/plan) ---
+    # --- Ollama cloud (chat agent + feedback AI workflows) ---
     ollama_base_url: str = "https://ollama.com/v1"
     ollama_api_key: str = Field(default="", repr=False)
+    chat_model: str = "gpt-oss:120b"
     workflow_triage_model: str = "gpt-oss:20b"
     workflow_investigate_model: str = "gpt-oss:120b"
     workflow_plan_model: str = "kimi-k2.7-code"

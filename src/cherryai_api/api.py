@@ -15,7 +15,7 @@ from loguru import logger
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from cherryai_api.agent import build_agent, run_turn, stream_turn
+from cherryai_api.agent import build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
@@ -205,11 +205,11 @@ async def send_message(session_id: uuid.UUID, body: SendMessageRequest):
                 elif kind == "done":
                     final = (payload or "".join(collected)).strip()
                     if not final:
-                        # openrouter/free sometimes emits a whitespace-only
+                        # Some models occasionally emit a whitespace-only
                         # answer; one non-streamed retry usually recovers.
                         logger.warning("Empty assistant reply; retrying turn")
                         retry = await run_turn(agent, prompt, history)
-                        final = (retry.output or "").strip()
+                        final = strip_leaked_reasoning(retry.output or "")
                         if final:
                             yield {"event": "token", "data": final}
                     if not final:

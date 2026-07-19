@@ -61,7 +61,7 @@ def _make_runtime(
     investigate_output: str = "investigation markdown",
     plan_output: str = "plan markdown",
 ) -> WorkflowRuntime:
-    settings = Settings(openrouter_api_key="x")
+    settings = Settings(ollama_api_key="x")
     triage = triage_output or TriageResult(type="bug", priority="medium", tags=[], questions=[])
     return WorkflowRuntime(
         settings=settings,
@@ -173,7 +173,7 @@ async def test_preflight_model_missing_raises(monkeypatch) -> None:
         return {"some-other-model"}
 
     monkeypatch.setattr(workflows, "_fetch_available_models", fake_fetch)
-    settings = Settings(openrouter_api_key="x")
+    settings = Settings(ollama_api_key="x")
     with pytest.raises(RuntimeError, match="not available"):
         await workflows._preflight_model(settings, "gpt-oss:20b")
 
@@ -183,7 +183,7 @@ async def test_preflight_model_present_does_not_raise(monkeypatch) -> None:
         return {"gpt-oss:20b", "kimi-k2.7-code"}
 
     monkeypatch.setattr(workflows, "_fetch_available_models", fake_fetch)
-    settings = Settings(openrouter_api_key="x")
+    settings = Settings(ollama_api_key="x")
     await workflows._preflight_model(settings, "gpt-oss:20b")  # must not raise
 
 
