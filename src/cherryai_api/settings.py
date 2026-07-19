@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     # Comma-separated list of allowed browser origins.
     cors_origins: str = "http://localhost:5173"
 
+    # --- Logging ---
+    # Directory for the JSONL log file (rotated at 1 MB, 7 gzipped rotations
+    # kept). Relative paths resolve against the process working directory.
+    log_dir: str = "logs"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

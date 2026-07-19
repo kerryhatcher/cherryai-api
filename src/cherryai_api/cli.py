@@ -161,6 +161,10 @@ def feedback_search(query: str) -> None:
 
 
 def main() -> None:
+    from cherryai_api.logging_setup import setup_file_logging
+    from cherryai_api.settings import get_settings
+
+    setup_file_logging(get_settings().log_dir)
     app()
 
 

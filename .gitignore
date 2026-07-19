@@ -220,3 +220,4 @@ __marimo__/
 # CherryAI local data
 .cognee/
 screenshots/
+logs/
