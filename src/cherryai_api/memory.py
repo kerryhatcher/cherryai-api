@@ -65,11 +65,19 @@ def _configure_graph() -> None:
 
 
 def _configure_cognee_llm() -> None:
-    """Use OpenRouter as Cognee's structured-output extraction model."""
-    os.environ["LLM_PROVIDER"] = "custom"
-    os.environ["LLM_MODEL"] = _settings.openrouter_model
-    os.environ["LLM_ENDPOINT"] = "https://openrouter.ai/api/v1"
-    os.environ["LLM_API_KEY"] = _settings.openrouter_api_key
+    """Point Cognee's structured-output extraction model at local Ollama.
+
+    OpenRouter's free tier cannot serve Cognee's cognify pipeline (its
+    structured-output calls 502 at the provider), so extraction runs on the
+    local instance instead.
+    """
+    # Cognee's native ollama provider wraps an OpenAI-compatible client, so
+    # the endpoint keeps its /v1 suffix and the model name stays unprefixed
+    # (the "custom" provider would require a litellm "openai/" model prefix).
+    os.environ["LLM_PROVIDER"] = "ollama"
+    os.environ["LLM_MODEL"] = _settings.cognee_llm_model
+    os.environ["LLM_ENDPOINT"] = _settings.cognee_llm_endpoint
+    os.environ["LLM_API_KEY"] = _settings.cognee_llm_api_key
 
 
 def _configure_directories() -> None:
@@ -128,11 +136,18 @@ class CogneeMemory:
         the full add + cognify pipeline into the durable graph dataset
         rather than the fast session-only path used for chat turns.
         """
-        _ = await cognee.remember(
+        result = await cognee.remember(
             fact,
             dataset_name=self.dataset,
             node_set=["user_facts"],
         )
+        # remember() reports pipeline failures on the result rather than
+        # raising, so a broken extraction LLM would otherwise be invisible.
+        status = getattr(result, "status", None)
+        if status == "errored":
+            raise RuntimeError(
+                f"Cognee remember() failed: {getattr(result, 'error', 'unknown error')}"
+            )
 
     async def recall_facts(self, query: str) -> str:
         """Recall existing durable facts similar to a candidate fact.
@@ -196,8 +211,8 @@ def _format_results(
             if value:
                 memories.append(str(value))
                 break
-        else:
-            memories.append(str(result))
+        # Results with no usable text (e.g. an empty graph completion) are
+        # skipped rather than rendered as a raw object repr.
     return "\n\n".join(memories) if memories else empty_message
 
 

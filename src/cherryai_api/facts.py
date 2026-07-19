@@ -68,6 +68,9 @@ def build_extractor_agent(settings: Settings) -> Agent[None, ExtractedFacts]:
         _local_ollama_model(settings),
         output_type=ExtractedFacts,
         instructions=EXTRACT_SYSTEM_PROMPT,
+        # qwen3:8b occasionally emits reasoning text instead of the output
+        # tool call; a couple of validation retries absorbs that flakiness.
+        retries=3,
     )
 
 
@@ -77,6 +80,8 @@ def build_judge_agent(settings: Settings) -> Agent[None, FactVerdict]:
         _local_ollama_model(settings),
         output_type=FactVerdict,
         instructions=JUDGE_SYSTEM_PROMPT,
+        # Same flakiness margin as the extractor agent.
+        retries=3,
     )
 
 

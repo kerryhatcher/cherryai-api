@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     neo4j_password: str = Field(default="cherryai_dev", repr=False)
 
     # --- Cognee memory ---
+    # Cognee's cognify extraction LLM. Local Ollama by default: OpenRouter's
+    # free tier 502s on Cognee's structured-output calls (provider "Stealth"
+    # rejects them), so the graph pipeline must not depend on it.
+    cognee_llm_endpoint: str = "http://localhost:11434/v1"
+    cognee_llm_model: str = "qwen3:8b"
+    cognee_llm_api_key: str = Field(default="ollama", repr=False)
     cognee_root_directory: str = "./.cognee"
     cognee_dataset: str = "cherryai_chat_history"
     cognee_session_id: str = "cherryai-chat"
