@@ -177,7 +177,8 @@ def _register_search_tools(agent: Agent, database: Database, memory: CogneeMemor
     async def search_wiki(query: str) -> str:
         """Search this workspace's wiki. Returns matching pages as compact text."""
         try:
-            # TODO(task 9): scope to the feedback entry's / triggering user's owner id
+            # Workflows are workspace-level background jobs; they search all
+            # owners deliberately.
             hits = await search_wiki_entries(database.pool, query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_wiki failed: {error}")

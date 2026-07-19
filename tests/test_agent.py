@@ -8,6 +8,9 @@ model's real answer — not end early on the narration.
 
 from __future__ import annotations
 
+import uuid
+
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -18,7 +21,19 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
-from cherryai_api.agent import stream_turn
+from cherryai_api.agent import AgentDeps, stream_turn
+
+
+class _FakeMemory:
+    """A stand-in for CogneeMemory: no real Cognee calls."""
+
+    async def recall(self, query: str) -> str:  # pragma: no cover - unused by these tests
+        return ""
+
+
+def _deps() -> AgentDeps:
+    return AgentDeps(memory=_FakeMemory(), user_id=uuid.uuid4())
+
 
 NARRATION = "I don't have anything on that person. Let me check the wiki:"
 WIKI_RESULT = "Stephanie Hatcher (/wiki/stephanie-hatcher) Wife of Kerry Hatcher."
@@ -68,7 +83,7 @@ def _build_narrating_agent() -> tuple[Agent[None, str], list[str]]:
 async def test_stream_turn_answers_from_tool_results_despite_narration():
     agent, tool_calls = _build_narrating_agent()
 
-    events = [event async for event in stream_turn(agent, "who is Stephanie Hatcher")]
+    events = [event async for event in stream_turn(agent, "who is Stephanie Hatcher", deps=_deps())]
 
     kind, final = events[-1]
     assert kind == "done"
@@ -89,7 +104,7 @@ def _build_echo_agent(reply: str) -> Agent[None, str]:
 
 
 async def _final_payload(agent: Agent[None, str]) -> str:
-    events = [event async for event in stream_turn(agent, "who is Stephanie Hatcher")]
+    events = [event async for event in stream_turn(agent, "who is Stephanie Hatcher", deps=_deps())]
     kind, final = events[-1]
     assert kind == "done"
     return final
@@ -110,3 +125,44 @@ async def test_stream_turn_strips_leaked_think_block():
 async def test_stream_turn_keeps_ordinary_answers_untouched():
     agent = _build_echo_agent("Thoughtful gardens need thought and care.")
     assert await _final_payload(agent) == "Thoughtful gardens need thought and care."
+
+
+class _DatabaseStub:
+    """A stand-in for Database: only the `.pool` attribute is read."""
+
+    def __init__(self, pool) -> None:
+        self.pool = pool
+
+
+def _respond_search_wiki(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    if _saw_tool_return(messages):
+        return ModelResponse(parts=[TextPart("done")])
+    return ModelResponse(parts=[ToolCallPart(tool_name="search_wiki", args={"query": "anything"})])
+
+
+@pytest.mark.asyncio
+async def test_search_wiki_tool_scopes_to_deps_user(pool, make_user, monkeypatch):
+    """The wiki tool must pass the deps user id into search_entries."""
+    from cherryai_api import agent as agent_mod
+    from cherryai_api.agent import build_agent
+    from cherryai_api.settings import Settings
+
+    seen: dict = {}
+
+    async def fake_search(pool_arg, owner_id, query):
+        seen["owner_id"] = owner_id
+        return []
+
+    monkeypatch.setattr(agent_mod, "search_entries", fake_search)
+
+    user = await make_user("ztest-search-wiki-deps@example.com")
+    agent = build_agent(
+        Settings(ollama_api_key="x"),
+        database=_DatabaseStub(pool),
+    )
+    deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
+
+    model = FunctionModel(function=_respond_search_wiki)
+    await agent.run("who is in the wiki?", deps=deps, model=model)
+
+    assert seen["owner_id"] == deps.user_id

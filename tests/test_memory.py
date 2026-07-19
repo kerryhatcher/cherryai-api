@@ -96,3 +96,19 @@ async def test_recall_facts_tolerates_permission_denied_on_first_run(monkeypatch
     result = await memory.recall_facts("Where does the user live?")
 
     assert result == "No similar facts were found."
+
+
+def test_build_memory_accepts_per_user_values():
+    from cherryai_api.memory import build_memory
+
+    m = build_memory("user-abc", "session-123")
+    assert m.dataset == "user-abc"
+    assert m.session_id == "session-123"
+
+
+def test_build_memory_defaults_to_settings():
+    from cherryai_api.memory import build_memory
+    from cherryai_api.settings import get_settings
+
+    m = build_memory()
+    assert m.dataset == get_settings().cognee_dataset

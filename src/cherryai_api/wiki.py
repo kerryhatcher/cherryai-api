@@ -347,12 +347,12 @@ async def search_entries(
 
 
 async def search_all_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
-    """Full-text search across every owner's title+body (CLI admin view only).
+    """Full-text search across every owner's title+body.
 
-    The HTTP API always scopes searches to the requesting user via
-    :func:`search_entries`; this is used by the CLI's all-owners view and,
-    temporarily, by the chat agent's ``search_wiki`` tool
-    (TODO(task 9): scope the agent tool to the calling user instead).
+    The HTTP API and the chat agent's ``search_wiki`` tool always scope
+    searches to the requesting user via :func:`search_entries`. This is used
+    by the CLI's all-owners view and by the workflow runtime's background
+    ``search_wiki`` tool, which deliberately searches across all owners.
     """
     if not query.strip():
         return []

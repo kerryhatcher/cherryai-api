@@ -216,10 +216,10 @@ def _format_results(
     return "\n\n".join(memories) if memories else empty_message
 
 
-def build_memory() -> CogneeMemory:
-    """Construct the CogneeMemory configured for this demo."""
+def build_memory(dataset: str | None = None, session_id: str | None = None) -> CogneeMemory:
+    """Construct a CogneeMemory; None falls back to the configured defaults."""
     return CogneeMemory(
-        _settings.cognee_dataset,
-        _settings.cognee_session_id,
+        dataset or _settings.cognee_dataset,
+        session_id or _settings.cognee_session_id,
         top_k=_settings.cognee_recall_top_k,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import typer
 
@@ -37,11 +38,13 @@ def serve(
 @app.command()
 def chat(prompt: str) -> None:
     """Run a one-shot prompt through the agent (smoke test, no persistence)."""
-    from cherryai_api.agent import build_agent, run_turn
+    from cherryai_api.agent import AgentDeps, build_agent, run_turn
+    from cherryai_api.memory import build_memory
 
     async def _run() -> str:
         agent = build_agent()
-        result = await run_turn(agent, prompt)
+        deps = AgentDeps(memory=build_memory(), user_id=uuid.uuid4())
+        result = await run_turn(agent, prompt, deps=deps)
         return result.output
 
     output = asyncio.run(_run())

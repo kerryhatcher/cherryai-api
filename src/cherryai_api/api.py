@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.admin import router as admin_router
-from cherryai_api.agent import build_agent, run_turn, stream_turn, strip_leaked_reasoning
+from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, fastapi_users_app, require_chat
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
@@ -47,12 +47,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_telemetry(app)
     database = build_database()
     await database.connect()
-    memory = build_memory()
-    workflows = build_workflow_runtime(settings, database, memory)
-    agent = build_agent(settings, memory=memory, database=database, workflows=workflows)
+    # Kept solely for the workflow runtime, which is a workspace-level
+    # background pipeline not tied to a requesting user. Per-request chat
+    # traffic builds its own memory in send_message.
+    default_memory = build_memory()
+    workflows = build_workflow_runtime(settings, database, default_memory)
+    agent = build_agent(settings, database=database, workflows=workflows)
     app.state.settings = settings
     app.state.db = database
-    app.state.memory = memory
     app.state.workflows = workflows
     app.state.agent = agent
     if settings.fact_extraction_enabled:
@@ -199,7 +201,6 @@ async def send_message(
 ):
     """Persist the user message and stream the assistant reply as SSE."""
     db = app.state.db
-    memory = app.state.memory
     agent = app.state.agent
 
     session = await db.get_session(session_id, user.id)
@@ -209,6 +210,9 @@ async def send_message(
     prompt = body.content.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Message content is empty")
+
+    memory = build_memory(user.memory_dataset, str(session_id))
+    deps = AgentDeps(memory=memory, user_id=user.id)
 
     was_empty = await db.is_session_empty(session_id)
     await db.add_message(session_id, "user", prompt)
@@ -223,7 +227,7 @@ async def send_message(
     async def event_stream() -> AsyncIterator[dict]:
         collected: list[str] = []
         try:
-            async for kind, payload in stream_turn(agent, prompt, history):
+            async for kind, payload in stream_turn(agent, prompt, history, deps=deps):
                 if kind == "token":
                     collected.append(payload)
                     yield {"event": "token", "data": payload}
@@ -233,7 +237,7 @@ async def send_message(
                         # Some models occasionally emit a whitespace-only
                         # answer; one non-streamed retry usually recovers.
                         logger.warning("Empty assistant reply; retrying turn")
-                        retry = await run_turn(agent, prompt, history)
+                        retry = await run_turn(agent, prompt, history, deps=deps)
                         final = strip_leaked_reasoning(retry.output or "")
                         if final:
                             yield {"event": "token", "data": final}

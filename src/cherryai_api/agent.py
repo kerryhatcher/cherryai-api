@@ -6,7 +6,9 @@ so a flaky search or fetch never crashes an agent run.
 """
 
 import re
+import uuid
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,6 +18,7 @@ from pydantic_ai import (
     AgentRunResultEvent,
     PartDeltaEvent,
     PartStartEvent,
+    RunContext,
     TextPartDelta,
 )
 from pydantic_ai.messages import TextPart
@@ -27,10 +30,19 @@ from cherryai_api.feedback import FeedbackCreate
 from cherryai_api.feedback import create_entry as create_feedback_entry
 from cherryai_api.feedback import format_search_results as format_feedback_results
 from cherryai_api.feedback import search_entries as search_feedback_entries
-from cherryai_api.memory import CogneeMemory, build_memory
+from cherryai_api.memory import CogneeMemory
 from cherryai_api.settings import Settings, get_settings
-from cherryai_api.wiki import format_search_results, search_all_entries
+from cherryai_api.wiki import format_search_results, search_entries
 from cherryai_api.workflows import WorkflowRuntime, fire_and_forget_triage
+
+
+@dataclass
+class AgentDeps:
+    """Per-request context: whose memory, and which user's data to search."""
+
+    memory: CogneeMemory
+    user_id: uuid.UUID
+
 
 # Tracks how many times search_memory has run within a single agent turn so a
 # model cannot loop on recalled content. Mirrors hatchai's loop guard.
@@ -174,23 +186,23 @@ def build_model(settings: Settings) -> OpenAIChatModel:
 
 def build_agent(
     settings: Settings | None = None,
-    memory: CogneeMemory | None = None,
     database: Database | None = None,
     workflows: WorkflowRuntime | None = None,
-) -> Agent[None, str]:
+) -> Agent[AgentDeps, str]:
     """Build the CherryAI agent and register its six tools.
 
     ``database`` powers the read-only ``search_wiki``/``search_feedback``
     tools and the guardrailed ``create_feedback`` tool; when omitted (e.g.
     one-shot CLI smoke tests) those tools report themselves unavailable
     instead. ``workflows`` (when given, alongside ``database``) fires
-    auto-triage after ``create_feedback`` succeeds.
+    auto-triage after ``create_feedback`` succeeds. Per-request state (whose
+    memory, which user's data to search) arrives via ``AgentDeps`` on each run.
     """
     settings = settings or get_settings()
-    memory = memory or build_memory()
-    agent: Agent[None, str] = Agent(
+    agent: Agent[AgentDeps, str] = Agent(
         build_model(settings),
         instructions=SYSTEM_PROMPT,
+        deps_type=AgentDeps,
     )
 
     @agent.tool_plain
@@ -219,8 +231,8 @@ def build_agent(
             readable = readable[:_FETCH_MAX_CHARS] + "… [truncated]"
         return readable or f"No readable text found at {url}."
 
-    @agent.tool_plain
-    async def search_memory(query: str) -> str:
+    @agent.tool
+    async def search_memory(ctx: RunContext[AgentDeps], query: str) -> str:
         """Recall relevant details from earlier conversations."""
         state = _memory_search_state.get()
         if state is not None:
@@ -234,20 +246,19 @@ def build_agent(
             state["count"] += 1
         logger.bind(query=query).debug("search_memory")
         try:
-            return await memory.recall(query)
+            return await ctx.deps.memory.recall(query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_memory failed: {error}")
             return f"search_memory failed: {error}"
 
-    @agent.tool_plain
-    async def search_wiki(query: str) -> str:
-        """Search this workspace's wiki. Returns matching pages as compact text."""
+    @agent.tool
+    async def search_wiki(ctx: RunContext[AgentDeps], query: str) -> str:
+        """Search this user's wiki. Returns matching pages as compact text."""
         logger.bind(query=query).debug("search_wiki")
         if database is None:
             return "search_wiki is unavailable: no database is configured."
         try:
-            # TODO(task 9): scope to ctx.deps.user_id
-            hits = await search_all_entries(database.pool, query)
+            hits = await search_entries(database.pool, ctx.deps.user_id, query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_wiki failed: {error}")
             return f"search_wiki failed: {error}"
@@ -298,22 +309,26 @@ def build_agent(
 
 
 async def run_turn(
-    agent: Agent[None, str],
+    agent: Agent[AgentDeps, str],
     prompt: str,
     message_history: list | None = None,
+    *,
+    deps: AgentDeps,
 ):
     """Run one agent turn with the per-turn memory loop guard active."""
     token = _memory_search_state.set({"count": 0})
     try:
-        return await agent.run(prompt, message_history=message_history or [])
+        return await agent.run(prompt, message_history=message_history or [], deps=deps)
     finally:
         _memory_search_state.reset(token)
 
 
 async def stream_turn(
-    agent: Agent[None, str],
+    agent: Agent[AgentDeps, str],
     prompt: str,
     message_history: list | None = None,
+    *,
+    deps: AgentDeps,
 ):
     """Yield ("token", delta) chunks then a final ("done", full_text) tuple.
 
@@ -328,7 +343,9 @@ async def stream_turn(
     token = _memory_search_state.set({"count": 0})
     try:
         final = ""
-        async with agent.run_stream_events(prompt, message_history=message_history or []) as events:
+        async with agent.run_stream_events(
+            prompt, message_history=message_history or [], deps=deps
+        ) as events:
             async for event in events:
                 if isinstance(event, AgentRunResultEvent):
                     final = event.result.output
