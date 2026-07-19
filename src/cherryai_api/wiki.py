@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS wiki_entries (
 );
 CREATE INDEX IF NOT EXISTS wiki_entries_search_idx
     ON wiki_entries USING GIN (search);
+ALTER TABLE wiki_entries ADD COLUMN IF NOT EXISTS folder TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS wiki_entries_folder_idx ON wiki_entries (folder);
 """
 
 _SEARCH_LIMIT = 10
@@ -102,6 +104,28 @@ def slugify(title: str) -> str:
     alphanumeric characters.
     """
     return re.sub(r"[^a-z0-9]+", "-", title.strip().lower()).strip("-")
+
+
+MAX_FOLDER_DEPTH = 3
+MAX_FOLDER_LENGTH = 200
+
+
+def normalize_folder(raw: str) -> str:
+    """Normalize a folder path: slugify each segment, drop empties, rejoin.
+
+    Returns "" for the root. Leading, trailing, and doubled slashes and ".."
+    segments all normalize away rather than erroring. Raises :class:`ValueError`
+    when the result is too deep or too long.
+    """
+    segments = [segment for segment in (slugify(part) for part in raw.split("/")) if segment]
+    if not segments:
+        return ""
+    if len(segments) > MAX_FOLDER_DEPTH:
+        raise ValueError(f"Folder path may be at most {MAX_FOLDER_DEPTH} levels deep")
+    folder = "/".join(segments)
+    if len(folder) > MAX_FOLDER_LENGTH:
+        raise ValueError(f"Folder path may be at most {MAX_FOLDER_LENGTH} characters")
+    return folder
 
 
 async def ensure_wiki_table(pool: asyncpg.Pool) -> None:

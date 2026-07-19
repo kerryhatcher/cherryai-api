@@ -20,6 +20,7 @@ from cherryai_api.wiki import (
     format_search_results,
     get_entry,
     list_entries,
+    normalize_folder,
     search_entries,
     slugify,
     update_entry,
@@ -49,6 +50,34 @@ def _unique_title(label: str) -> str:
 )
 def test_slugify(title: str, expected: str) -> None:
     assert slugify(title) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", ""),
+        ("   ", ""),
+        ("research", "research"),
+        ("Research / OCR ", "research/ocr"),
+        ("/research/ocr/", "research/ocr"),
+        ("research//ocr", "research/ocr"),
+        ("../research", "research"),
+        ("Research & Models", "research-models"),
+        ("a/b/c", "a/b/c"),
+    ],
+)
+def test_normalize_folder(raw: str, expected: str) -> None:
+    assert normalize_folder(raw) == expected
+
+
+def test_normalize_folder_rejects_excess_depth() -> None:
+    with pytest.raises(ValueError, match="3 levels"):
+        normalize_folder("a/b/c/d")
+
+
+def test_normalize_folder_rejects_overlong_path() -> None:
+    with pytest.raises(ValueError, match="200 characters"):
+        normalize_folder("/".join(["x" * 90, "y" * 90, "z" * 90]))
 
 
 def test_format_search_results_empty() -> None:
