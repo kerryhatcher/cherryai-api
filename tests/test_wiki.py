@@ -21,6 +21,7 @@ from cherryai_api.wiki import (
     get_entry,
     list_entries,
     normalize_folder,
+    rename_folder,
     search_entries,
     slugify,
     update_entry,
@@ -249,3 +250,63 @@ async def test_list_and_search_expose_folder(pool) -> None:
         assert hits and hits[0].folder == "research/ocr"
     finally:
         await delete_entry(pool, entry.slug)
+
+
+# --- Folder rename ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rename_folder_moves_folder_and_descendants(pool) -> None:
+    parent = await create_entry(
+        pool, WikiCreate(title=_unique_title("rename parent"), folder="zresearch")
+    )
+    child = await create_entry(
+        pool, WikiCreate(title=_unique_title("rename child"), folder="zresearch/ocr")
+    )
+    outside = await create_entry(
+        pool, WikiCreate(title=_unique_title("rename outside"), folder="zresearching")
+    )
+    try:
+        moved = await rename_folder(pool, "zresearch", "znotes")
+        assert moved == 2
+
+        assert (await get_entry(pool, parent.slug)).folder == "znotes"
+        assert (await get_entry(pool, child.slug)).folder == "znotes/ocr"
+        # A sibling whose name merely starts with the source must not move.
+        assert (await get_entry(pool, outside.slug)).folder == "zresearching"
+    finally:
+        for entry in (parent, child, outside):
+            await delete_entry(pool, entry.slug)
+
+
+@pytest.mark.asyncio
+async def test_rename_folder_returns_zero_when_unmatched(pool) -> None:
+    assert await rename_folder(pool, "znosuchfolder", "zwhatever") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "target", "message"),
+    [
+        ("", "znotes", "Source folder"),
+        ("zresearch", "", "Target folder"),
+        ("zresearch", "zresearch", "must differ"),
+        ("zresearch", "zresearch/ocr", "inside the source"),
+    ],
+)
+async def test_rename_folder_rejects_invalid_pairs(pool, source, target, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        await rename_folder(pool, source, target)
+
+
+@pytest.mark.asyncio
+async def test_rename_folder_rejects_result_exceeding_max_depth(pool) -> None:
+    deep = await create_entry(
+        pool, WikiCreate(title=_unique_title("deep page"), folder="zsrc/mid/leaf")
+    )
+    try:
+        # zsrc -> za/zb would push zsrc/mid/leaf to za/zb/mid/leaf: 4 levels.
+        with pytest.raises(ValueError, match="levels of nesting"):
+            await rename_folder(pool, "zsrc", "za/zb")
+    finally:
+        await delete_entry(pool, deep.slug)

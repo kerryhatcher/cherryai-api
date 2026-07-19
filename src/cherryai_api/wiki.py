@@ -13,7 +13,7 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 # Generated tsvector + GIN index give us Postgres full-text search for free on
 # every write. Created on startup alongside the chat tables (see db.connect()).
@@ -99,6 +99,15 @@ class WikiUpdate(BaseModel):
     tags: list[str] | None = None
     body: str | None = None
     folder: str | None = None
+
+
+class FolderRename(BaseModel):
+    """Rename payload; JSON uses ``from``/``to``, which are keywords in Python."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: str = Field(alias="from")
+    target: str = Field(alias="to")
 
 
 def slugify(title: str) -> str:
@@ -216,6 +225,46 @@ async def delete_entry(pool: asyncpg.Pool, slug: str) -> bool:
     return result.endswith("1")
 
 
+async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
+    """Rewrite the folder prefix on a folder and every descendant.
+
+    Returns the number of pages moved, or 0 when no page lives under ``source``.
+    Raises :class:`ValueError` for an empty, identical, self-nesting, or
+    too-deep rename.
+    """
+    src = normalize_folder(source)
+    dst = normalize_folder(target)
+    if not src:
+        raise ValueError("Source folder must not be empty")
+    if not dst:
+        raise ValueError("Target folder must not be empty")
+    if src == dst:
+        raise ValueError("Target folder must differ from the source folder")
+    if dst.startswith(f"{src}/"):
+        raise ValueError("Target folder must not be inside the source folder")
+
+    # LIKE with a '/' guard so 'zresearch' never matches 'zresearching'.
+    match = "folder = $1 OR folder LIKE $1 || '/%'"
+    deepest = await pool.fetchval(
+        "SELECT max(array_length(string_to_array(folder, '/'), 1)) "
+        f"FROM wiki_entries WHERE {match}",
+        src,
+    )
+    if deepest is None:
+        return 0
+    if deepest - len(src.split("/")) + len(dst.split("/")) > MAX_FOLDER_DEPTH:
+        raise ValueError(f"Renaming would exceed {MAX_FOLDER_DEPTH} levels of nesting")
+
+    result = await pool.execute(
+        "UPDATE wiki_entries "
+        "SET folder = $2 || substring(folder from length($1) + 1), updated_at = now() "
+        f"WHERE {match}",
+        src,
+        dst,
+    )
+    return int(result.split()[-1])
+
+
 async def search_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
     """Full-text search over title+body, top 10 by ts_rank with snippets.
 
@@ -266,6 +315,17 @@ def _pool(request: Request) -> asyncpg.Pool:
 async def search(request: Request, q: str) -> list[dict]:
     hits = await search_entries(_pool(request), q)
     return [hit.model_dump(mode="json") for hit in hits]
+
+
+@router.post("/folders/rename")
+async def rename_wiki_folder(request: Request, body: FolderRename) -> dict:
+    try:
+        moved = await rename_folder(_pool(request), body.source, body.target)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if moved == 0:
+        raise HTTPException(status_code=404, detail="No pages found in that folder")
+    return {"moved": moved}
 
 
 @router.get("")
