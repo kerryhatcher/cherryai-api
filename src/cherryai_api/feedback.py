@@ -14,8 +14,11 @@ import uuid
 from datetime import datetime
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+
+from cherryai_api.auth import current_verified_user
+from cherryai_api.users import User
 
 _VALID_TYPES = {"bug", "feature", "user_story"}
 _VALID_STATUSES = {"open", "in_progress", "resolved", "closed", "wontfix"}
@@ -189,8 +192,14 @@ async def get_entry(pool: asyncpg.Pool, id: int) -> FeedbackEntry | None:
     return FeedbackEntry(**dict(row)) if row else None
 
 
-async def create_entry(pool: asyncpg.Pool, data: FeedbackCreate) -> FeedbackEntry:
+async def create_entry(
+    pool: asyncpg.Pool, data: FeedbackCreate, user_id: uuid.UUID | None = None
+) -> FeedbackEntry:
     """Insert a new entry; status is always 'open' regardless of input.
+
+    ``user_id`` attributes the entry to its reporter but does not scope
+    anything — feedback stays workspace-shared and is omitted when not
+    supplied (e.g. CLI/tool-originated entries).
 
     Raises :class:`ValueError` on an empty title or an invalid type/priority.
     """
@@ -203,8 +212,8 @@ async def create_entry(pool: asyncpg.Pool, data: FeedbackCreate) -> FeedbackEntr
         raise ValueError(f"Invalid priority '{data.priority}'")
     row = await pool.fetchrow(
         "INSERT INTO feedback_entries "
-        "(title, tags, type, status, priority, body, investigation, plan) "
-        f"VALUES ($1, $2, $3, 'open', $4, $5, $6, $7) RETURNING {_ENTRY_COLUMNS}",
+        "(title, tags, type, status, priority, body, investigation, plan, user_id) "
+        f"VALUES ($1, $2, $3, 'open', $4, $5, $6, $7, $8) RETURNING {_ENTRY_COLUMNS}",
         title,
         list(data.tags),
         data.type,
@@ -212,6 +221,7 @@ async def create_entry(pool: asyncpg.Pool, data: FeedbackCreate) -> FeedbackEntr
         data.body,
         data.investigation,
         data.plan,
+        user_id,
     )
     return FeedbackEntry(**dict(row))
 
@@ -335,7 +345,11 @@ def _pool(request: Request) -> asyncpg.Pool:
 # /search is declared before /{id} so the literal path wins over the wildcard
 # (id is also int-typed, so a "search" segment could never match it anyway).
 @router.get("/search")
-async def search(request: Request, q: str) -> list[dict]:
+async def search(
+    request: Request,
+    q: str,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
     hits = await search_entries(_pool(request), q)
     return [hit.model_dump(mode="json") for hit in hits]
 
@@ -346,6 +360,7 @@ async def list_feedback(
     type: str | None = None,
     status: str | None = None,
     priority: str | None = None,
+    user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
         entries = await list_entries(_pool(request), type=type, status=status, priority=priority)
@@ -355,9 +370,13 @@ async def list_feedback(
 
 
 @router.post("", status_code=201)
-async def create_feedback(request: Request, body: FeedbackCreate) -> dict:
+async def create_feedback(
+    request: Request,
+    body: FeedbackCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     try:
-        entry = await create_entry(_pool(request), body)
+        entry = await create_entry(_pool(request), body, user_id=user.id)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     _trigger_auto_triage(request, entry.id)
@@ -379,7 +398,11 @@ def _trigger_auto_triage(request: Request, id: int) -> None:
 
 
 @router.get("/{id}")
-async def get_feedback(request: Request, id: int) -> dict:
+async def get_feedback(
+    request: Request,
+    id: int,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     entry = await get_entry(_pool(request), id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Feedback entry not found")
@@ -387,7 +410,12 @@ async def get_feedback(request: Request, id: int) -> dict:
 
 
 @router.put("/{id}")
-async def update_feedback(request: Request, id: int, body: FeedbackUpdate) -> dict:
+async def update_feedback(
+    request: Request,
+    id: int,
+    body: FeedbackUpdate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     try:
         entry = await update_entry(_pool(request), id, body)
     except ValueError as error:
@@ -400,7 +428,11 @@ async def update_feedback(request: Request, id: int, body: FeedbackUpdate) -> di
 
 
 @router.delete("/{id}", status_code=204)
-async def delete_feedback(request: Request, id: int) -> None:
+async def delete_feedback(
+    request: Request,
+    id: int,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> None:
     try:
         deleted = await delete_entry(_pool(request), id)
     except EntryLocked as error:

@@ -206,6 +206,29 @@ async def test_update_succeeds_once_job_is_no_longer_running(pool) -> None:
     assert updated.status == "resolved"
 
 
+async def test_create_entry_records_reporter_user_id(pool, make_user) -> None:
+    reporter = await make_user("ztest-freporter@example.com")
+    created = await create_entry(
+        pool,
+        FeedbackCreate(title=_unique_title("Attributed Bug"), type="bug"),
+        user_id=reporter["id"],
+    )
+    stored_user_id = await pool.fetchval(
+        "SELECT user_id FROM feedback_entries WHERE id = $1", created.id
+    )
+    assert stored_user_id == reporter["id"]
+
+
+async def test_create_entry_user_id_defaults_to_none(pool) -> None:
+    created = await create_entry(
+        pool, FeedbackCreate(title=_unique_title("Unattributed Bug"), type="bug")
+    )
+    stored_user_id = await pool.fetchval(
+        "SELECT user_id FROM feedback_entries WHERE id = $1", created.id
+    )
+    assert stored_user_id is None
+
+
 async def test_job_fields_default_to_none(pool) -> None:
     created = await create_entry(pool, FeedbackCreate(title=_unique_title("Fresh"), type="bug"))
     assert created.job_stage is None

@@ -32,7 +32,7 @@ from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory
 from cherryai_api.settings import Settings
 from cherryai_api.wiki import format_search_results as format_wiki_results
-from cherryai_api.wiki import search_entries as search_wiki_entries
+from cherryai_api.wiki import search_all_entries as search_wiki_entries
 
 _STAGES = ("triage", "investigate", "plan")
 
@@ -177,6 +177,7 @@ def _register_search_tools(agent: Agent, database: Database, memory: CogneeMemor
     async def search_wiki(query: str) -> str:
         """Search this workspace's wiki. Returns matching pages as compact text."""
         try:
+            # TODO(task 9): scope to the feedback entry's / triggering user's owner id
             hits = await search_wiki_entries(database.pool, query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_wiki failed: {error}")

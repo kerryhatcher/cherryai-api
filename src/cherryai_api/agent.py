@@ -29,7 +29,7 @@ from cherryai_api.feedback import format_search_results as format_feedback_resul
 from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory, build_memory
 from cherryai_api.settings import Settings, get_settings
-from cherryai_api.wiki import format_search_results, search_entries
+from cherryai_api.wiki import format_search_results, search_all_entries
 from cherryai_api.workflows import WorkflowRuntime, fire_and_forget_triage
 
 # Tracks how many times search_memory has run within a single agent turn so a
@@ -246,7 +246,8 @@ def build_agent(
         if database is None:
             return "search_wiki is unavailable: no database is configured."
         try:
-            hits = await search_entries(database.pool, query)
+            # TODO(task 9): scope to ctx.deps.user_id
+            hits = await search_all_entries(database.pool, query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_wiki failed: {error}")
             return f"search_wiki failed: {error}"

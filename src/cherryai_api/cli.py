@@ -74,15 +74,15 @@ def sessions_list() -> None:
 
 @wiki_app.command("list")
 def wiki_list() -> None:
-    """List wiki pages, newest-updated first."""
+    """List wiki pages across all owners, newest-updated first."""
     from cherryai_api.db import build_database
-    from cherryai_api.wiki import list_entries
+    from cherryai_api.wiki import list_all_entries
 
     async def _run() -> None:
         db = build_database()
         await db.connect()
         try:
-            entries = await list_entries(db.pool)
+            entries = await list_all_entries(db.pool)
         finally:
             await db.close()
         if not entries:
@@ -100,15 +100,15 @@ def wiki_list() -> None:
 
 @wiki_app.command("search")
 def wiki_search(query: str) -> None:
-    """Full-text search the wiki and print matching pages."""
+    """Full-text search the wiki across all owners and print matching pages."""
     from cherryai_api.db import build_database
-    from cherryai_api.wiki import format_search_results, search_entries
+    from cherryai_api.wiki import format_search_results, search_all_entries
 
     async def _run() -> None:
         db = build_database()
         await db.connect()
         try:
-            hits = await search_entries(db.pool, query)
+            hits = await search_all_entries(db.pool, query)
         finally:
             await db.close()
         typer.echo(format_search_results(hits))

@@ -12,8 +12,11 @@ import uuid
 from datetime import datetime
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+
+from cherryai_api.auth import current_verified_user
+from cherryai_api.users import User
 
 # Generated tsvector + GIN index give us Postgres full-text search for free on
 # every write. Created on startup alongside the chat tables (see db.connect()).
@@ -41,7 +44,7 @@ _HEADLINE_OPTS = (
     "StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=20, ShortWord=3"
 )
 _MARK_RE = re.compile(r"</?mark>")
-_ENTRY_COLUMNS = "id, slug, title, tags, body, folder, created_at, updated_at"
+_ENTRY_COLUMNS = "id, slug, title, tags, body, folder, owner_id, created_at, updated_at"
 
 
 class SlugExists(Exception):
@@ -61,6 +64,7 @@ class WikiEntry(BaseModel):
     tags: list[str]
     body: str
     folder: str
+    owner_id: uuid.UUID
     created_at: datetime
     updated_at: datetime
 
@@ -148,8 +152,21 @@ async def ensure_wiki_table(pool: asyncpg.Pool) -> None:
         await conn.execute(CREATE_WIKI_TABLE)
 
 
-async def list_entries(pool: asyncpg.Pool) -> list[WikiListItem]:
-    """Return all entries, newest-updated first, without bodies."""
+async def list_entries(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[WikiListItem]:
+    """Return the owner's entries, newest-updated first, without bodies."""
+    rows = await pool.fetch(
+        "SELECT id, slug, title, tags, folder, updated_at "
+        "FROM wiki_entries WHERE owner_id = $1 ORDER BY updated_at DESC",
+        owner_id,
+    )
+    return [WikiListItem(**dict(row)) for row in rows]
+
+
+async def list_all_entries(pool: asyncpg.Pool) -> list[WikiListItem]:
+    """Return every entry across all owners, newest-updated first.
+
+    CLI-only admin view; the HTTP API always scopes to the requesting user.
+    """
     rows = await pool.fetch(
         "SELECT id, slug, title, tags, folder, updated_at "
         "FROM wiki_entries ORDER BY updated_at DESC"
@@ -157,17 +174,22 @@ async def list_entries(pool: asyncpg.Pool) -> list[WikiListItem]:
     return [WikiListItem(**dict(row)) for row in rows]
 
 
-async def get_entry(pool: asyncpg.Pool, slug: str) -> WikiEntry | None:
-    """Return the full entry for a slug, or None if it does not exist."""
-    row = await pool.fetchrow(f"SELECT {_ENTRY_COLUMNS} FROM wiki_entries WHERE slug = $1", slug)
+async def get_entry(pool: asyncpg.Pool, owner_id: uuid.UUID, slug: str) -> WikiEntry | None:
+    """Return the owner's full entry for a slug, or None if it does not exist."""
+    row = await pool.fetchrow(
+        f"SELECT {_ENTRY_COLUMNS} FROM wiki_entries WHERE owner_id = $1 AND slug = $2",
+        owner_id,
+        slug,
+    )
     return WikiEntry(**dict(row)) if row else None
 
 
-async def create_entry(pool: asyncpg.Pool, data: WikiCreate) -> WikiEntry:
-    """Insert a new entry with a server-derived slug.
+async def create_entry(pool: asyncpg.Pool, owner_id: uuid.UUID, data: WikiCreate) -> WikiEntry:
+    """Insert a new entry with a server-derived slug, owned by ``owner_id``.
 
     Raises :class:`ValueError` on an empty/slug-less title and
-    :class:`SlugExists` when the derived slug collides.
+    :class:`SlugExists` when the derived slug collides with one of this
+    owner's existing entries (the same slug is fine for a different owner).
     """
     title = data.title.strip()
     if not title:
@@ -178,25 +200,29 @@ async def create_entry(pool: asyncpg.Pool, data: WikiCreate) -> WikiEntry:
     folder = normalize_folder(data.folder)
     try:
         row = await pool.fetchrow(
-            f"INSERT INTO wiki_entries (id, slug, title, tags, body, folder) "
-            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_ENTRY_COLUMNS}",
+            f"INSERT INTO wiki_entries (id, slug, title, tags, body, folder, owner_id) "
+            f"VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {_ENTRY_COLUMNS}",
             uuid.uuid4(),
             slug,
             title,
             list(data.tags),
             data.body,
             folder,
+            owner_id,
         )
     except asyncpg.UniqueViolationError as error:
         raise SlugExists(slug) from error
     return WikiEntry(**dict(row))
 
 
-async def update_entry(pool: asyncpg.Pool, slug: str, data: WikiUpdate) -> WikiEntry | None:
-    """Update the provided fields of an entry, bumping updated_at.
+async def update_entry(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, slug: str, data: WikiUpdate
+) -> WikiEntry | None:
+    """Update the provided fields of the owner's entry, bumping updated_at.
 
     The slug never changes so wikilinks stay stable. Returns None if the slug
-    does not exist; raises :class:`ValueError` if title is set to blank.
+    does not exist for this owner; raises :class:`ValueError` if title is set
+    to blank.
     """
     title = data.title.strip() if data.title is not None else None
     if data.title is not None and not title:
@@ -204,13 +230,14 @@ async def update_entry(pool: asyncpg.Pool, slug: str, data: WikiUpdate) -> WikiE
     folder = normalize_folder(data.folder) if data.folder is not None else None
     row = await pool.fetchrow(
         f"UPDATE wiki_entries SET "
-        f"title = COALESCE($2, title), "
-        f"tags = COALESCE($3, tags), "
-        f"body = COALESCE($4, body), "
-        f"folder = COALESCE($5, folder), "
+        f"title = COALESCE($3, title), "
+        f"tags = COALESCE($4, tags), "
+        f"body = COALESCE($5, body), "
+        f"folder = COALESCE($6, folder), "
         f"updated_at = now() "
-        f"WHERE slug = $1 RETURNING {_ENTRY_COLUMNS}",
+        f"WHERE slug = $1 AND owner_id = $2 RETURNING {_ENTRY_COLUMNS}",
         slug,
+        owner_id,
         title,
         list(data.tags) if data.tags is not None else None,
         data.body,
@@ -219,13 +246,15 @@ async def update_entry(pool: asyncpg.Pool, slug: str, data: WikiUpdate) -> WikiE
     return WikiEntry(**dict(row)) if row else None
 
 
-async def delete_entry(pool: asyncpg.Pool, slug: str) -> bool:
-    """Delete an entry; return True if a row was removed."""
-    result = await pool.execute("DELETE FROM wiki_entries WHERE slug = $1", slug)
+async def delete_entry(pool: asyncpg.Pool, owner_id: uuid.UUID, slug: str) -> bool:
+    """Delete the owner's entry; return True if a row was removed."""
+    result = await pool.execute(
+        "DELETE FROM wiki_entries WHERE slug = $1 AND owner_id = $2", slug, owner_id
+    )
     return result.endswith("1")
 
 
-async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
+async def rename_folder(pool: asyncpg.Pool, owner_id: uuid.UUID, source: str, target: str) -> int:
     """Rewrite the folder prefix on a folder and every descendant, atomically.
 
     The depth check and the rewrite run as CTEs inside a single statement, so
@@ -253,13 +282,15 @@ async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
 
     # LIKE with a '/' guard so 'zresearch' never matches 'zresearching'. The
     # UPDATE only fires when stats.too_deep = 0, so a single too-deep match
-    # blocks the write for every matched row, not just its own.
+    # blocks the write for every matched row, not just its own. Both the
+    # match and the update are scoped to owner_id so a rename never touches
+    # another owner's pages, even ones that happen to share folder names.
     row = await pool.fetchrow(
         """
         WITH matched AS (
             SELECT id, $2 || substring(folder from length($1) + 1) AS new_folder
               FROM wiki_entries
-             WHERE folder = $1 OR folder LIKE $1 || '/%'
+             WHERE (folder = $1 OR folder LIKE $1 || '/%') AND owner_id = $4
         ),
         stats AS (
             SELECT count(*) AS total,
@@ -272,7 +303,7 @@ async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
             UPDATE wiki_entries e
                SET folder = m.new_folder, updated_at = now()
               FROM matched m, stats s
-             WHERE e.id = m.id AND s.too_deep = 0
+             WHERE e.id = m.id AND s.too_deep = 0 AND e.owner_id = $4
             RETURNING e.id
         )
         SELECT s.total, s.too_deep, (SELECT count(*) FROM updated) AS moved
@@ -281,6 +312,7 @@ async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
         src,
         dst,
         MAX_FOLDER_DEPTH,
+        owner_id,
     )
     if row["total"] == 0:
         return 0
@@ -289,11 +321,38 @@ async def rename_folder(pool: asyncpg.Pool, source: str, target: str) -> int:
     return row["moved"]
 
 
-async def search_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
-    """Full-text search over title+body, top 10 by ts_rank with snippets.
+async def search_entries(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, query: str
+) -> list[WikiSearchHit]:
+    """Full-text search over the owner's title+body, top 10 by ts_rank with snippets.
 
     Uses ``websearch_to_tsquery`` so the query accepts natural phrasing. An
     empty or stop-word-only query yields no hits.
+    """
+    if not query.strip():
+        return []
+    rows = await pool.fetch(
+        "SELECT slug, title, tags, folder, "
+        "ts_headline('english', title || ' ' || body, q, $3) AS snippet, "
+        "ts_rank(search, q) AS rank "
+        "FROM wiki_entries, websearch_to_tsquery('english', $1) AS q "
+        "WHERE search @@ q AND owner_id = $2 "
+        "ORDER BY rank DESC "
+        f"LIMIT {_SEARCH_LIMIT}",
+        query,
+        owner_id,
+        _HEADLINE_OPTS,
+    )
+    return [WikiSearchHit(**dict(row)) for row in rows]
+
+
+async def search_all_entries(pool: asyncpg.Pool, query: str) -> list[WikiSearchHit]:
+    """Full-text search across every owner's title+body (CLI admin view only).
+
+    The HTTP API always scopes searches to the requesting user via
+    :func:`search_entries`; this is used by the CLI's all-owners view and,
+    temporarily, by the chat agent's ``search_wiki`` tool
+    (TODO(task 9): scope the agent tool to the calling user instead).
     """
     if not query.strip():
         return []
@@ -338,15 +397,23 @@ def _pool(request: Request) -> asyncpg.Pool:
 
 # /search is declared before /{slug} so the literal path wins over the wildcard.
 @router.get("/search")
-async def search(request: Request, q: str) -> list[dict]:
-    hits = await search_entries(_pool(request), q)
+async def search(
+    request: Request,
+    q: str,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    hits = await search_entries(_pool(request), user.id, q)
     return [hit.model_dump(mode="json") for hit in hits]
 
 
 @router.post("/folders/rename")
-async def rename_wiki_folder(request: Request, body: FolderRename) -> dict:
+async def rename_wiki_folder(
+    request: Request,
+    body: FolderRename,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     try:
-        moved = await rename_folder(_pool(request), body.source, body.target)
+        moved = await rename_folder(_pool(request), user.id, body.source, body.target)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if moved == 0:
@@ -355,15 +422,22 @@ async def rename_wiki_folder(request: Request, body: FolderRename) -> dict:
 
 
 @router.get("")
-async def list_wiki(request: Request) -> list[dict]:
-    entries = await list_entries(_pool(request))
+async def list_wiki(
+    request: Request,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    entries = await list_entries(_pool(request), user.id)
     return [entry.model_dump(mode="json") for entry in entries]
 
 
 @router.post("", status_code=201)
-async def create_wiki(request: Request, body: WikiCreate) -> dict:
+async def create_wiki(
+    request: Request,
+    body: WikiCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     try:
-        entry = await create_entry(_pool(request), body)
+        entry = await create_entry(_pool(request), user.id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except SlugExists as error:
@@ -372,17 +446,26 @@ async def create_wiki(request: Request, body: WikiCreate) -> dict:
 
 
 @router.get("/{slug}")
-async def get_wiki(request: Request, slug: str) -> dict:
-    entry = await get_entry(_pool(request), slug)
+async def get_wiki(
+    request: Request,
+    slug: str,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    entry = await get_entry(_pool(request), user.id, slug)
     if entry is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
     return entry.model_dump(mode="json")
 
 
 @router.put("/{slug}")
-async def update_wiki(request: Request, slug: str, body: WikiUpdate) -> dict:
+async def update_wiki(
+    request: Request,
+    slug: str,
+    body: WikiUpdate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
     try:
-        entry = await update_entry(_pool(request), slug, body)
+        entry = await update_entry(_pool(request), user.id, slug, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if entry is None:
@@ -391,6 +474,10 @@ async def update_wiki(request: Request, slug: str, body: WikiUpdate) -> dict:
 
 
 @router.delete("/{slug}", status_code=204)
-async def delete_wiki(request: Request, slug: str) -> None:
-    if not await delete_entry(_pool(request), slug):
+async def delete_wiki(
+    request: Request,
+    slug: str,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> None:
+    if not await delete_entry(_pool(request), user.id, slug):
         raise HTTPException(status_code=404, detail="Wiki page not found")

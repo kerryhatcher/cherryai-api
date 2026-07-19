@@ -1,7 +1,9 @@
 """Tests for the wiki: slug derivation, CRUD, FTS, and tool formatting.
 
 The DB-backed tests use the ``pool`` fixture (dev Postgres) and unique
-``Ztest``-prefixed titles so they never collide with real demo pages.
+``Ztest``-prefixed titles so they never collide with real demo pages. Every
+DB-backed test also uses the ``owner`` fixture (a fresh user per test, via
+``make_user``) since every wiki function is scoped to an owner.
 """
 
 from __future__ import annotations
@@ -31,6 +33,13 @@ from cherryai_api.wiki import (
 def _unique_title(label: str) -> str:
     """A 'Ztest ...'-prefixed title whose slug lands under the test namespace."""
     return f"Ztest {uuid.uuid4().hex[:8]} {label}"
+
+
+@pytest.fixture
+async def owner(make_user):
+    """A fresh user id, created via ``make_user``, to own this test's entries."""
+    user = await make_user(f"ztest-{uuid.uuid4().hex[:8]}@example.com")
+    return user["id"]
 
 
 # --- Pure functions (no database) --------------------------------------------
@@ -136,63 +145,63 @@ def test_format_search_results_omits_folder_line_at_root() -> None:
 # --- Database-backed CRUD ----------------------------------------------------
 
 
-async def test_crud_round_trip(pool) -> None:
+async def test_crud_round_trip(pool, owner) -> None:
     title = _unique_title("Orchard Guide")
     created = await create_entry(
-        pool, WikiCreate(title=title, tags=["cherry", "care"], body="Prune yearly.")
+        pool, owner, WikiCreate(title=title, tags=["cherry", "care"], body="Prune yearly.")
     )
     assert created.title == title
     assert created.tags == ["cherry", "care"]
     assert created.body == "Prune yearly."
 
-    fetched = await get_entry(pool, created.slug)
+    fetched = await get_entry(pool, owner, created.slug)
     assert fetched is not None
     assert fetched.id == created.id
 
-    slugs = [item.slug for item in await list_entries(pool)]
+    slugs = [item.slug for item in await list_entries(pool, owner)]
     assert created.slug in slugs
 
-    updated = await update_entry(pool, created.slug, WikiUpdate(body="Prune twice."))
+    updated = await update_entry(pool, owner, created.slug, WikiUpdate(body="Prune twice."))
     assert updated is not None
     assert updated.body == "Prune twice."
     assert updated.title == title
     assert updated.updated_at >= created.updated_at
 
-    assert await delete_entry(pool, created.slug) is True
-    assert await get_entry(pool, created.slug) is None
+    assert await delete_entry(pool, owner, created.slug) is True
+    assert await get_entry(pool, owner, created.slug) is None
 
 
-async def test_duplicate_slug_raises_409_signal(pool) -> None:
+async def test_duplicate_slug_raises_409_signal(pool, owner) -> None:
     title = _unique_title("Duplicate Page")
-    first = await create_entry(pool, WikiCreate(title=title))
+    first = await create_entry(pool, owner, WikiCreate(title=title))
     with pytest.raises(SlugExists) as exc_info:
-        await create_entry(pool, WikiCreate(title=title))
+        await create_entry(pool, owner, WikiCreate(title=title))
     assert exc_info.value.slug == first.slug
 
 
-async def test_get_unknown_returns_none(pool) -> None:
-    assert await get_entry(pool, "ztest-does-not-exist") is None
+async def test_get_unknown_returns_none(pool, owner) -> None:
+    assert await get_entry(pool, owner, "ztest-does-not-exist") is None
 
 
-async def test_update_unknown_returns_none(pool) -> None:
-    result = await update_entry(pool, "ztest-does-not-exist", WikiUpdate(body="nope"))
+async def test_update_unknown_returns_none(pool, owner) -> None:
+    result = await update_entry(pool, owner, "ztest-does-not-exist", WikiUpdate(body="nope"))
     assert result is None
 
 
-async def test_delete_unknown_returns_false(pool) -> None:
-    assert await delete_entry(pool, "ztest-does-not-exist") is False
+async def test_delete_unknown_returns_false(pool, owner) -> None:
+    assert await delete_entry(pool, owner, "ztest-does-not-exist") is False
 
 
-async def test_empty_title_raises(pool) -> None:
+async def test_empty_title_raises(pool, owner) -> None:
     with pytest.raises(ValueError):
-        await create_entry(pool, WikiCreate(title="   "))
+        await create_entry(pool, owner, WikiCreate(title="   "))
 
 
-async def test_update_never_changes_slug(pool) -> None:
-    created = await create_entry(pool, WikiCreate(title=_unique_title("Stable Slug")))
+async def test_update_never_changes_slug(pool, owner) -> None:
+    created = await create_entry(pool, owner, WikiCreate(title=_unique_title("Stable Slug")))
     original_slug = created.slug
     updated = await update_entry(
-        pool, original_slug, WikiUpdate(title=_unique_title("Renamed Entirely"))
+        pool, owner, original_slug, WikiUpdate(title=_unique_title("Renamed Entirely"))
     )
     assert updated is not None
     assert updated.slug == original_slug
@@ -201,10 +210,11 @@ async def test_update_never_changes_slug(pool) -> None:
 # --- Full-text search --------------------------------------------------------
 
 
-async def test_search_finds_seeded_entry(pool) -> None:
+async def test_search_finds_seeded_entry(pool, owner) -> None:
     marker = uuid.uuid4().hex[:8]
     created = await create_entry(
         pool,
+        owner,
         WikiCreate(
             title=_unique_title("Pollination Notes"),
             body=(
@@ -213,7 +223,7 @@ async def test_search_finds_seeded_entry(pool) -> None:
             ),
         ),
     )
-    hits = await search_entries(pool, "pollen blossoms orchard")
+    hits = await search_entries(pool, owner, "pollen blossoms orchard")
     matched = [hit for hit in hits if hit.slug == created.slug]
     assert matched, "expected the seeded entry among search hits"
     hit = matched[0]
@@ -221,97 +231,127 @@ async def test_search_finds_seeded_entry(pool) -> None:
     assert hit.snippet
 
 
-async def test_search_blank_query_returns_no_hits(pool) -> None:
-    assert await search_entries(pool, "   ") == []
+async def test_search_blank_query_returns_no_hits(pool, owner) -> None:
+    assert await search_entries(pool, owner, "   ") == []
 
 
 @pytest.mark.asyncio
-async def test_create_entry_normalizes_folder(pool) -> None:
+async def test_create_entry_normalizes_folder(pool, owner) -> None:
     entry = await create_entry(
-        pool, WikiCreate(title=_unique_title("folder create"), folder="Research / OCR ")
+        pool, owner, WikiCreate(title=_unique_title("folder create"), folder="Research / OCR ")
     )
     try:
         assert entry.folder == "research/ocr"
-        fetched = await get_entry(pool, entry.slug)
+        fetched = await get_entry(pool, owner, entry.slug)
         assert fetched is not None and fetched.folder == "research/ocr"
     finally:
-        await delete_entry(pool, entry.slug)
+        await delete_entry(pool, owner, entry.slug)
 
 
 @pytest.mark.asyncio
-async def test_create_entry_defaults_to_root(pool) -> None:
-    entry = await create_entry(pool, WikiCreate(title=_unique_title("root page")))
+async def test_create_entry_defaults_to_root(pool, owner) -> None:
+    entry = await create_entry(pool, owner, WikiCreate(title=_unique_title("root page")))
     try:
         assert entry.folder == ""
     finally:
-        await delete_entry(pool, entry.slug)
+        await delete_entry(pool, owner, entry.slug)
 
 
 @pytest.mark.asyncio
-async def test_update_entry_moves_and_clears_folder(pool) -> None:
+async def test_update_entry_moves_and_clears_folder(pool, owner) -> None:
     entry = await create_entry(
-        pool, WikiCreate(title=_unique_title("folder move"), folder="research")
+        pool, owner, WikiCreate(title=_unique_title("folder move"), folder="research")
     )
     try:
-        moved = await update_entry(pool, entry.slug, WikiUpdate(folder="ops/runbooks"))
+        moved = await update_entry(pool, owner, entry.slug, WikiUpdate(folder="ops/runbooks"))
         assert moved is not None and moved.folder == "ops/runbooks"
 
         # Omitting folder leaves it alone; "" explicitly moves the page to root.
-        untouched = await update_entry(pool, entry.slug, WikiUpdate(title="Ztest renamed"))
+        untouched = await update_entry(pool, owner, entry.slug, WikiUpdate(title="Ztest renamed"))
         assert untouched is not None and untouched.folder == "ops/runbooks"
 
-        rooted = await update_entry(pool, entry.slug, WikiUpdate(folder=""))
+        rooted = await update_entry(pool, owner, entry.slug, WikiUpdate(folder=""))
         assert rooted is not None and rooted.folder == ""
     finally:
-        await delete_entry(pool, entry.slug)
+        await delete_entry(pool, owner, entry.slug)
 
 
 @pytest.mark.asyncio
-async def test_list_and_search_expose_folder(pool) -> None:
+async def test_list_and_search_expose_folder(pool, owner) -> None:
     title = _unique_title("folder visible")
     entry = await create_entry(
-        pool, WikiCreate(title=title, folder="research/ocr", body="Zqqx unique marker body")
+        pool,
+        owner,
+        WikiCreate(title=title, folder="research/ocr", body="Zqqx unique marker body"),
     )
     try:
-        listed = [item for item in await list_entries(pool) if item.slug == entry.slug]
+        listed = [item for item in await list_entries(pool, owner) if item.slug == entry.slug]
         assert listed and listed[0].folder == "research/ocr"
 
-        hits = await search_entries(pool, "Zqqx")
+        hits = await search_entries(pool, owner, "Zqqx")
         assert hits and hits[0].folder == "research/ocr"
     finally:
-        await delete_entry(pool, entry.slug)
+        await delete_entry(pool, owner, entry.slug)
+
+
+# --- Cross-owner isolation -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wiki_entries_invisible_across_users(pool, make_user):
+    from cherryai_api.wiki import WikiCreate, create_entry, get_entry, search_entries
+
+    alice = await make_user("ztest-walice@example.com")
+    bob = await make_user("ztest-wbob@example.com")
+    entry = await create_entry(
+        pool, alice["id"], WikiCreate(title="Ztest Private", body="secret pie recipe")
+    )
+    assert await get_entry(pool, bob["id"], entry.slug) is None
+    hits = await search_entries(pool, bob["id"], "secret pie")
+    assert all(h.slug != entry.slug for h in hits)
+
+
+@pytest.mark.asyncio
+async def test_same_slug_allowed_for_different_owners(pool, make_user):
+    from cherryai_api.wiki import WikiCreate, create_entry
+
+    alice = await make_user("ztest-salice@example.com")
+    bob = await make_user("ztest-sbob@example.com")
+    a = await create_entry(pool, alice["id"], WikiCreate(title="Ztest Same", body=""))
+    b = await create_entry(pool, bob["id"], WikiCreate(title="Ztest Same", body=""))
+    assert a.slug == b.slug
 
 
 # --- Folder rename ------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_rename_folder_moves_folder_and_descendants(pool) -> None:
+async def test_rename_folder_moves_folder_and_descendants(pool, owner) -> None:
     parent = await create_entry(
-        pool, WikiCreate(title=_unique_title("rename parent"), folder="zresearch")
+        pool, owner, WikiCreate(title=_unique_title("rename parent"), folder="zresearch")
     )
     child = await create_entry(
-        pool, WikiCreate(title=_unique_title("rename child"), folder="zresearch/ocr")
+        pool, owner, WikiCreate(title=_unique_title("rename child"), folder="zresearch/ocr")
     )
     outside = await create_entry(
-        pool, WikiCreate(title=_unique_title("rename outside"), folder="zresearching")
+        pool, owner, WikiCreate(title=_unique_title("rename outside"), folder="zresearching")
     )
     try:
-        moved = await rename_folder(pool, "zresearch", "znotes")
+        moved = await rename_folder(pool, owner, "zresearch", "znotes")
         assert moved == 2
 
-        assert (await get_entry(pool, parent.slug)).folder == "znotes"
-        assert (await get_entry(pool, child.slug)).folder == "znotes/ocr"
+        assert (await get_entry(pool, owner, parent.slug)).folder == "znotes"
+        assert (await get_entry(pool, owner, child.slug)).folder == "znotes/ocr"
         # A sibling whose name merely starts with the source must not move.
-        assert (await get_entry(pool, outside.slug)).folder == "zresearching"
+        assert (await get_entry(pool, owner, outside.slug)).folder == "zresearching"
     finally:
         for entry in (parent, child, outside):
-            await delete_entry(pool, entry.slug)
+            await delete_entry(pool, owner, entry.slug)
 
 
 @pytest.mark.asyncio
-async def test_rename_folder_returns_zero_when_unmatched(pool) -> None:
-    assert await rename_folder(pool, "znosuchfolder", "zwhatever") == 0
+async def test_rename_folder_returns_zero_when_unmatched(pool, owner) -> None:
+    assert await rename_folder(pool, owner, "znosuchfolder", "zwhatever") == 0
 
 
 @pytest.mark.asyncio
@@ -324,31 +364,31 @@ async def test_rename_folder_returns_zero_when_unmatched(pool) -> None:
         ("zresearch", "zresearch/ocr", "inside the source"),
     ],
 )
-async def test_rename_folder_rejects_invalid_pairs(pool, source, target, message) -> None:
+async def test_rename_folder_rejects_invalid_pairs(pool, owner, source, target, message) -> None:
     with pytest.raises(ValueError, match=message):
-        await rename_folder(pool, source, target)
+        await rename_folder(pool, owner, source, target)
 
 
 @pytest.mark.asyncio
-async def test_rename_folder_rejects_result_exceeding_max_depth(pool) -> None:
+async def test_rename_folder_rejects_result_exceeding_max_depth(pool, owner) -> None:
     deep = await create_entry(
-        pool, WikiCreate(title=_unique_title("deep page"), folder="zsrc/mid/leaf")
+        pool, owner, WikiCreate(title=_unique_title("deep page"), folder="zsrc/mid/leaf")
     )
     try:
         # zsrc -> za/zb would push zsrc/mid/leaf to za/zb/mid/leaf: 4 levels.
         with pytest.raises(ValueError, match="levels of nesting"):
-            await rename_folder(pool, "zsrc", "za/zb")
+            await rename_folder(pool, owner, "zsrc", "za/zb")
     finally:
-        await delete_entry(pool, deep.slug)
+        await delete_entry(pool, owner, deep.slug)
 
 
 @pytest.mark.asyncio
-async def test_rename_folder_rejecting_too_deep_leaves_shallow_page_untouched(pool) -> None:
+async def test_rename_folder_rejecting_too_deep_leaves_shallow_page_untouched(pool, owner) -> None:
     shallow = await create_entry(
-        pool, WikiCreate(title=_unique_title("atomic shallow page"), folder="zatomic")
+        pool, owner, WikiCreate(title=_unique_title("atomic shallow page"), folder="zatomic")
     )
     deep = await create_entry(
-        pool, WikiCreate(title=_unique_title("atomic deep page"), folder="zatomic/mid/leaf")
+        pool, owner, WikiCreate(title=_unique_title("atomic deep page"), folder="zatomic/mid/leaf")
     )
     try:
         # zatomic -> za/zb would push zatomic (1 level) to za/zb (fine) but
@@ -356,10 +396,10 @@ async def test_rename_folder_rejecting_too_deep_leaves_shallow_page_untouched(po
         # rename must reject the whole operation rather than moving the
         # shallow page and leaving the deep one behind.
         with pytest.raises(ValueError, match="levels of nesting"):
-            await rename_folder(pool, "zatomic", "za/zb")
+            await rename_folder(pool, owner, "zatomic", "za/zb")
 
-        assert (await get_entry(pool, shallow.slug)).folder == "zatomic"
-        assert (await get_entry(pool, deep.slug)).folder == "zatomic/mid/leaf"
+        assert (await get_entry(pool, owner, shallow.slug)).folder == "zatomic"
+        assert (await get_entry(pool, owner, deep.slug)).folder == "zatomic/mid/leaf"
     finally:
         for entry in (shallow, deep):
-            await delete_entry(pool, entry.slug)
+            await delete_entry(pool, owner, entry.slug)
