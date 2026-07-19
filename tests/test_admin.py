@@ -92,3 +92,12 @@ async def test_patch_role_syncs_superuser(client, make_user, pool):
     assert res.status_code == 200
     row = await pool.fetchrow('SELECT role, is_superuser FROM "user" WHERE id = $1', user["id"])
     assert row["role"] == "admin" and row["is_superuser"] is True
+
+
+@pytest.mark.asyncio
+async def test_approve_unknown_user_is_404_even_with_bad_role(client, make_user):
+    await _login_admin(client, make_user)
+    import uuid
+
+    res = await client.post(f"/admin/users/{uuid.uuid4()}/approve", json={"role": "bogus"})
+    assert res.status_code == 404

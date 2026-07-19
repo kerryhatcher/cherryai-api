@@ -73,8 +73,8 @@ async def approve_user(
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ) -> User:
     role = (body.role if body else ROLE_CHAT) or ROLE_CHAT
-    _validate_role(role)
     user = await _get_user_or_404(session, user_id)
+    _validate_role(role)
     user.is_verified = True
     user.role = role
     user.is_superuser = role == ROLE_ADMIN
