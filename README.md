@@ -197,6 +197,8 @@ uv run ruff check --fix
 
 ### Testing
 
+Run `uv run alembic upgrade head` after pulling migrations.
+
 Run tests to verify core functionality:
 
 ```bash

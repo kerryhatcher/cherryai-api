@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.agent import build_agent, run_turn, stream_turn, strip_leaked_reasoning
+from cherryai_api.auth import auth_backend, fastapi_users_app
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
@@ -23,6 +24,7 @@ from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
 from cherryai_api.telemetry import setup_telemetry
+from cherryai_api.users import UserCreate, UserRead, UserUpdate
 from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
 from cherryai_api.workflows import router as workflows_router
@@ -77,6 +79,17 @@ app.add_middleware(
 app.include_router(wiki_router)
 app.include_router(feedback_router)
 app.include_router(workflows_router)
+app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
+app.include_router(
+    fastapi_users_app.get_register_router(UserRead, UserCreate),
+    prefix="/auth",
+    tags=["auth"],
+)
+app.include_router(
+    fastapi_users_app.get_users_router(UserRead, UserUpdate),
+    prefix="/users",
+    tags=["users"],
+)
 
 
 async def _neo4j_reachable() -> bool:
