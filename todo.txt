@@ -1,0 +1,5 @@
+(A) 2026-07-18 Add updated_at timestamp to Session model so API clients can sync caches incrementally instead of replacing wholesale +ApiContract @schema raised-by:cherryai-cli ref:../cherryai-cli/docs/superpowers/specs/2026-07-18-cherryai-cli-core-design.md
+(B) 2026-07-18 Expose admin operations over HTTP so out-of-process clients are not limited to health while the Typer CLI reaches into Postgres and Neo4j directly +ApiFirst @architecture raised-by:cherryai-cli
+(B) 2026-07-18 Implement authentication and the three RBAC roles the planning README requires since the API is currently fully unauthenticated +Auth @security raised-by:cherryai-cli
+(C) 2026-07-18 Add a DELETE endpoint for sessions so clients can remove chats +ApiContract @endpoints raised-by:cherryai-cli
+(C) 2026-07-18 Return message ids in the SSE done event so streaming clients can cache a turn without an extra GET roundtrip +ApiContract @streaming raised-by:cherryai-cli
