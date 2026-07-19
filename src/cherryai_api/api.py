@@ -22,6 +22,7 @@ from cherryai_api.feedback import router as feedback_router
 from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
+from cherryai_api.telemetry import setup_telemetry
 from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
 from cherryai_api.workflows import router as workflows_router
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Open the database pool and build the agent once per process."""
     settings = get_settings()
     setup_file_logging(settings.log_dir)
+    setup_telemetry(app)
     database = build_database()
     await database.connect()
     memory = build_memory()

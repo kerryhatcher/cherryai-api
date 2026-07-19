@@ -9,9 +9,15 @@ content.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-from cherryai_api.db import build_database
+# Tests must never export telemetry, even with local Logfire credentials
+# present. Set before any cherryai_api import can trigger logfire.configure().
+os.environ.setdefault("LOGFIRE_SEND_TO_LOGFIRE", "false")
+
+from cherryai_api.db import build_database  # noqa: E402
 
 _TEST_SLUG_PREFIX = "ztest-"
 _TEST_TITLE_PREFIX = "Ztest "

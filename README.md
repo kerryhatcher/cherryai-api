@@ -52,9 +52,14 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
    NEO4J_URI=neo4j://localhost:7484
    NEO4J_USER=neo4j
    NEO4J_PASSWORD=cherryai_dev
+
+   # Observability (optional — see below)
+   # LOGFIRE_TOKEN=your_write_token_here
    ```
 
    **Important:** The docker-compose configuration below maps ports `5442` (Postgres) and `7484`/`7697` (Neo4j) to avoid conflicts with system services. Your `.env` must match these port mappings.
+
+   **Observability (Pydantic Logfire):** the API exports traces, metrics, and logs to Logfire only when credentials are present (`send_to_logfire="if-token-present"`), so everything works without them. For local development run `logfire auth` then `logfire projects use --org '<org>' '<project>'` (stores gitignored credentials in `.logfire/`); for deployments set `LOGFIRE_TOKEN` to a write token instead. Never commit the token.
 
 2. **Start the database services:**
 
