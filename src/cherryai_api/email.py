@@ -131,13 +131,35 @@ class EmailApprovalOut(BaseModel):
 
 
 def _build_client() -> JmapClient:
-    """Build a JMAP client from the API token in settings."""
-    settings = get_settings()
-    if not settings.fastmail_api_token:
+    """Build a JMAP client from env, settings, or the shared config file.
+
+    Precedence:
+    1. ``FASTMAIL_API_TOKEN`` env var
+    2. ``fastmail_api_token`` in app settings (.env)
+    3. ``[core].api_token`` in ``~/.config/fastmail-cli/config.toml``
+    """
+    import os
+    from pathlib import Path
+
+    token = os.environ.get("FASTMAIL_API_TOKEN")
+    if not token:
+        token = get_settings().fastmail_api_token
+    if not token:
+        config_file = Path.home() / ".config" / "fastmail-cli" / "config.toml"
+        if config_file.exists():
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib  # type: ignore[no-redef]
+            data = tomllib.loads(config_file.read_text())
+            token = data.get("core", {}).get("api_token", "")
+    if not token:
         raise FastmailError(
-            "Fastmail API token not configured. Set FASTMAIL_API_TOKEN in your .env file."
+            "Fastmail API token not configured. "
+            "Set FASTMAIL_API_TOKEN in your .env file, "
+            "or add [core].api_token to ~/.config/fastmail-cli/config.toml."
         )
-    return JmapClient(token=settings.fastmail_api_token)
+    return JmapClient(token=token)
 
 
 def _to_mailbox_out(mb) -> MailboxOut:
