@@ -9,6 +9,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "beautifulsoup4>=4.15.0",
     "cognee[fastembed]>=1.2.2,<2",
+    "cryptography>=45.0.0",
     "fastapi>=0.139.2",
     "fastapi-users[sqlalchemy]>=15.0.5",
     "fastmail-py-sdk",

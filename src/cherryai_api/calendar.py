@@ -8,6 +8,7 @@ calendar tools.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -119,9 +120,19 @@ class EventUpdateIn(BaseModel):
 # ------------------------------------------------------------------
 
 
-def _build_client() -> CalDavClient:
-    """Build a CalDAV client from env vars or config file."""
+def _build_client(
+    username: str | None = None,
+    app_password: str | None = None,
+) -> CalDavClient:
+    """Build a CalDAV client.
+
+    If username and app_password are provided (per-user credentials), use those.
+    Otherwise fall back to the system-level credentials from env/settings/config.
+    """
     from fastmail_sdk.config import load_credentials
+
+    if username and app_password:
+        return CalDavClient(username=username, app_password=app_password)
 
     try:
         username, app_password = load_credentials()
@@ -134,7 +145,24 @@ def _build_client() -> CalDavClient:
     return CalDavClient(username=username, app_password=app_password)
 
 
-def _get_client(request: Request) -> CalDavClient:
+async def _resolve_user_cal_creds(user_id: uuid.UUID) -> tuple[str | None, str | None]:
+    """Return (username, app_password) for a user's active Fastmail credential.
+
+    Returns (None, None) if the user has no credentials configured, so
+    callers fall back to the system-level credentials.
+    """
+    from cherryai_api.integrations import decrypt_credential, get_active_credential_for_user
+    from cherryai_api.orm import async_session_maker
+
+    async with async_session_maker() as session:
+        cred = await get_active_credential_for_user(session, user_id)
+        if cred is None:
+            return None, None
+        username, app_password, _api_token = decrypt_credential(cred)
+        return username, app_password
+
+
+def _get_client(request: Request, user_id: uuid.UUID | None = None) -> CalDavClient:
     """Build a client from request-scoped settings (router use)."""
     return _build_client()
 
@@ -198,8 +226,12 @@ def _to_event_out(event) -> CalendarEventOut:
 # ------------------------------------------------------------------
 
 
-async def list_calendars(request: Request | None = None) -> list[CalendarOut]:
-    client = _build_client()
+async def list_calendars(
+    request: Request | None = None,
+    user_id: uuid.UUID | None = None,
+) -> list[CalendarOut]:
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         calendars = await client.list_calendars()
     return [_to_calendar_out(c) for c in calendars]
@@ -211,9 +243,11 @@ async def list_events(
     start: str | None = None,
     end: str | None = None,
     week: bool = False,
+    user_id: uuid.UUID | None = None,
 ) -> list[CalendarEventOut]:
     """List events for a specific calendar."""
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         range_start, range_end = _resolve_range(start, end, week)
         events = await client.list_events(
@@ -231,9 +265,11 @@ async def list_all_events(
     start: str | None = None,
     end: str | None = None,
     week: bool = False,
+    user_id: uuid.UUID | None = None,
 ) -> list[CalendarEventOut]:
     """List events across ALL calendars."""
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         range_start, range_end = _resolve_range(start, end, week)
         events = await client.list_events(EventQuery(start=range_start, end=range_end))
@@ -259,15 +295,19 @@ async def get_event(
     request: Request | None = None,
     event_id: str = "",
     calendar_id: str | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> CalendarEventOut:
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         event = await client.get_event_by_id(event_id, calendar_id)
     return _to_event_out(event)
 
 
 async def create_event(
-    request: Request | None = None, data: EventCreateIn | None = None
+    request: Request | None = None,
+    data: EventCreateIn | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> CalendarEventOut:
     from fastmail_sdk.ical import build_event_uid
     from fastmail_sdk.models.event import (
@@ -277,7 +317,8 @@ async def create_event(
         EventReminder,
     )
 
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
 
     # Build the SDK model
     start_dt = _parse_datetime(data.start, data.timezone)
@@ -320,8 +361,10 @@ async def update_event(
     event_id: str = "",
     calendar_id: str | None = None,
     data: EventUpdateIn | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> CalendarEventOut:
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         existing = await client.get_event_by_id(event_id, calendar_id)
         if not existing.etag:
@@ -377,16 +420,23 @@ async def delete_event(
     request: Request | None = None,
     event_id: str = "",
     calendar_id: str | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> None:
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         event = await client.get_event_by_id(event_id, calendar_id)
         await client.delete_event(event)
 
 
-async def search_events(request: Request | None = None, query: str = "") -> list[CalendarEventOut]:
+async def search_events(
+    request: Request | None = None,
+    query: str = "",
+    user_id: uuid.UUID | None = None,
+) -> list[CalendarEventOut]:
     """Substring search over event titles/descriptions across all calendars."""
-    client = _build_client()
+    username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, app_password=app_password)
     async with client:
         events = await client.list_events(EventQuery())
     query_lower = query.lower()
@@ -464,7 +514,7 @@ async def list_calendars_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        calendars = await list_calendars(request)
+        calendars = await list_calendars(request, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [c.model_dump(mode="json") for c in calendars]
@@ -477,7 +527,7 @@ async def search_calendar_events(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        events = await search_events(request, q)
+        events = await search_events(request, q, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in events]
@@ -493,7 +543,7 @@ async def list_all_events_route(
 ) -> list[dict]:
     """List events across ALL calendars."""
     try:
-        events = await list_all_events(request, start, end, week)
+        events = await list_all_events(request, start, end, week, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in events]
@@ -509,7 +559,7 @@ async def list_events_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        events = await list_events(request, calendar_id, start, end, week)
+        events = await list_events(request, calendar_id, start, end, week, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in events]
@@ -523,7 +573,7 @@ async def get_event_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
     try:
-        event = await get_event(request, event_id, calendar_id)
+        event = await get_event(request, event_id, calendar_id, user_id=user.id)
     except EventNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FastmailError as error:
@@ -541,7 +591,7 @@ async def create_event_route(
     if body.calendar_id is None:
         body.calendar_id = calendar_id
     try:
-        event = await create_event(request, body)
+        event = await create_event(request, body, user_id=user.id)
     except CalendarNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FastmailError as error:
@@ -558,7 +608,7 @@ async def update_event_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
     try:
-        event = await update_event(request, event_id, calendar_id, body)
+        event = await update_event(request, event_id, calendar_id, body, user_id=user.id)
     except EventNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except EventConflict as error:
@@ -576,7 +626,7 @@ async def delete_event_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> None:
     try:
-        await delete_event(request, event_id, calendar_id)
+        await delete_event(request, event_id, calendar_id, user_id=user.id)
     except EventNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except EventConflict as error:

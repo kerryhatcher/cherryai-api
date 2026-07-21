@@ -23,6 +23,7 @@ from cherryai_api.db import build_database, make_session_title
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
+from cherryai_api.integrations import router as integrations_router
 from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.memory import build_memory
 from cherryai_api.settings import get_settings
@@ -86,6 +87,7 @@ app.include_router(feedback_router)
 app.include_router(workflows_router)
 app.include_router(calendar_router)
 app.include_router(email_router)
+app.include_router(integrations_router)
 app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(
     fastapi_users_app.get_register_router(UserRead, UserCreate),

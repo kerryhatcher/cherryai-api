@@ -130,16 +130,22 @@ class EmailApprovalOut(BaseModel):
 # ------------------------------------------------------------------
 
 
-def _build_client() -> JmapClient:
-    """Build a JMAP client from env, settings, or the shared config file.
+def _build_client(
+    username: str | None = None,
+    token: str | None = None,
+) -> JmapClient:
+    """Build a JMAP client.
 
-    Precedence:
-    1. ``FASTMAIL_API_TOKEN`` env var
-    2. ``fastmail_api_token`` in app settings (.env)
-    3. ``[core].api_token`` in ``~/.config/fastmail-cli/config.toml``
+    If username and token are provided (per-user credentials), use those.
+    Otherwise fall back to the system-level token from env/settings/config.
     """
     import os
     from pathlib import Path
+
+    if token and username:
+        return JmapClient(token=token, username=username)
+    if token:
+        return JmapClient(token=token)
 
     token = os.environ.get("FASTMAIL_API_TOKEN")
     if not token:
@@ -160,6 +166,24 @@ def _build_client() -> JmapClient:
             "or add [core].api_token to ~/.config/fastmail-cli/config.toml."
         )
     return JmapClient(token=token)
+
+
+async def _resolve_user_creds(user_id: uuid.UUID) -> tuple[str | None, str | None]:
+    """Return (username, api_token) for a user's active Fastmail credential.
+
+    Returns (None, None) if the user has no credentials configured, so
+    callers fall back to the system-level token.
+    """
+    from cherryai_api.integrations import decrypt_credential, get_active_credential_for_user
+    from cherryai_api.orm import async_session_maker
+
+    async with async_session_maker() as session:
+        cred = await get_active_credential_for_user(session, user_id)
+        if cred is None:
+            return None, None
+        username, app_password, api_token = decrypt_credential(cred)
+        # JMAP accepts the app password as the bearer token.
+        return username, api_token or app_password
 
 
 def _to_mailbox_out(mb) -> MailboxOut:
@@ -215,8 +239,12 @@ def _to_email_detail_out(email) -> EmailDetailOut:
 # ------------------------------------------------------------------
 
 
-async def list_mailboxes(request: Request | None = None) -> list[MailboxOut]:
-    client = _build_client()
+async def list_mailboxes(
+    request: Request | None = None,
+    user_id: uuid.UUID | None = None,
+) -> list[MailboxOut]:
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         mailboxes = await client.list_mailboxes()
@@ -227,8 +255,10 @@ async def list_emails(
     request: Request | None = None,
     mailbox_id: str | None = None,
     limit: int = 50,
+    user_id: uuid.UUID | None = None,
 ) -> list[EmailOut]:
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         if mailbox_id:
@@ -243,8 +273,10 @@ async def list_emails(
 async def get_email(
     request: Request | None = None,
     email_id: str = "",
+    user_id: uuid.UUID | None = None,
 ) -> EmailDetailOut:
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         email = await client.get_email(email_id)
@@ -254,8 +286,10 @@ async def get_email(
 async def get_thread(
     request: Request | None = None,
     email_id: str = "",
+    user_id: uuid.UUID | None = None,
 ) -> list[ThreadEmailOut]:
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         emails = await client.get_thread(email_id)
@@ -281,8 +315,10 @@ async def search_emails(
     query: str = "",
     mailbox_id: str | None = None,
     limit: int = 50,
+    user_id: uuid.UUID | None = None,
 ) -> list[EmailOut]:
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         filt = SearchFilter(text=query)
@@ -293,9 +329,11 @@ async def search_emails(
 async def send_email_direct(
     request: Request | None = None,
     data: EmailSendIn | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> str:
     """Send an email immediately (human-initiated). Returns the email ID."""
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         to_addrs = [EmailAddress(email=addr) for addr in data.to]
@@ -317,9 +355,11 @@ async def reply_email_direct(
     request: Request | None = None,
     email_id: str = "",
     data: EmailReplyIn | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> str:
     """Reply to an email immediately (human-initiated). Returns the new email ID."""
-    client = _build_client()
+    username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
         original = await client.get_email(email_id)
@@ -587,7 +627,7 @@ async def list_mailboxes_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        mailboxes = await list_mailboxes(request)
+        mailboxes = await list_mailboxes(request, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [m.model_dump(mode="json") for m in mailboxes]
@@ -601,7 +641,7 @@ async def list_mailbox_emails_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        emails = await list_emails(request, mailbox_id, limit)
+        emails = await list_emails(request, mailbox_id, limit, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in emails]
@@ -614,7 +654,7 @@ async def list_inbox_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        emails = await list_emails(request, None, limit)
+        emails = await list_emails(request, None, limit, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in emails]
@@ -629,7 +669,7 @@ async def search_emails_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        emails = await search_emails(request, q, mailbox_id, limit)
+        emails = await search_emails(request, q, mailbox_id, limit, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in emails]
@@ -642,7 +682,7 @@ async def get_email_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
     try:
-        email = await get_email(request, email_id)
+        email = await get_email(request, email_id, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return email.model_dump(mode="json")
@@ -655,7 +695,7 @@ async def get_thread_route(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> list[dict]:
     try:
-        thread = await get_thread(request, email_id)
+        thread = await get_thread(request, email_id, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [t.model_dump(mode="json") for t in thread]
@@ -669,7 +709,7 @@ async def send_email_route(
 ) -> dict:
     """Human-initiated send — goes out immediately."""
     try:
-        email_id = await send_email_direct(request, body)
+        email_id = await send_email_direct(request, body, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return {"id": email_id}
@@ -684,7 +724,7 @@ async def reply_email_route(
 ) -> dict:
     """Human-initiated reply — goes out immediately."""
     try:
-        new_id = await reply_email_direct(request, email_id, body)
+        new_id = await reply_email_direct(request, email_id, body, user_id=user.id)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return {"id": new_id}
