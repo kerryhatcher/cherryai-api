@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     fastmail_username: str = Field(default="", repr=False)
     fastmail_app_password: str = Field(default="", repr=False)
 
+    # --- Fastmail JMAP (email) ---
+    # API token for JMAP email client (read/send).
+    # Maps to FASTMAIL_API_TOKEN env var.
+    fastmail_api_token: str = Field(default="", repr=False)
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
