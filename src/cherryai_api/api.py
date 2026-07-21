@@ -18,6 +18,7 @@ from sse_starlette.sse import EventSourceResponse
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, fastapi_users_app, require_chat
+from cherryai_api.calendar import router as calendar_router
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
@@ -82,6 +83,7 @@ app.add_middleware(
 app.include_router(wiki_router)
 app.include_router(feedback_router)
 app.include_router(workflows_router)
+app.include_router(calendar_router)
 app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(
     fastapi_users_app.get_register_router(UserRead, UserCreate),

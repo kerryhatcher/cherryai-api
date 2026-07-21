@@ -11,6 +11,7 @@ dependencies = [
     "cognee[fastembed]>=1.2.2,<2",
     "fastapi>=0.139.2",
     "fastapi-users[sqlalchemy]>=15.0.5",
+    "fastmail-py-sdk",
     "httpx>=0.28.1",
     "logfire[asyncpg,fastapi,httpx,system-metrics]>=4.37.0",
     "loguru>=0.7.3",
@@ -53,3 +54,6 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.uv.sources]
+fastmail-py-sdk = { path = "../fastmail-py-sdk" }

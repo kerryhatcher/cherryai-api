@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     cherryai_admin_email: str = ""
     cherryai_admin_password: str = Field(default="", repr=False)
 
+    # --- Fastmail CalDAV / CardDAV ---
+    # Credentials for calendar and contacts integration.
+    # Maps to FASTMAIL_USERNAME / FASTMAIL_APP_PASSWORD env vars.
+    fastmail_username: str = Field(default="", repr=False)
+    fastmail_app_password: str = Field(default="", repr=False)
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

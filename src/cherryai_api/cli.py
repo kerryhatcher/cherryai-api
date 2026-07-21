@@ -16,6 +16,8 @@ feedback_app = typer.Typer(help="Inspect feedback (bugs, features, user stories)
 app.add_typer(feedback_app, name="feedback")
 users_app = typer.Typer(help="Manage user accounts.")
 app.add_typer(users_app, name="users")
+calendar_app = typer.Typer(help="Inspect Fastmail calendars and events.")
+app.add_typer(calendar_app, name="calendar")
 
 
 @app.command()
@@ -308,6 +310,82 @@ def users_reactivate(email: str) -> None:
         user.is_active = True
 
     _mutate_by_email(email, _mutate)
+
+
+@calendar_app.command("list")
+def calendar_list() -> None:
+    """List Fastmail calendars."""
+    from cherryai_api.calendar import list_calendars
+
+    async def _run() -> None:
+        try:
+            calendars = await list_calendars()
+        except Exception as error:
+            typer.echo(f"Error: {error}", err=True)
+            raise typer.Exit(code=1) from error
+        if not calendars:
+            typer.echo("No calendars found.")
+            return
+        for cal in calendars:
+            default = " (default)" if cal.is_default else ""
+            color = f" {cal.color}" if cal.color else ""
+            typer.echo(f"{cal.id}  {cal.name}{default}{color}")
+
+    asyncio.run(_run())
+
+
+@calendar_app.command("events")
+def calendar_events(
+    calendar: str = typer.Option(None, "--calendar", "-c", help="Calendar ID."),
+    week: bool = typer.Option(False, "--week", help="Show this week's events."),
+    start: str = typer.Option(None, "--start", help="Range start (YYYY-MM-DD)."),
+    end: str = typer.Option(None, "--end", help="Range end (YYYY-MM-DD)."),
+) -> None:
+    """List calendar events (defaults to today)."""
+    from cherryai_api.calendar import list_events
+
+    async def _run() -> None:
+        try:
+            events = await list_events(
+                calendar_id=calendar,
+                start=start,
+                end=end,
+                week=week,
+            )
+        except Exception as error:
+            typer.echo(f"Error: {error}", err=True)
+            raise typer.Exit(code=1) from error
+        if not events:
+            typer.echo("No events found.")
+            return
+        for event in events:
+            cal = f" [{event.calendar_name or event.calendar_id}]"
+            typer.echo(
+                f"{event.id[:8]}  {event.start.value} → {event.end.value}  {event.title}{cal}"
+            )
+
+    asyncio.run(_run())
+
+
+@calendar_app.command("search")
+def calendar_search(query: str) -> None:
+    """Search calendar events by title, description, or location."""
+    from cherryai_api.calendar import search_events
+
+    async def _run() -> None:
+        try:
+            events = await search_events(query=query)
+        except Exception as error:
+            typer.echo(f"Error: {error}", err=True)
+            raise typer.Exit(code=1) from error
+        if not events:
+            typer.echo(f"No events match '{query}'.")
+            return
+        for event in events:
+            cal = f" [{event.calendar_name or event.calendar_id}]"
+            typer.echo(f"{event.id[:8]}  {event.start.value}  {event.title}{cal}")
+
+    asyncio.run(_run())
 
 
 def main() -> None:
