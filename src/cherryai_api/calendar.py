@@ -212,23 +212,10 @@ async def list_events(
     end: str | None = None,
     week: bool = False,
 ) -> list[CalendarEventOut]:
+    """List events for a specific calendar."""
     client = _build_client()
     async with client:
-        # Resolve date range
-        if week:
-            from fastmail_sdk.ical import current_week_range
-
-            range_start, range_end = current_week_range()
-        elif start and end:
-            from fastmail_sdk.ical import parse_range_end, parse_range_start
-
-            range_start = parse_range_start(start)
-            range_end = parse_range_end(end)
-        else:
-            from fastmail_sdk.ical import default_today_range
-
-            range_start, range_end = default_today_range()
-
+        range_start, range_end = _resolve_range(start, end, week)
         events = await client.list_events(
             EventQuery(
                 calendar_id=calendar_id,
@@ -237,6 +224,35 @@ async def list_events(
             )
         )
     return [_to_event_out(e) for e in events]
+
+
+async def list_all_events(
+    request: Request | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    week: bool = False,
+) -> list[CalendarEventOut]:
+    """List events across ALL calendars."""
+    client = _build_client()
+    async with client:
+        range_start, range_end = _resolve_range(start, end, week)
+        events = await client.list_events(EventQuery(start=range_start, end=range_end))
+    return [_to_event_out(e) for e in events]
+
+
+def _resolve_range(start: str | None, end: str | None, week: bool) -> tuple[datetime, datetime]:
+    """Resolve a date range from parameters."""
+    if week:
+        from fastmail_sdk.ical import current_week_range
+
+        return current_week_range()
+    if start and end:
+        from fastmail_sdk.ical import parse_range_end, parse_range_start
+
+        return parse_range_start(start), parse_range_end(end)
+    from fastmail_sdk.ical import default_today_range
+
+    return default_today_range()
 
 
 async def get_event(
@@ -462,6 +478,22 @@ async def search_calendar_events(
 ) -> list[dict]:
     try:
         events = await search_events(request, q)
+    except FastmailError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return [e.model_dump(mode="json") for e in events]
+
+
+@router.get("/events")
+async def list_all_events_route(
+    request: Request,
+    start: str | None = None,
+    end: str | None = None,
+    week: bool = False,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    """List events across ALL calendars."""
+    try:
+        events = await list_all_events(request, start, end, week)
     except FastmailError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return [e.model_dump(mode="json") for e in events]
