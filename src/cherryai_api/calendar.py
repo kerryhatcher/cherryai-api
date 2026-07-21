@@ -22,7 +22,6 @@ from fastmail_sdk.models.event import EventDateTime, EventQuery
 from pydantic import BaseModel
 
 from cherryai_api.auth import current_verified_user
-from cherryai_api.settings import get_settings
 from cherryai_api.users import User
 
 # ------------------------------------------------------------------
@@ -121,16 +120,18 @@ class EventUpdateIn(BaseModel):
 
 
 def _build_client() -> CalDavClient:
-    settings = get_settings()
-    if not settings.fastmail_username or not settings.fastmail_app_password:
+    """Build a CalDAV client from env vars or config file."""
+    from fastmail_sdk.config import load_credentials
+
+    try:
+        username, app_password = load_credentials()
+    except Exception as error:
         raise FastmailError(
-            "Fastmail calendar integration is not configured. "
-            "Set FASTMAIL_USERNAME and FASTMAIL_APP_PASSWORD."
-        )
-    return CalDavClient(
-        username=settings.fastmail_username,
-        app_password=settings.fastmail_app_password,
-    )
+            "Fastmail calendar credentials not found. "
+            "Set FASTMAIL_USERNAME and FASTMAIL_APP_PASSWORD, "
+            "or add a [calendar] section to ~/.config/fastmail-cli/config.toml."
+        ) from error
+    return CalDavClient(username=username, app_password=app_password)
 
 
 def _get_client(request: Request) -> CalDavClient:
