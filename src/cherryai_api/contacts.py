@@ -139,6 +139,20 @@ async def _resolve_user_creds(user_id: uuid.UUID) -> tuple[str | None, str | Non
         return username, app_password
 
 
+def _require_creds(username: str | None, app_password: str | None) -> tuple[str, str]:
+    """Return (username, app_password) or raise a helpful 400 if missing."""
+    if username and app_password:
+        return username, app_password
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Fastmail credentials not configured. "
+            "Connect your Fastmail account in Settings → Integrations, "
+            "or set FASTMAIL_USERNAME and FASTMAIL_APP_PASSWORD environment variables."
+        ),
+    )
+
+
 def _to_contact_out(c: SdkContact) -> ContactOut:
     return ContactOut(
         id=c.id,
@@ -170,6 +184,7 @@ async def list_contacts(
     user_id: uuid.UUID | None = None,
 ) -> list[ContactOut]:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         addressbooks = await client.list_addressbooks()
@@ -190,6 +205,7 @@ async def search_contacts(
     user_id: uuid.UUID | None = None,
 ) -> list[ContactOut]:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         results = await client.search_contacts(query)
@@ -202,6 +218,7 @@ async def get_contact(
     user_id: uuid.UUID | None = None,
 ) -> ContactOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         contact = await client.get_contact_by_id(contact_id)
@@ -213,6 +230,7 @@ async def create_contact(
     user_id: uuid.UUID | None = None,
 ) -> ContactOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         addressbooks = await client.list_addressbooks()
@@ -242,6 +260,7 @@ async def update_contact(
     user_id: uuid.UUID | None = None,
 ) -> ContactOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         existing = await client.get_contact_by_id(contact_id)
@@ -280,6 +299,7 @@ async def delete_contact(
     user_id: uuid.UUID | None = None,
 ) -> None:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         contact = await client.get_contact_by_id(contact_id)
@@ -297,6 +317,7 @@ async def list_groups(
     user_id: uuid.UUID | None = None,
 ) -> list[ContactGroupOut]:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         groups = await client.list_groups()
@@ -309,6 +330,7 @@ async def create_group(
     user_id: uuid.UUID | None = None,
 ) -> ContactGroupOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         addressbooks = await client.list_addressbooks()
@@ -329,6 +351,7 @@ async def rename_group(
     user_id: uuid.UUID | None = None,
 ) -> ContactGroupOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         group = await client.get_group_by_id(group_id)
@@ -345,6 +368,7 @@ async def delete_group(
     user_id: uuid.UUID | None = None,
 ) -> None:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         group = await client.get_group_by_id(group_id)
@@ -359,6 +383,7 @@ async def add_group_member(
     user_id: uuid.UUID | None = None,
 ) -> ContactGroupOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         group = await client.get_group_by_id(group_id)
@@ -376,6 +401,7 @@ async def remove_group_member(
     user_id: uuid.UUID | None = None,
 ) -> ContactGroupOut:
     username, app_password = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         group = await client.get_group_by_id(group_id)
