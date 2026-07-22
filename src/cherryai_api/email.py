@@ -186,6 +186,22 @@ async def _resolve_user_creds(user_id: uuid.UUID) -> tuple[str | None, str | Non
         return username, api_token or app_password
 
 
+def _require_creds(username: str | None, token: str | None) -> tuple[str, str]:
+    """Return (username, token) or raise a helpful 400 if missing."""
+    if username and token:
+        return username, token
+    if token:
+        return "", token
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Fastmail credentials not configured. "
+            "Connect your Fastmail account in Settings → Integrations, "
+            "or set FASTMAIL_API_TOKEN in your .env file."
+        ),
+    )
+
+
 def _to_mailbox_out(mb) -> MailboxOut:
     return MailboxOut(
         id=mb.id,
@@ -244,6 +260,7 @@ async def list_mailboxes(
     user_id: uuid.UUID | None = None,
 ) -> list[MailboxOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -258,6 +275,7 @@ async def list_emails(
     user_id: uuid.UUID | None = None,
 ) -> list[EmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -276,6 +294,7 @@ async def get_email(
     user_id: uuid.UUID | None = None,
 ) -> EmailDetailOut:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -289,6 +308,7 @@ async def get_thread(
     user_id: uuid.UUID | None = None,
 ) -> list[ThreadEmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -318,6 +338,7 @@ async def search_emails(
     user_id: uuid.UUID | None = None,
 ) -> list[EmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -333,6 +354,7 @@ async def send_email_direct(
 ) -> str:
     """Send an email immediately (human-initiated). Returns the email ID."""
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()
@@ -359,6 +381,7 @@ async def reply_email_direct(
 ) -> str:
     """Reply to an email immediately (human-initiated). Returns the new email ID."""
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
+    username, token = _require_creds(username, token)
     client = _build_client(username=username, token=token)
     async with client:
         await client.authenticate()

@@ -162,6 +162,20 @@ async def _resolve_user_cal_creds(user_id: uuid.UUID) -> tuple[str | None, str |
         return username, app_password
 
 
+def _require_creds(username: str | None, app_password: str | None) -> tuple[str, str]:
+    """Return (username, app_password) or raise a helpful 400 if missing."""
+    if username and app_password:
+        return username, app_password
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Fastmail credentials not configured. "
+            "Connect your Fastmail account in Settings → Integrations, "
+            "or set FASTMAIL_USERNAME and FASTMAIL_APP_PASSWORD in your .env file."
+        ),
+    )
+
+
 def _get_client(request: Request, user_id: uuid.UUID | None = None) -> CalDavClient:
     """Build a client from request-scoped settings (router use)."""
     return _build_client()
@@ -231,6 +245,7 @@ async def list_calendars(
     user_id: uuid.UUID | None = None,
 ) -> list[CalendarOut]:
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         calendars = await client.list_calendars()
@@ -247,6 +262,7 @@ async def list_events(
 ) -> list[CalendarEventOut]:
     """List events for a specific calendar."""
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         range_start, range_end = _resolve_range(start, end, week)
@@ -269,6 +285,7 @@ async def list_all_events(
 ) -> list[CalendarEventOut]:
     """List events across ALL calendars."""
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         range_start, range_end = _resolve_range(start, end, week)
@@ -298,6 +315,7 @@ async def get_event(
     user_id: uuid.UUID | None = None,
 ) -> CalendarEventOut:
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         event = await client.get_event_by_id(event_id, calendar_id)
@@ -318,6 +336,7 @@ async def create_event(
     )
 
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
 
     # Build the SDK model
@@ -364,6 +383,7 @@ async def update_event(
     user_id: uuid.UUID | None = None,
 ) -> CalendarEventOut:
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         existing = await client.get_event_by_id(event_id, calendar_id)
@@ -423,6 +443,7 @@ async def delete_event(
     user_id: uuid.UUID | None = None,
 ) -> None:
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         event = await client.get_event_by_id(event_id, calendar_id)
@@ -436,6 +457,7 @@ async def search_events(
 ) -> list[CalendarEventOut]:
     """Substring search over event titles/descriptions across all calendars."""
     username, app_password = await _resolve_user_cal_creds(user_id) if user_id else (None, None)
+    username, app_password = _require_creds(username, app_password)
     client = _build_client(username=username, app_password=app_password)
     async with client:
         events = await client.list_events(EventQuery())
