@@ -492,14 +492,16 @@ async def upsert_plan_day(
 
 
 async def update_plan_day(
-    pool: asyncpg.Pool, day_id: uuid.UUID, data: MealPlanDayUpdate
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, data: MealPlanDayUpdate
 ) -> MealPlanDay | None:
     row = await pool.fetchrow(
-        f"UPDATE meal_plan_days SET "
-        f"notes = COALESCE($2, notes) "
-        f"WHERE id = $1 "
-        f"RETURNING {_DAY_COLUMNS}",
+        "UPDATE meal_plan_days d SET "
+        "notes = COALESCE($3, d.notes) "
+        "FROM meal_plans p "
+        "WHERE d.id = $1 AND d.plan_id = p.id AND p.owner_id = $2 "
+        "RETURNING d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order",
         day_id,
+        owner_id,
         data.notes,
     )
     if row is None:
@@ -509,8 +511,13 @@ async def update_plan_day(
     return MealPlanDay(**day)
 
 
-async def delete_plan_day(pool: asyncpg.Pool, day_id: uuid.UUID) -> bool:
-    result = await pool.execute("DELETE FROM meal_plan_days WHERE id = $1", day_id)
+async def delete_plan_day(pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID) -> bool:
+    result = await pool.execute(
+        "DELETE FROM meal_plan_days d USING meal_plans p "
+        "WHERE d.id = $1 AND d.plan_id = p.id AND p.owner_id = $2",
+        day_id,
+        owner_id,
+    )
     return result.endswith("1")
 
 
@@ -520,8 +527,16 @@ async def delete_plan_day(pool: asyncpg.Pool, day_id: uuid.UUID) -> bool:
 
 
 async def add_recipe_to_day(
-    pool: asyncpg.Pool, day_id: uuid.UUID, recipe_id: uuid.UUID
-) -> RecipeRef:
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, recipe_id: uuid.UUID
+) -> RecipeRef | None:
+    owns_day = await pool.fetchval(
+        "SELECT 1 FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+        "WHERE d.id = $1 AND p.owner_id = $2",
+        day_id,
+        owner_id,
+    )
+    if owns_day is None:
+        return None
     max_order = await pool.fetchval(
         "SELECT COALESCE(MAX(sort_order), -1) FROM meal_plan_day_recipes WHERE day_id = $1",
         day_id,
@@ -540,12 +555,16 @@ async def add_recipe_to_day(
 
 
 async def remove_recipe_from_day(
-    pool: asyncpg.Pool, day_id: uuid.UUID, recipe_id: uuid.UUID
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, recipe_id: uuid.UUID
 ) -> bool:
     result = await pool.execute(
-        "DELETE FROM meal_plan_day_recipes WHERE day_id = $1 AND recipe_id = $2",
+        "DELETE FROM meal_plan_day_recipes dr "
+        "USING meal_plan_days d, meal_plans p "
+        "WHERE dr.day_id = $1 AND dr.recipe_id = $2 "
+        "AND dr.day_id = d.id AND d.plan_id = p.id AND p.owner_id = $3",
         day_id,
         recipe_id,
+        owner_id,
     )
     return result.endswith("1")
 
@@ -736,21 +755,24 @@ async def add_ingredient(
 
 
 async def update_ingredient(
-    pool: asyncpg.Pool, ingredient_id: uuid.UUID, data: IngredientUpdate
+    pool: asyncpg.Pool, owner_id: uuid.UUID, ingredient_id: uuid.UUID, data: IngredientUpdate
 ) -> RecipeIngredient | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Ingredient name must not be empty")
     row = await pool.fetchrow(
-        "UPDATE recipe_ingredients SET "
-        "name = COALESCE($2, name), "
-        "quantity = COALESCE($3, quantity), "
-        "unit = COALESCE($4, unit), "
-        "notes = COALESCE($5, notes), "
-        "category = COALESCE($6, category) "
-        "WHERE id = $1 "
-        "RETURNING id, recipe_id, name, quantity, unit, notes, category, sort_order",
+        "UPDATE recipe_ingredients i SET "
+        "name = COALESCE($3, i.name), "
+        "quantity = COALESCE($4, i.quantity), "
+        "unit = COALESCE($5, i.unit), "
+        "notes = COALESCE($6, i.notes), "
+        "category = COALESCE($7, i.category) "
+        "FROM recipes r "
+        "WHERE i.id = $1 AND i.recipe_id = r.id AND r.owner_id = $2 "
+        "RETURNING i.id, i.recipe_id, i.name, i.quantity, i.unit, i.notes, i.category, "
+        "i.sort_order",
         ingredient_id,
+        owner_id,
         name,
         data.quantity,
         data.unit,
@@ -760,8 +782,15 @@ async def update_ingredient(
     return RecipeIngredient(**dict(row)) if row else None
 
 
-async def delete_ingredient(pool: asyncpg.Pool, ingredient_id: uuid.UUID) -> bool:
-    result = await pool.execute("DELETE FROM recipe_ingredients WHERE id = $1", ingredient_id)
+async def delete_ingredient(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, ingredient_id: uuid.UUID
+) -> bool:
+    result = await pool.execute(
+        "DELETE FROM recipe_ingredients i USING recipes r "
+        "WHERE i.id = $1 AND i.recipe_id = r.id AND r.owner_id = $2",
+        ingredient_id,
+        owner_id,
+    )
     return result.endswith("1")
 
 
@@ -904,21 +933,24 @@ async def add_list_item(
 
 
 async def update_list_item(
-    pool: asyncpg.Pool, item_id: uuid.UUID, data: ShoppingListItemUpdate
+    pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID, data: ShoppingListItemUpdate
 ) -> ShoppingListItem | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Item name must not be empty")
     row = await pool.fetchrow(
-        "UPDATE shopping_list_items SET "
-        "name = COALESCE($2, name), "
-        "quantity = COALESCE($3, quantity), "
-        "unit = COALESCE($4, unit), "
-        "category = COALESCE($5, category), "
-        "purchased = COALESCE($6, purchased) "
-        "WHERE id = $1 "
-        "RETURNING id, list_id, name, quantity, unit, category, purchased, sort_order",
+        "UPDATE shopping_list_items it SET "
+        "name = COALESCE($3, it.name), "
+        "quantity = COALESCE($4, it.quantity), "
+        "unit = COALESCE($5, it.unit), "
+        "category = COALESCE($6, it.category), "
+        "purchased = COALESCE($7, it.purchased) "
+        "FROM shopping_lists l "
+        "WHERE it.id = $1 AND it.list_id = l.id AND l.owner_id = $2 "
+        "RETURNING it.id, it.list_id, it.name, it.quantity, it.unit, it.category, "
+        "it.purchased, it.sort_order",
         item_id,
+        owner_id,
         name,
         data.quantity,
         data.unit,
@@ -928,8 +960,13 @@ async def update_list_item(
     return ShoppingListItem(**dict(row)) if row else None
 
 
-async def delete_list_item(pool: asyncpg.Pool, item_id: uuid.UUID) -> bool:
-    result = await pool.execute("DELETE FROM shopping_list_items WHERE id = $1", item_id)
+async def delete_list_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID) -> bool:
+    result = await pool.execute(
+        "DELETE FROM shopping_list_items it USING shopping_lists l "
+        "WHERE it.id = $1 AND it.list_id = l.id AND l.owner_id = $2",
+        item_id,
+        owner_id,
+    )
     return result.endswith("1")
 
 
@@ -1112,7 +1149,7 @@ async def update_day(
     body: MealPlanDayUpdate,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
-    day = await update_plan_day(_pool(request), day_id, body)
+    day = await update_plan_day(_pool(request), user.id, day_id, body)
     if day is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return day.model_dump(mode="json")
@@ -1129,7 +1166,9 @@ async def add_recipe_to_day_endpoint(
     body: DayRecipeAction,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
-    ref = await add_recipe_to_day(_pool(request), day_id, body.recipe_id)
+    ref = await add_recipe_to_day(_pool(request), user.id, day_id, body.recipe_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="Day not found")
     return ref.model_dump(mode="json")
 
 
@@ -1140,7 +1179,7 @@ async def remove_recipe_from_day_endpoint(
     recipe_id: uuid.UUID,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> None:
-    if not await remove_recipe_from_day(_pool(request), day_id, recipe_id):
+    if not await remove_recipe_from_day(_pool(request), user.id, day_id, recipe_id):
         raise HTTPException(status_code=404, detail="Recipe not found on this day")
 
 
@@ -1150,7 +1189,7 @@ async def delete_day(
     day_id: uuid.UUID,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> None:
-    if not await delete_plan_day(_pool(request), day_id):
+    if not await delete_plan_day(_pool(request), user.id, day_id):
         raise HTTPException(status_code=404, detail="Day not found")
 
 
@@ -1261,7 +1300,7 @@ async def update_recipe_ingredient(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
     try:
-        ingredient = await update_ingredient(_pool(request), ingredient_id, body)
+        ingredient = await update_ingredient(_pool(request), user.id, ingredient_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if ingredient is None:
@@ -1275,7 +1314,7 @@ async def delete_recipe_ingredient(
     ingredient_id: uuid.UUID,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> None:
-    if not await delete_ingredient(_pool(request), ingredient_id):
+    if not await delete_ingredient(_pool(request), user.id, ingredient_id):
         raise HTTPException(status_code=404, detail="Ingredient not found")
 
 
@@ -1370,7 +1409,7 @@ async def update_list_item_endpoint(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> dict:
     try:
-        item = await update_list_item(_pool(request), item_id, body)
+        item = await update_list_item(_pool(request), user.id, item_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if item is None:
@@ -1384,5 +1423,5 @@ async def delete_list_item_endpoint(
     item_id: uuid.UUID,
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> None:
-    if not await delete_list_item(_pool(request), item_id):
+    if not await delete_list_item(_pool(request), user.id, item_id):
         raise HTTPException(status_code=404, detail="Item not found")

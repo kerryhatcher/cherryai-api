@@ -14,15 +14,29 @@ import pytest
 
 from cherryai_api.meal_units import aggregate, canonicalize, format_display
 from cherryai_api.meals import (
+    IngredientUpdate,
     MealPlanCreate,
     MealPlanDayCreate,
+    MealPlanDayUpdate,
     RecipeCreate,
     RecipeIngredientCreate,
+    ShoppingListCreate,
+    ShoppingListItemCreate,
+    ShoppingListItemUpdate,
     add_ingredient,
+    add_list_item,
     add_recipe_to_day,
     create_meal_plan,
     create_recipe,
+    create_shopping_list,
+    delete_ingredient,
+    delete_list_item,
+    delete_plan_day,
     generate_shopping_list_from_plan,
+    remove_recipe_from_day,
+    update_ingredient,
+    update_list_item,
+    update_plan_day,
     upsert_plan_day,
 )
 
@@ -255,8 +269,8 @@ async def test_generate_list_aggregates_duplicate_ingredients(pool, owner) -> No
     )
     day1 = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
     day2 = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 21)))
-    await add_recipe_to_day(pool, day1.id, recipe.id)
-    await add_recipe_to_day(pool, day2.id, recipe.id)
+    await add_recipe_to_day(pool, owner, day1.id, recipe.id)
+    await add_recipe_to_day(pool, owner, day2.id, recipe.id)
 
     slist = await generate_shopping_list_from_plan(pool, owner, plan.id)
     matching = [i for i in slist.items if i.name == "Ztest Flour"]
@@ -272,3 +286,89 @@ async def test_generate_list_no_recipes_raises(pool, owner) -> None:
     )
     with pytest.raises(ValueError, match="no recipes"):
         await generate_shopping_list_from_plan(pool, owner, plan.id)
+
+
+# --- IDOR regression: child-object endpoints verify ownership ----------------
+
+
+@pytest.fixture
+async def alice(make_user):
+    user = await make_user(f"ztest-alice-{uuid.uuid4().hex[:8]}@example.com")
+    return user["id"]
+
+
+@pytest.fixture
+async def bob(make_user):
+    user = await make_user(f"ztest-bob-{uuid.uuid4().hex[:8]}@example.com")
+    return user["id"]
+
+
+async def test_update_plan_day_rejects_other_owner(pool, alice, bob) -> None:
+    plan = await create_meal_plan(
+        pool, alice, MealPlanCreate(name="Ztest Alice Plan", week_start=date(2026, 7, 20))
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+
+    assert await update_plan_day(pool, bob, day.id, MealPlanDayUpdate(notes="hacked")) is None
+    updated = await update_plan_day(pool, alice, day.id, MealPlanDayUpdate(notes="mine"))
+    assert updated is not None and updated.notes == "mine"
+
+
+async def test_delete_plan_day_rejects_other_owner(pool, alice, bob) -> None:
+    plan = await create_meal_plan(
+        pool, alice, MealPlanCreate(name="Ztest Alice Plan 2", week_start=date(2026, 7, 20))
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+
+    assert await delete_plan_day(pool, bob, day.id) is False
+    assert await delete_plan_day(pool, alice, day.id) is True
+
+
+async def test_add_recipe_to_day_rejects_other_owner(pool, alice, bob) -> None:
+    plan = await create_meal_plan(
+        pool, alice, MealPlanCreate(name="Ztest Alice Plan 3", week_start=date(2026, 7, 20))
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    recipe = await create_recipe(pool, alice, RecipeCreate(name="Ztest Alice Recipe"))
+
+    assert await add_recipe_to_day(pool, bob, day.id, recipe.id) is None
+    ref = await add_recipe_to_day(pool, alice, day.id, recipe.id)
+    assert ref is not None and ref.id == recipe.id
+
+
+async def test_remove_recipe_from_day_rejects_other_owner(pool, alice, bob) -> None:
+    plan = await create_meal_plan(
+        pool, alice, MealPlanCreate(name="Ztest Alice Plan 4", week_start=date(2026, 7, 20))
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    recipe = await create_recipe(pool, alice, RecipeCreate(name="Ztest Alice Recipe 2"))
+    await add_recipe_to_day(pool, alice, day.id, recipe.id)
+
+    assert await remove_recipe_from_day(pool, bob, day.id, recipe.id) is False
+    assert await remove_recipe_from_day(pool, alice, day.id, recipe.id) is True
+
+
+async def test_ingredient_mutation_rejects_other_owner(pool, alice, bob) -> None:
+    recipe = await create_recipe(pool, alice, RecipeCreate(name="Ztest Alice Recipe 5"))
+    ingredient = await add_ingredient(pool, recipe.id, RecipeIngredientCreate(name="Ztest Salt"))
+
+    assert (
+        await update_ingredient(pool, bob, ingredient.id, IngredientUpdate(name="Hacked")) is None
+    )
+    updated = await update_ingredient(pool, alice, ingredient.id, IngredientUpdate(name="Renamed"))
+    assert updated is not None and updated.name == "Renamed"
+
+    assert await delete_ingredient(pool, bob, ingredient.id) is False
+    assert await delete_ingredient(pool, alice, ingredient.id) is True
+
+
+async def test_list_item_mutation_rejects_other_owner(pool, alice, bob) -> None:
+    slist = await create_shopping_list(pool, alice, ShoppingListCreate(name="Ztest Alice List"))
+    item = await add_list_item(pool, slist.id, ShoppingListItemCreate(name="Ztest Milk"))
+
+    assert await update_list_item(pool, bob, item.id, ShoppingListItemUpdate(name="Hacked")) is None
+    updated = await update_list_item(pool, alice, item.id, ShoppingListItemUpdate(name="Renamed"))
+    assert updated is not None and updated.name == "Renamed"
+
+    assert await delete_list_item(pool, bob, item.id) is False
+    assert await delete_list_item(pool, alice, item.id) is True
