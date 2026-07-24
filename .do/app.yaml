@@ -23,12 +23,16 @@ services:
     dockerfile_path: Dockerfile
     http_port: 8000
     instance_count: 1
-    instance_size_slug: basic-xxs
+    instance_size_slug: basic-xs
     routes:
       - path: /api
+        preserve_path_prefix: true
       - path: /auth
+        preserve_path_prefix: true
       - path: /users
+        preserve_path_prefix: true
       - path: /admin
+        preserve_path_prefix: true
     health_check:
       http_path: /api/health
     envs:
