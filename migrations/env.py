@@ -13,6 +13,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from cherryai_api.frontend_errors import FrontendError  # noqa: F401 (register tables)
 from cherryai_api.orm import Base, sqlalchemy_url
 from cherryai_api.users import AccessToken, User  # noqa: F401 (register tables)
 
