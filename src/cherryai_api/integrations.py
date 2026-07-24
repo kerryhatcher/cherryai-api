@@ -12,6 +12,7 @@ from datetime import datetime
 
 from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, String, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,7 +84,8 @@ class FastmailCredentialIn(BaseModel):
     username: str = Field(min_length=1, description="Fastmail email address")
     app_password: str = Field(min_length=1, description="Fastmail app password")
     api_token: str | None = Field(
-        default=None, description="JMAP API token (optional; app password covers JMAP too)"
+        default=None,
+        description="JMAP Bearer token (preferred; generate in Fastmail Settings → API Tokens)",
     )
 
 
@@ -168,15 +170,19 @@ async def _validate_fastmail_creds(username: str, app_password: str) -> tuple[bo
         from fastmail_sdk import JmapClient
         from fastmail_sdk.errors import FastmailError
 
-        client = JmapClient(token=app_password, username=username)
-        # A lightweight call to verify the credentials work.
-        mailboxes = await client.get_mailboxes()
+        client = JmapClient(token=app_password)
+        async with client:
+            await client.authenticate()
+            # A lightweight call to verify the credentials work.
+            mailboxes = await client.list_mailboxes()
         if mailboxes:
             return True, f"Connected — {len(mailboxes)} mailbox(es) found"
         return True, "Connected successfully"
     except FastmailError as e:
+        logger.warning(f"Fastmail credential validation failed: {e}")
         return False, str(e)
     except Exception as e:
+        logger.opt(exception=True).error(f"Fastmail credential validation error: {e}")
         return False, f"Connection failed: {e}"
 
 
@@ -222,7 +228,7 @@ async def create_fastmail_credential(
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ) -> FastmailCredentialOut:
     # Validate before saving.
-    ok, detail = await _validate_fastmail_creds(body.username, body.app_password)
+    ok, detail = await _validate_fastmail_creds(body.username, body.api_token or body.app_password)
     if not ok:
         raise HTTPException(status_code=400, detail=f"Credential validation failed: {detail}")
 
@@ -253,7 +259,7 @@ async def validate_fastmail_credential(
     user: User = Depends(current_verified_user),  # noqa: B008
 ) -> ValidateResult:
     """Test credentials without saving them."""
-    ok, detail = await _validate_fastmail_creds(body.username, body.app_password)
+    ok, detail = await _validate_fastmail_creds(body.username, body.api_token or body.app_password)
     return ValidateResult(ok=ok, detail=detail)
 
 
@@ -273,7 +279,7 @@ async def update_fastmail_credential(
     if body.app_password is not None:
         # Validate new password before saving.
         username = body.username or cred.username
-        ok, detail = await _validate_fastmail_creds(username, body.app_password)
+        ok, detail = await _validate_fastmail_creds(username, body.api_token or body.app_password)
         if not ok:
             raise HTTPException(status_code=400, detail=f"Credential validation failed: {detail}")
         cred.app_password_encrypted = _encrypt(body.app_password)

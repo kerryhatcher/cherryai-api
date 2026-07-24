@@ -131,19 +131,16 @@ class EmailApprovalOut(BaseModel):
 
 
 def _build_client(
-    username: str | None = None,
     token: str | None = None,
 ) -> JmapClient:
     """Build a JMAP client.
 
-    If username and token are provided (per-user credentials), use those.
+    If token is provided (per-user credentials), use it.
     Otherwise fall back to the system-level token from env/settings/config.
     """
     import os
     from pathlib import Path
 
-    if token and username:
-        return JmapClient(token=token, username=username)
     if token:
         return JmapClient(token=token)
 
@@ -261,7 +258,7 @@ async def list_mailboxes(
 ) -> list[MailboxOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         mailboxes = await client.list_mailboxes()
@@ -276,7 +273,7 @@ async def list_emails(
 ) -> list[EmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         if mailbox_id:
@@ -295,7 +292,7 @@ async def get_email(
 ) -> EmailDetailOut:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         email = await client.get_email(email_id)
@@ -309,7 +306,7 @@ async def get_thread(
 ) -> list[ThreadEmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         emails = await client.get_thread(email_id)
@@ -339,7 +336,7 @@ async def search_emails(
 ) -> list[EmailOut]:
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         filt = SearchFilter(text=query)
@@ -355,7 +352,7 @@ async def send_email_direct(
     """Send an email immediately (human-initiated). Returns the email ID."""
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         to_addrs = [EmailAddress(email=addr) for addr in data.to]
@@ -382,7 +379,7 @@ async def reply_email_direct(
     """Reply to an email immediately (human-initiated). Returns the new email ID."""
     username, token = await _resolve_user_creds(user_id) if user_id else (None, None)
     username, token = _require_creds(username, token)
-    client = _build_client(username=username, token=token)
+    client = _build_client(token=token)
     async with client:
         await client.authenticate()
         original = await client.get_email(email_id)
