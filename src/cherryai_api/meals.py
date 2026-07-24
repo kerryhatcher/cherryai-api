@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from cherryai_api.auth import current_verified_user
+from cherryai_api.meal_units import aggregate
 from cherryai_api.users import User
 
 # ------------------------------------------------------------------
@@ -940,32 +941,35 @@ async def delete_list_item(pool: asyncpg.Pool, item_id: uuid.UUID) -> bool:
 async def generate_shopping_list_from_plan(
     pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID
 ) -> ShoppingList:
-    """Aggregate all recipe ingredients from a meal plan into a shopping list."""
+    """Aggregate all recipe ingredients from a meal plan into a shopping list.
+
+    Ingredients are collected per day-recipe *link*, not per distinct recipe:
+    a recipe assigned to N days on the plan contributes N copies of its
+    ingredients, which :func:`~cherryai_api.meal_units.aggregate` then sums
+    (in a shared canonical unit) into one line per (name, unit dimension).
+    """
     plan = await get_meal_plan(pool, owner_id, plan_id)
     if plan is None:
         raise ValueError("Meal plan not found")
 
-    # Collect all recipe_ids referenced in the plan via the junction table
-    recipe_ids = await pool.fetch(
-        "SELECT DISTINCT dr.recipe_id "
+    # One row per day-recipe link joined to its ingredients — deliberately
+    # not DISTINCT, so a recipe assigned to N days contributes N sets of
+    # ingredients for aggregate() to sum.
+    rows = await pool.fetch(
+        "SELECT ri.name, ri.quantity, ri.unit, ri.category "
         "FROM meal_plan_day_recipes dr "
         "JOIN meal_plan_days d ON d.id = dr.day_id "
-        "WHERE d.plan_id = $1",
+        "JOIN recipe_ingredients ri ON ri.recipe_id = dr.recipe_id "
+        "WHERE d.plan_id = $1 "
+        "ORDER BY ri.category, ri.name",
         plan_id,
     )
 
-    if not recipe_ids:
+    if not rows:
         raise ValueError("Meal plan has no recipes assigned")
 
-    rids = [r["recipe_id"] for r in recipe_ids]
-
-    # Fetch all ingredients for those recipes
-    rows = await pool.fetch(
-        "SELECT name, quantity, unit, category "
-        "FROM recipe_ingredients "
-        "WHERE recipe_id = ANY($1::uuid[]) "
-        "ORDER BY category, name",
-        rids,
+    aggregated = aggregate(
+        (row["name"], row["quantity"], row["unit"], row["category"]) for row in rows
     )
 
     # Create the shopping list
@@ -980,15 +984,15 @@ async def generate_shopping_list_from_plan(
 
     # Add aggregated items
     items: list[ShoppingListItem] = []
-    for row in rows:
+    for entry in aggregated:
         item = await add_list_item(
             pool,
             slist.id,
             ShoppingListItemCreate(
-                name=row["name"],
-                quantity=row["quantity"],
-                unit=row["unit"],
-                category=row["category"],
+                name=entry.name,
+                quantity=entry.quantity,
+                unit=entry.unit,
+                category=entry.category,
             ),
         )
         items.append(item)
