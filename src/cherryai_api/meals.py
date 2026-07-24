@@ -117,6 +117,30 @@ CREATE TABLE IF NOT EXISTS pantry_items (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS pantry_items_owner_idx ON pantry_items (owner_id, name);
+
+CREATE TABLE IF NOT EXISTS stores (
+    id UUID PRIMARY KEY,
+    owner_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS stores_owner_idx ON stores (owner_id);
+
+CREATE TABLE IF NOT EXISTS store_products (
+    id UUID PRIMARY KEY,
+    store_id UUID NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+    ingredient_name TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    package_quantity REAL NOT NULL,
+    package_unit TEXT NOT NULL,
+    price_cents INTEGER,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS store_products_store_idx ON store_products (store_id, ingredient_name);
 """
 
 # Additive schema evolution: CREATE TABLE IF NOT EXISTS (above) can't alter
@@ -432,6 +456,59 @@ class DayAlreadyConsumed(Exception):
     def __init__(self, day_id: uuid.UUID) -> None:
         self.day_id = day_id
         super().__init__(f"Day {day_id} is already marked consumed")
+
+
+# ------------------------------------------------------------------
+# Pydantic models — Stores & Store Products
+# ------------------------------------------------------------------
+
+
+class StoreCreate(BaseModel):
+    name: str
+    notes: str | None = None
+
+
+class StoreUpdate(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+
+
+class Store(BaseModel):
+    id: uuid.UUID
+    owner_id: uuid.UUID
+    name: str
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoreProductCreate(BaseModel):
+    ingredient_name: str
+    product_name: str
+    package_quantity: float
+    package_unit: str
+    price_cents: int | None = None
+    notes: str | None = None
+
+
+class StoreProductUpdate(BaseModel):
+    ingredient_name: str | None = None
+    product_name: str | None = None
+    package_quantity: float | None = None
+    package_unit: str | None = None
+    price_cents: int | None = None
+    notes: str | None = None
+
+
+class StoreProduct(BaseModel):
+    id: uuid.UUID
+    store_id: uuid.UUID
+    ingredient_name: str
+    product_name: str
+    package_quantity: float
+    package_unit: str
+    price_cents: int | None
+    notes: str | None
 
 
 # ------------------------------------------------------------------
@@ -1421,6 +1498,166 @@ async def commit_list_to_pantry(
 
 
 # ------------------------------------------------------------------
+# Data access — Stores
+# ------------------------------------------------------------------
+
+_STORE_COLUMNS = "id, owner_id, name, notes, created_at, updated_at"
+_PRODUCT_COLUMNS = (
+    "id, store_id, ingredient_name, product_name, package_quantity, "
+    "package_unit, price_cents, notes"
+)
+
+
+async def list_stores(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[Store]:
+    rows = await pool.fetch(
+        f"SELECT {_STORE_COLUMNS} FROM stores WHERE owner_id = $1 ORDER BY name", owner_id
+    )
+    return [Store(**dict(row)) for row in rows]
+
+
+async def get_store(pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID) -> Store | None:
+    row = await pool.fetchrow(
+        f"SELECT {_STORE_COLUMNS} FROM stores WHERE id = $1 AND owner_id = $2",
+        store_id,
+        owner_id,
+    )
+    return Store(**dict(row)) if row else None
+
+
+async def create_store(pool: asyncpg.Pool, owner_id: uuid.UUID, data: StoreCreate) -> Store:
+    name = data.name.strip()
+    if not name:
+        raise ValueError("Store name must not be empty")
+    row = await pool.fetchrow(
+        f"INSERT INTO stores (id, owner_id, name, notes) "
+        f"VALUES ($1, $2, $3, $4) RETURNING {_STORE_COLUMNS}",
+        uuid.uuid4(),
+        owner_id,
+        name,
+        data.notes,
+    )
+    return Store(**dict(row))
+
+
+async def update_store(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID, data: StoreUpdate
+) -> Store | None:
+    name = data.name.strip() if data.name is not None else None
+    if data.name is not None and not name:
+        raise ValueError("Store name must not be empty")
+    row = await pool.fetchrow(
+        f"UPDATE stores SET "
+        f"name = COALESCE($3, name), "
+        f"notes = COALESCE($4, notes), "
+        f"updated_at = now() "
+        f"WHERE id = $1 AND owner_id = $2 RETURNING {_STORE_COLUMNS}",
+        store_id,
+        owner_id,
+        name,
+        data.notes,
+    )
+    return Store(**dict(row)) if row else None
+
+
+async def delete_store(pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID) -> bool:
+    result = await pool.execute(
+        "DELETE FROM stores WHERE id = $1 AND owner_id = $2", store_id, owner_id
+    )
+    return result.endswith("1")
+
+
+async def list_store_products(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID
+) -> list[StoreProduct] | None:
+    """Returns None if the store isn't found or isn't owned by `owner_id`."""
+    store = await get_store(pool, owner_id, store_id)
+    if store is None:
+        return None
+    rows = await pool.fetch(
+        f"SELECT {_PRODUCT_COLUMNS} FROM store_products "
+        f"WHERE store_id = $1 ORDER BY ingredient_name",
+        store_id,
+    )
+    return [StoreProduct(**dict(row)) for row in rows]
+
+
+async def add_store_product(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID, data: StoreProductCreate
+) -> StoreProduct | None:
+    """Returns None if the store isn't found or isn't owned by `owner_id`."""
+    store = await get_store(pool, owner_id, store_id)
+    if store is None:
+        return None
+    ingredient_name = data.ingredient_name.strip()
+    product_name = data.product_name.strip()
+    if not ingredient_name:
+        raise ValueError("Ingredient name must not be empty")
+    if not product_name:
+        raise ValueError("Product name must not be empty")
+    row = await pool.fetchrow(
+        f"INSERT INTO store_products "
+        f"(id, store_id, ingredient_name, product_name, package_quantity, package_unit, "
+        f"price_cents, notes) "
+        f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {_PRODUCT_COLUMNS}",
+        uuid.uuid4(),
+        store_id,
+        ingredient_name,
+        product_name,
+        data.package_quantity,
+        data.package_unit,
+        data.price_cents,
+        data.notes,
+    )
+    return StoreProduct(**dict(row))
+
+
+async def update_store_product(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, product_id: uuid.UUID, data: StoreProductUpdate
+) -> StoreProduct | None:
+    ingredient_name = data.ingredient_name.strip() if data.ingredient_name is not None else None
+    product_name = data.product_name.strip() if data.product_name is not None else None
+    if data.ingredient_name is not None and not ingredient_name:
+        raise ValueError("Ingredient name must not be empty")
+    if data.product_name is not None and not product_name:
+        raise ValueError("Product name must not be empty")
+    row = await pool.fetchrow(
+        "UPDATE store_products sp SET "
+        "ingredient_name = COALESCE($3, sp.ingredient_name), "
+        "product_name = COALESCE($4, sp.product_name), "
+        "package_quantity = COALESCE($5, sp.package_quantity), "
+        "package_unit = COALESCE($6, sp.package_unit), "
+        "price_cents = COALESCE($7, sp.price_cents), "
+        "notes = COALESCE($8, sp.notes), "
+        "updated_at = now() "
+        "FROM stores st "
+        "WHERE sp.id = $1 AND sp.store_id = st.id AND st.owner_id = $2 "
+        "RETURNING sp.id, sp.store_id, sp.ingredient_name, sp.product_name, "
+        "sp.package_quantity, sp.package_unit, sp.price_cents, sp.notes",
+        product_id,
+        owner_id,
+        ingredient_name,
+        product_name,
+        data.package_quantity,
+        data.package_unit,
+        data.price_cents,
+        data.notes,
+    )
+    return StoreProduct(**dict(row)) if row else None
+
+
+async def delete_store_product(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, product_id: uuid.UUID
+) -> bool:
+    result = await pool.execute(
+        "DELETE FROM store_products sp USING stores st "
+        "WHERE sp.id = $1 AND sp.store_id = st.id AND st.owner_id = $2",
+        product_id,
+        owner_id,
+    )
+    return result.endswith("1")
+
+
+# ------------------------------------------------------------------
 # Shopping list generation from meal plan
 # ------------------------------------------------------------------
 
@@ -1974,3 +2211,111 @@ async def commit_to_pantry_endpoint(
     if added is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     return CommitToPantryResponse(added=added).model_dump(mode="json")
+
+
+# -- Stores --
+
+
+@router.get("/stores")
+async def list_stores_endpoint(
+    request: Request,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    stores = await list_stores(_pool(request), user.id)
+    return [store.model_dump(mode="json") for store in stores]
+
+
+@router.post("/stores", status_code=201)
+async def create_store_endpoint(
+    request: Request,
+    body: StoreCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        store = await create_store(_pool(request), user.id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return store.model_dump(mode="json")
+
+
+@router.put("/stores/{store_id}")
+async def update_store_endpoint(
+    request: Request,
+    store_id: uuid.UUID,
+    body: StoreUpdate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        store = await update_store(_pool(request), user.id, store_id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if store is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return store.model_dump(mode="json")
+
+
+@router.delete("/stores/{store_id}", status_code=204)
+async def delete_store_endpoint(
+    request: Request,
+    store_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> None:
+    if not await delete_store(_pool(request), user.id, store_id):
+        raise HTTPException(status_code=404, detail="Store not found")
+
+
+# -- Store Products --
+
+
+@router.get("/stores/{store_id}/products")
+async def list_store_products_endpoint(
+    request: Request,
+    store_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    products = await list_store_products(_pool(request), user.id, store_id)
+    if products is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return [product.model_dump(mode="json") for product in products]
+
+
+@router.post("/stores/{store_id}/products", status_code=201)
+async def add_store_product_endpoint(
+    request: Request,
+    store_id: uuid.UUID,
+    body: StoreProductCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        product = await add_store_product(_pool(request), user.id, store_id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if product is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return product.model_dump(mode="json")
+
+
+@router.put("/stores/products/{product_id}")
+async def update_store_product_endpoint(
+    request: Request,
+    product_id: uuid.UUID,
+    body: StoreProductUpdate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        product = await update_store_product(_pool(request), user.id, product_id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if product is None:
+        raise HTTPException(status_code=404, detail="Store product not found")
+    return product.model_dump(mode="json")
+
+
+@router.delete("/stores/products/{product_id}", status_code=204)
+async def delete_store_product_endpoint(
+    request: Request,
+    product_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> None:
+    if not await delete_store_product(_pool(request), user.id, product_id):
+        raise HTTPException(status_code=404, detail="Store product not found")

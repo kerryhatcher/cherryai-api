@@ -16,6 +16,7 @@ from cherryai_api.meal_units import (
     aggregate,
     canonicalize,
     format_display,
+    packages_needed,
     to_canonical_unit_factor,
 )
 from cherryai_api.meals import (
@@ -32,27 +33,39 @@ from cherryai_api.meals import (
     ShoppingListCreate,
     ShoppingListItemCreate,
     ShoppingListItemUpdate,
+    StoreCreate,
+    StoreProductCreate,
+    StoreProductUpdate,
+    StoreUpdate,
     add_ingredient,
     add_list_item,
     add_recipe_to_day,
+    add_store_product,
     commit_list_to_pantry,
     consume_day,
     create_meal_plan,
     create_recipe,
     create_shopping_list,
+    create_store,
     delete_ingredient,
     delete_list_item,
     delete_pantry_item,
     delete_plan_day,
+    delete_store,
+    delete_store_product,
     generate_shopping_list_from_plan,
     get_plan_day,
     list_pantry_items,
+    list_store_products,
+    list_stores,
     remove_recipe_from_day,
     unconsume_day,
     update_ingredient,
     update_list_item,
     update_pantry_item,
     update_plan_day,
+    update_store,
+    update_store_product,
     upsert_pantry_item,
     upsert_plan_day,
 )
@@ -729,3 +742,175 @@ async def test_commit_to_pantry_rejects_other_owner(pool, alice, bob) -> None:
         pool, alice, ShoppingListCreate(name="Ztest Alice List Commit")
     )
     assert await commit_list_to_pantry(pool, bob, slist.id) is None
+
+
+# --- packages_needed (package math) --------------------------------------------
+
+
+def test_packages_needed_exact_fit() -> None:
+    result = packages_needed(10.0, "lb", 5.0, "lb")
+    assert result == (2, 0.0, "lb")
+
+
+def test_packages_needed_rounds_up_with_leftover() -> None:
+    result = packages_needed(8.0, "lb", 5.0, "lb")
+    assert result is not None
+    packages, leftover_qty, leftover_unit = result
+    assert packages == 2
+    assert leftover_qty == pytest.approx(2.0)
+    assert leftover_unit == "lb"
+
+
+def test_packages_needed_converts_across_units_same_dimension() -> None:
+    # Need 24 oz, packages are sold in 1 lb (453.592g) units -> ceil(24*28.3495/453.592) = 2
+    result = packages_needed(24.0, "oz", 1.0, "lb")
+    assert result is not None
+    packages, leftover_qty, leftover_unit = result
+    assert packages == 2
+    assert leftover_unit == "oz"
+    assert leftover_qty > 0
+
+
+def test_packages_needed_dimension_mismatch_returns_none() -> None:
+    assert packages_needed(2.0, "cup", 5.0, "lb") is None
+
+
+def test_packages_needed_non_positive_package_size_returns_none() -> None:
+    assert packages_needed(2.0, "lb", 0.0, "lb") is None
+
+
+def test_packages_needed_zero_needed_is_zero_packages() -> None:
+    result = packages_needed(0.0, "lb", 5.0, "lb")
+    assert result is not None
+    packages, leftover_qty, _ = result
+    assert packages == 0
+    assert leftover_qty == 0.0
+
+
+def test_packages_needed_blank_needed_unit_falls_back_to_package_unit() -> None:
+    result = packages_needed(3.0, None, 2.0, "count")
+    assert result is not None
+    packages, _, leftover_unit = result
+    assert packages == 2
+    assert leftover_unit == "count"
+
+
+# --- Stores & store products ----------------------------------------------------
+
+
+async def test_store_crud_round_trip(pool, owner) -> None:
+    store = await create_store(pool, owner, StoreCreate(name="Ztest Sam's Club", notes="bulk"))
+    assert store.name == "Ztest Sam's Club"
+    assert store.notes == "bulk"
+
+    updated = await update_store(pool, owner, store.id, StoreUpdate(name="Ztest Costco"))
+    assert updated is not None and updated.name == "Ztest Costco"
+
+    stores = await list_stores(pool, owner)
+    assert any(s.id == store.id for s in stores)
+
+    assert await delete_store(pool, owner, store.id) is True
+    assert await delete_store(pool, owner, store.id) is False
+
+
+async def test_create_store_rejects_blank_name(pool, owner) -> None:
+    with pytest.raises(ValueError):
+        await create_store(pool, owner, StoreCreate(name="   "))
+
+
+async def test_store_update_and_delete_rejects_other_owner(pool, alice, bob) -> None:
+    store = await create_store(pool, alice, StoreCreate(name="Ztest Alice Store"))
+    assert await update_store(pool, bob, store.id, StoreUpdate(name="Hacked")) is None
+    assert await delete_store(pool, bob, store.id) is False
+    assert await delete_store(pool, alice, store.id) is True
+
+
+async def test_store_product_crud_round_trip(pool, owner) -> None:
+    store = await create_store(pool, owner, StoreCreate(name="Ztest Product Store"))
+    product = await add_store_product(
+        pool,
+        owner,
+        store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Chicken Tenders",
+            product_name="Breaded Chicken Tenders",
+            package_quantity=5.0,
+            package_unit="lb",
+            price_cents=1299,
+        ),
+    )
+    assert product is not None
+    assert product.ingredient_name == "Ztest Chicken Tenders"
+    assert product.package_quantity == 5.0
+
+    products = await list_store_products(pool, owner, store.id)
+    assert products is not None
+    assert any(p.id == product.id for p in products)
+
+    updated = await update_store_product(
+        pool, owner, product.id, StoreProductUpdate(price_cents=999)
+    )
+    assert updated is not None and updated.price_cents == 999
+
+    assert await delete_store_product(pool, owner, product.id) is True
+    assert await delete_store_product(pool, owner, product.id) is False
+
+
+async def test_add_store_product_rejects_unowned_store(pool, alice, bob) -> None:
+    store = await create_store(pool, alice, StoreCreate(name="Ztest Alice Product Store"))
+    result = await add_store_product(
+        pool,
+        bob,
+        store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest X", product_name="X", package_quantity=1.0, package_unit="lb"
+        ),
+    )
+    assert result is None
+
+
+async def test_list_store_products_rejects_unowned_store(pool, alice, bob) -> None:
+    store = await create_store(pool, alice, StoreCreate(name="Ztest Alice List Store"))
+    assert await list_store_products(pool, bob, store.id) is None
+
+
+async def test_store_product_update_and_delete_rejects_other_owner(pool, alice, bob) -> None:
+    store = await create_store(pool, alice, StoreCreate(name="Ztest Alice Product Store 2"))
+    product = await add_store_product(
+        pool,
+        alice,
+        store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Y", product_name="Y", package_quantity=1.0, package_unit="lb"
+        ),
+    )
+    assert product is not None
+
+    assert (
+        await update_store_product(pool, bob, product.id, StoreProductUpdate(product_name="Hack"))
+        is None
+    )
+    assert await delete_store_product(pool, bob, product.id) is False
+    assert await delete_store_product(pool, alice, product.id) is True
+
+
+async def test_create_store_product_rejects_blank_names(pool, owner) -> None:
+    store = await create_store(pool, owner, StoreCreate(name="Ztest Blank Names Store"))
+    with pytest.raises(ValueError):
+        await add_store_product(
+            pool,
+            owner,
+            store.id,
+            StoreProductCreate(
+                ingredient_name="   ", product_name="X", package_quantity=1.0, package_unit="lb"
+            ),
+        )
+    with pytest.raises(ValueError):
+        await add_store_product(
+            pool,
+            owner,
+            store.id,
+            StoreProductCreate(
+                ingredient_name="X", product_name="   ", package_quantity=1.0, package_unit="lb"
+            ),
+        )

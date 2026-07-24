@@ -13,6 +13,7 @@ identical unit string — never silently coerced into a wrong conversion.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -253,3 +254,36 @@ def aggregate(
         )
 
     return results
+
+
+def packages_needed(
+    needed_qty: float,
+    needed_unit: str | None,
+    package_qty: float,
+    package_unit: str | None,
+) -> tuple[int, float, str] | None:
+    """Compute how many store packages to buy and the leftover after use.
+
+    ``packages = ceil(needed / package_size)``; leftover is what's left over
+    after using ``needed_qty`` out of the purchased packages, expressed in
+    ``needed_unit`` (falling back to ``package_unit`` when ``needed_unit``
+    is blank).
+
+    Returns ``None`` when ``needed_unit`` and ``package_unit`` are in
+    different dimensions (e.g. needed in "cups" but the package is sized in
+    "lb") — package math is only meaningful within one dimension — or when
+    the package size itself is non-positive.
+    """
+    needed_canonical, needed_dim, _ = canonicalize(needed_qty, needed_unit)
+    package_canonical, package_dim, _ = canonicalize(package_qty, package_unit)
+    if needed_dim != package_dim or not package_canonical or package_canonical <= 0:
+        return None
+
+    needed_canonical = needed_canonical or 0.0
+    packages = math.ceil(needed_canonical / package_canonical) if needed_canonical > 0 else 0
+    leftover_canonical = packages * package_canonical - needed_canonical
+
+    leftover_unit = needed_unit if needed_unit and needed_unit.strip() else package_unit
+    factor = to_canonical_unit_factor(leftover_unit)
+    leftover_qty, resolved_unit = format_display(leftover_canonical / factor, leftover_unit)
+    return packages, leftover_qty or 0.0, resolved_unit or _COUNT_UNIT
