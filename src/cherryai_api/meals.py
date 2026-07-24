@@ -1509,6 +1509,13 @@ async def commit_list_to_pantry(
 ) -> list[CommitToPantryLine] | None:
     """Add a shopping list's purchased items into pantry stock (upsert-add).
 
+    When an item carries package data (`packages` + `store_product_id` both
+    set), the family bought whole packages — credit `packages *
+    package_quantity` in `package_unit` to pantry, not the raw needed
+    `quantity`/`unit` (e.g. buying 2 x 5 lb for an 8 lb need credits 10 lb,
+    not 8). Items without package data keep crediting their raw
+    quantity/unit.
+
     Returns None if the list isn't found or isn't owned by `owner_id`.
     """
     slist = await get_shopping_list(pool, owner_id, list_id)
@@ -1519,11 +1526,22 @@ async def commit_list_to_pantry(
     async with pool.acquire() as conn:
         async with conn.transaction():
             for item in slist.items:
-                if not item.purchased or item.quantity is None:
+                if not item.purchased:
                     continue
-                await _add_to_pantry(conn, owner_id, item.name, item.quantity, item.unit)
+                credit_qty, credit_unit = item.quantity, item.unit
+                if item.packages is not None and item.store_product_id is not None:
+                    product = await conn.fetchrow(
+                        "SELECT package_quantity, package_unit FROM store_products WHERE id = $1",
+                        item.store_product_id,
+                    )
+                    if product is not None:
+                        credit_qty = item.packages * product["package_quantity"]
+                        credit_unit = product["package_unit"]
+                if credit_qty is None:
+                    continue
+                await _add_to_pantry(conn, owner_id, item.name, credit_qty, credit_unit)
                 added.append(
-                    CommitToPantryLine(name=item.name, quantity=item.quantity, unit=item.unit)
+                    CommitToPantryLine(name=item.name, quantity=credit_qty, unit=credit_unit)
                 )
     return added
 

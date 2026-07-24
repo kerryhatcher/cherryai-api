@@ -746,6 +746,70 @@ async def test_commit_to_pantry_rejects_other_owner(pool, alice, bob) -> None:
     assert await commit_list_to_pantry(pool, bob, slist.id) is None
 
 
+async def test_commit_to_pantry_credits_purchased_packages_not_needed_amount(pool, owner) -> None:
+    """Buying 2 x 5 lb for an 8 lb need credits pantry 10 lb, not 8 lb."""
+    store = await create_store(pool, owner, StoreCreate(name="Ztest Commit Store"))
+    product = await add_store_product(
+        pool,
+        owner,
+        store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Package Chicken",
+            product_name="Chicken Tenders",
+            package_quantity=5.0,
+            package_unit="lb",
+        ),
+    )
+    assert product is not None
+
+    slist = await create_shopping_list(
+        pool, owner, ShoppingListCreate(name="Ztest Commit Packages")
+    )
+    item = await add_list_item(
+        pool,
+        slist.id,
+        ShoppingListItemCreate(
+            name="Ztest Package Chicken",
+            quantity=8.0,
+            unit="lb",
+            packages=2,
+            store_product_id=product.id,
+            store_name=store.name,
+            package_label="5 lb",
+        ),
+    )
+    await update_list_item(pool, owner, item.id, ShoppingListItemUpdate(purchased=True))
+
+    added = await commit_list_to_pantry(pool, owner, slist.id)
+    assert added is not None
+    credited = next(a for a in added if a.name == "Ztest Package Chicken")
+    assert credited.quantity == 10.0
+    assert credited.unit == "lb"
+
+    pantry = await list_pantry_items(pool, owner)
+    stocked = next(i for i in pantry if i.name == "Ztest Package Chicken")
+    assert stocked.quantity == 10.0
+    assert stocked.unit == "lb"
+
+
+async def test_commit_to_pantry_without_package_data_credits_raw_quantity(pool, owner) -> None:
+    slist = await create_shopping_list(
+        pool, owner, ShoppingListCreate(name="Ztest Commit No Package")
+    )
+    item = await add_list_item(
+        pool,
+        slist.id,
+        ShoppingListItemCreate(name="Ztest No Package Milk", quantity=1.0, unit="gal"),
+    )
+    await update_list_item(pool, owner, item.id, ShoppingListItemUpdate(purchased=True))
+
+    added = await commit_list_to_pantry(pool, owner, slist.id)
+    assert added is not None
+    credited = next(a for a in added if a.name == "Ztest No Package Milk")
+    assert credited.quantity == 1.0
+    assert credited.unit == "gal"
+
+
 # --- packages_needed (package math) --------------------------------------------
 
 
