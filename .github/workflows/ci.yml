@@ -58,3 +58,16 @@ jobs:
         run: uv sync --locked
       - name: Run tests
         run: uv run pytest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [lint, audit, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: Trigger DO App Platform deployment
+        env:
+          DO_APP_ID: ${{ secrets.DO_APP_ID }}
+        run: doctl apps create-deployment "$DO_APP_ID" --wait
