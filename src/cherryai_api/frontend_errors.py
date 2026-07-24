@@ -25,6 +25,13 @@ class FrontendError(Base):
     __table_args__ = (Index("ix_frontend_errors_created_at", text("created_at DESC")),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # Nullable even though the endpoint now always has an authenticated caller:
+    # `ondelete="SET NULL"` (see migration 0005) requires it, and it keeps the
+    # historical row around after the reporting account is deleted. The FK
+    # constraint itself is created in the migration, not declared here — this
+    # codebase's other user-owned tables (e.g. `UserFastmailCredential` in
+    # integrations.py) follow the same split.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, index=True)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str | None] = mapped_column(Text, nullable=True)
     lineno: Mapped[int | None] = mapped_column(Integer, nullable=True)

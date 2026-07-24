@@ -19,7 +19,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
-from cherryai_api.auth import auth_backend, fastapi_users_app, require_chat
+from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users_app, require_chat
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
@@ -40,9 +40,11 @@ from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
 from cherryai_api.workflows import router as workflows_router
 
-# Per-field caps for POST /api/log/error. This is an unauthenticated,
-# fire-and-forget diagnostic sink that now writes to Postgres instead of an
-# append-only file, so unbounded input becomes a storage-abuse vector.
+# Per-field caps for POST /api/log/error. Authentication (see `log_error`'s
+# `current_verified_user` dependency) is now the primary abuse control, but
+# it does not make these caps redundant: a logged-in client can still send an
+# oversized stack trace, and a buggy or compromised client can still loop,
+# so unbounded input from a verified caller remains a storage-abuse vector.
 # Values are generous enough to hold a real browser stack trace in full
 # (errorLogger.ts already caps its own `stack` at 4096 chars, so 16384
 # leaves headroom for other/future callers) while still bounding worst-case
@@ -229,22 +231,27 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 async def log_error(
     body: LogErrorRequest,
     request: Request,
+    user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ) -> dict:
     """Accept a frontend error report and persist it to Postgres.
 
-    No authentication required — this is a fire-and-forget diagnostic sink.
-    A persistence failure is logged and swallowed rather than surfaced to
-    the caller: `errorLogger.ts` fires this request with `keepalive: true`
-    and ignores the response entirely, so failing loudly here would only
-    lose the report with no compensating benefit — a 500 would additionally
-    fill the API's own logs with noise during the exact incident the report
-    is meant to help diagnose.
+    Requires an authenticated, verified session — errors occurring before
+    login (the login page itself, unauthenticated bootstrap) are
+    intentionally dropped rather than accepted anonymously; that tradeoff
+    was made explicitly to close off an unauthenticated write path into
+    Postgres. A persistence failure is logged and swallowed rather than
+    surfaced to the caller: `errorLogger.ts` fires this request with
+    `keepalive: true` and ignores the response entirely, so failing loudly
+    here would only lose the report with no compensating benefit — a 500
+    would additionally fill the API's own logs with noise during the exact
+    incident the report is meant to help diagnose.
     """
     url = body.url or request.headers.get("referer", "")
     user_agent = body.user_agent or request.headers.get("user-agent", "")
 
     row = FrontendError(
+        user_id=user.id,
         message=body.message,
         source=body.source,
         lineno=body.lineno,
@@ -271,8 +278,10 @@ async def log_error(
         #
         # The exception text stays server-side: SQLAlchemy renders the failing
         # statement and its bound parameters into str(exc), and connection
-        # errors render the database host and port — none of which belongs in
-        # a response to an unauthenticated caller.
+        # errors render the database host and port. The caller is now a
+        # verified user rather than an anonymous one, but that grants no
+        # standing to see INSERT statements, bound parameters, or the
+        # database host/port, so the detail stays opaque regardless.
         logger.warning(f"Failed to persist frontend error report: {exc}")
         return {"status": "error", "detail": "failed to persist error report"}
 

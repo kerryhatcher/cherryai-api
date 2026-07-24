@@ -2,27 +2,59 @@
 
 Uses the real app (same approach as test_route_protection.py) rather than
 the lifespan-triggering TestClient — this endpoint only depends on
-``get_async_session``, which is independent of the app's lifespan-managed
-state (agent, workflows, Cognee memory).
+``get_async_session`` (plus auth), which is independent of the app's
+lifespan-managed state (agent, workflows, Cognee memory).
+
+The endpoint now requires an authenticated, verified session, so every test
+here logs in first via ``/auth/login`` and lets httpx carry the resulting
+cookie.
 """
+
+import types
 
 import httpx
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from cherryai_api.api import app
+from cherryai_api.auth import current_verified_user
 from cherryai_api.orm import get_async_session
 
 
 @pytest.fixture
-async def log_error_client():
+async def anon_client():
+    """A client with no session cookie, for asserting anonymous rejection."""
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
 
+@pytest.fixture
+async def log_error_user(make_user):
+    return await make_user("ztest-logerror@example.com")
+
+
+@pytest.fixture
+async def log_error_client(log_error_user):
+    """An authenticated client logged in as ``log_error_user``."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        login = await c.post(
+            "/auth/login",
+            data={"username": log_error_user["email"], "password": log_error_user["password"]},
+        )
+        assert login.status_code == 204, login.text
+        yield c
+
+
 @pytest.mark.asyncio
-async def test_valid_payload_persists_expected_fields(log_error_client, pool):
+async def test_anonymous_request_is_rejected(anon_client):
+    res = await anon_client.post("/api/log/error", json={"message": "Ztest anon"})
+    assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_valid_payload_persists_expected_fields(log_error_client, log_error_user, pool):
     payload = {
         "message": "Ztest boom",
         "source": "app.js",
@@ -42,6 +74,7 @@ async def test_valid_payload_persists_expected_fields(log_error_client, pool):
         "SELECT * FROM frontend_errors WHERE message = $1", payload["message"]
     )
     assert row is not None
+    assert row["user_id"] == log_error_user["id"]
     assert row["source"] == payload["source"]
     assert row["lineno"] == payload["lineno"]
     assert row["colno"] == payload["colno"]
@@ -87,7 +120,9 @@ async def test_missing_url_and_user_agent_fall_back_to_headers(log_error_client,
     ids=["sqlalchemy-error", "connection-refused"],
 )
 @pytest.mark.asyncio
-async def test_persistence_failure_still_returns_success_shaped_response(log_error_client, failure):
+async def test_persistence_failure_still_returns_success_shaped_response(
+    log_error_client, log_error_user, failure
+):
     class _RaisingSession:
         def add(self, _row) -> None:
             pass
@@ -98,6 +133,15 @@ async def test_persistence_failure_still_returns_success_shaped_response(log_err
     async def _broken_session():
         yield _RaisingSession()
 
+    # The auth dependency chain (current_verified_user -> get_user_manager ->
+    # get_user_db -> get_async_session) resolves through the same override,
+    # so a raising session would 500 before the route body ever runs. Bypass
+    # auth directly instead, since this test is only exercising the route's
+    # own persistence-failure handling. `log_error_user` is the plain dict
+    # `make_user` returns, not a `User` ORM instance, so wrap it in something
+    # that supports attribute access for `user.id` in the route body.
+    fake_user = types.SimpleNamespace(id=log_error_user["id"])
+    app.dependency_overrides[current_verified_user] = lambda: fake_user
     app.dependency_overrides[get_async_session] = _broken_session
     try:
         res = await log_error_client.post(
@@ -106,11 +150,12 @@ async def test_persistence_failure_still_returns_success_shaped_response(log_err
         assert res.status_code == 200
         body = res.json()
         assert body["status"] == "error"
-        # Neither the exception text nor the connection target may reach an
-        # unauthenticated caller.
+        # Neither the exception text nor the connection target may reach the
+        # caller, authenticated or not.
         assert "Ztest simulated outage" not in body["detail"]
         assert "5432" not in body["detail"]
     finally:
+        app.dependency_overrides.pop(current_verified_user, None)
         app.dependency_overrides.pop(get_async_session, None)
 
 
