@@ -90,8 +90,17 @@ SYSTEM_PROMPT = (
     "a human approval queue and are NOT sent immediately; tell the user "
     "their email has been queued for review), "
     "`web_search` (current "
-    "information from the web), and `web_fetch` (read the full text of a "
-    "specific URL). "
+    "information from the web), `web_fetch` (read the full text of a "
+    "specific URL), and meal-planning tools scoped to this user's own data: "
+    "`search_recipes`, `get_recipe`, `create_recipe`, `update_recipe` "
+    "(recipes), `list_meal_plans`, `get_meal_plan`, `create_meal_plan`, "
+    "`assign_recipe_to_day`, `remove_recipe_from_day`, `mark_meal_consumed` "
+    "(weekly meal plans — deducts pantry stock on consume), "
+    "`generate_shopping_list`, `list_shopping_lists`, `get_shopping_list`, "
+    "`add_shopping_item`, `check_off_item` (shopping lists), `get_pantry`, "
+    "`set_pantry_item` (pantry stock), and `list_stores`, "
+    "`list_store_products`, `upsert_store_product` (store product mappings "
+    "used for shopping-list package sizing). "
     "Default tool policy — internal knowledge first: whenever the user asks "
     "about something (a fact, a topic, a person, a preference, past work), "
     "AUTOMATICALLY search search_memory, search_wiki, search_feedback, "
@@ -522,6 +531,15 @@ def build_agent(
             f"A human will review and approve it before it is sent. "
             f"To: {', '.join(approval.to_)}, Subject: {approval.subject}"
         )
+
+    # Local import: meals.py imports AgentDeps from this module for its tool
+    # type hints, so importing it at module top-level here would cycle.
+    # Deferring to call time (this function only runs after both modules
+    # have finished loading) breaks the cycle — same technique as db.py's
+    # Database.connect().
+    from cherryai_api.meals import register_meal_tools
+
+    register_meal_tools(agent, database)
 
     return agent
 
