@@ -682,7 +682,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45.0.0" },
     { name = "fastapi", specifier = ">=0.139.2" },
     { name = "fastapi-users", extras = ["sqlalchemy"], specifier = ">=15.0.5" },
-    { name = "fastmail-py-sdk", directory = "../fastmail-py-sdk" },
+    { name = "fastmail-py-sdk", specifier = ">=0.1.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "logfire", extras = ["asyncpg", "fastapi", "httpx", "system-metrics"], specifier = ">=4.37.0" },
     { name = "loguru", specifier = ">=0.7.3" },
@@ -1075,28 +1075,16 @@ wheels = [
 [[package]]
 name = "fastmail-py-sdk"
 version = "0.1.0"
-source = { directory = "../fastmail-py-sdk" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "icalendar" },
     { name = "pydantic" },
     { name = "python-dateutil" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.28" },
-    { name = "icalendar", specifier = ">=6.1" },
-    { name = "pydantic", specifier = ">=2.10" },
-    { name = "python-dateutil", specifier = ">=2.9" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.25" },
-    { name = "respx", specifier = ">=0.22" },
-    { name = "ruff", specifier = ">=0.9" },
+sdist = { url = "https://files.pythonhosted.org/packages/3f/c5/ff248e64fcf54e9e25bea3edb8a265f5773913bf4e2e0a353bc7acd816ac/fastmail_py_sdk-0.1.0.tar.gz", hash = "sha256:8c9a4f538c3af8a61b86f4adf6faf2992b8f3811240c924ed8e81bc962d21868", size = 55057, upload-time = "2026-07-23T03:10:39.702Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/c9/6e471e346e20d0b7793210a132aec30d7eb44e93834214c41cd501b9520d/fastmail_py_sdk-0.1.0-py3-none-any.whl", hash = "sha256:c7b74e9b580fb7c67efd251a97ec38f7a51776702441f7241956e8425098d853", size = 38205, upload-time = "2026-07-23T03:10:38.352Z" },
 ]
 
 [[package]]
