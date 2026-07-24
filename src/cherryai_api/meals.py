@@ -560,10 +560,11 @@ async def list_meal_plans(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[MealP
         SELECT {_PLAN_LIST_COLUMNS}
           FROM meal_plans p
           LEFT JOIN LATERAL (
-              SELECT count(*) AS day_count,
-                     count(*) FILTER (WHERE recipe_id IS NOT NULL) AS recipe_count
-                FROM meal_plan_days
-               WHERE plan_id = p.id
+              SELECT count(DISTINCT d.id) AS day_count,
+                     count(dr.id) AS recipe_count
+                FROM meal_plan_days d
+                LEFT JOIN meal_plan_day_recipes dr ON dr.day_id = d.id
+               WHERE d.plan_id = p.id
           ) dc ON true
          WHERE p.owner_id = $1
          ORDER BY p.week_start DESC
