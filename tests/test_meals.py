@@ -8,7 +8,7 @@ owner per test, matching the pattern in ``test_wiki.py``.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -21,6 +21,7 @@ from cherryai_api.meal_units import (
 )
 from cherryai_api.meals import (
     DayAlreadyConsumed,
+    GenerateListRequest,
     IngredientUpdate,
     MealPlanCreate,
     MealPlanDayCreate,
@@ -53,6 +54,7 @@ from cherryai_api.meals import (
     delete_plan_day,
     delete_store,
     delete_store_product,
+    generate_shopping_list,
     generate_shopping_list_from_plan,
     get_plan_day,
     list_pantry_items,
@@ -314,7 +316,7 @@ async def test_generate_list_no_recipes_raises(pool, owner) -> None:
     plan = await create_meal_plan(
         pool, owner, MealPlanCreate(name="Ztest Empty Plan", week_start=date(2026, 7, 20))
     )
-    with pytest.raises(ValueError, match="no recipes"):
+    with pytest.raises(ValueError, match="No recipes"):
         await generate_shopping_list_from_plan(pool, owner, plan.id)
 
 
@@ -914,3 +916,317 @@ async def test_create_store_product_rejects_blank_names(pool, owner) -> None:
                 ingredient_name="X", product_name="   ", package_quantity=1.0, package_unit="lb"
             ),
         )
+
+
+# --- GenerateListRequest: exactly-one-of validation -----------------------------
+
+
+def test_generate_list_request_requires_one_of_plan_ids_or_scope() -> None:
+    with pytest.raises(ValueError, match="Exactly one"):
+        GenerateListRequest()
+
+
+def test_generate_list_request_rejects_both_plan_ids_and_scope() -> None:
+    with pytest.raises(ValueError, match="Exactly one"):
+        GenerateListRequest(plan_ids=[uuid.uuid4()], scope="future")
+
+
+def test_generate_list_request_rejects_empty_plan_ids_with_no_scope() -> None:
+    with pytest.raises(ValueError, match="Exactly one"):
+        GenerateListRequest(plan_ids=[])
+
+
+def test_generate_list_request_accepts_plan_ids_only() -> None:
+    req = GenerateListRequest(plan_ids=[uuid.uuid4()])
+    assert req.scope is None
+
+
+def test_generate_list_request_accepts_scope_only() -> None:
+    req = GenerateListRequest(scope="future")
+    assert req.plan_ids is None
+
+
+# --- generate_shopping_list: multi-plan and scope=future ------------------------
+
+
+async def test_generate_shopping_list_multi_plan_aggregates_across_plans(pool, owner) -> None:
+    plan1 = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Multi 1", week_start=date(2026, 7, 20))
+    )
+    plan2 = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Multi 2", week_start=date(2026, 7, 27))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Multi Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Multi Flour", quantity=1.0, unit="cup")
+    )
+    day1 = await upsert_plan_day(pool, plan1.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    day2 = await upsert_plan_day(pool, plan2.id, MealPlanDayCreate(day_date=date(2026, 7, 27)))
+    await add_recipe_to_day(pool, owner, day1.id, recipe.id)
+    await add_recipe_to_day(pool, owner, day2.id, recipe.id)
+
+    slist = await generate_shopping_list(
+        pool, owner, GenerateListRequest(plan_ids=[plan1.id, plan2.id])
+    )
+    matching = [i for i in slist.items if i.name == "Ztest Multi Flour"]
+    assert len(matching) == 1
+    assert matching[0].quantity == 2.0
+
+
+async def test_generate_shopping_list_ignores_unowned_plan_ids(pool, alice, bob) -> None:
+    plan = await create_meal_plan(
+        pool, alice, MealPlanCreate(name="Ztest Alice Gen Plan", week_start=date(2026, 7, 20))
+    )
+    with pytest.raises(ValueError, match="No matching"):
+        await generate_shopping_list(pool, bob, GenerateListRequest(plan_ids=[plan.id]))
+
+
+async def test_generate_shopping_list_scope_future_no_plans_raises(pool, owner) -> None:
+    with pytest.raises(ValueError, match="No future"):
+        await generate_shopping_list(pool, owner, GenerateListRequest(scope="future"))
+
+
+async def test_generate_shopping_list_scope_future_date_logic(pool, owner) -> None:
+    today = date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    past_monday = this_monday - timedelta(days=7)
+    future_monday = this_monday + timedelta(days=7)
+
+    past_plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Scope Past", week_start=past_monday)
+    )
+    current_plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Scope Current", week_start=this_monday)
+    )
+    future_plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Scope Future", week_start=future_monday)
+    )
+
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Scope Recipe"))
+    await add_ingredient(
+        pool,
+        recipe.id,
+        RecipeIngredientCreate(name="Ztest Scope Ingredient", quantity=1.0, unit="cup"),
+    )
+
+    for plan, day_date in (
+        (past_plan, past_monday),
+        (current_plan, this_monday),
+        (future_plan, future_monday),
+    ):
+        day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=day_date))
+        await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    slist = await generate_shopping_list(pool, owner, GenerateListRequest(scope="future"))
+    matching = [i for i in slist.items if i.name == "Ztest Scope Ingredient"]
+    assert len(matching) == 1
+    # Current week's Monday and the future Monday are both >= this Monday;
+    # the past plan is excluded, so only 2x quantity shows up, not 3x.
+    assert matching[0].quantity == 2.0
+
+
+async def test_generate_shopping_list_custom_name_override(pool, owner) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Named Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Named Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Named Ingredient", quantity=1.0)
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    slist = await generate_shopping_list(
+        pool, owner, GenerateListRequest(plan_ids=[plan.id], name="Ztest Custom Name")
+    )
+    assert slist.name == "Ztest Custom Name"
+
+
+# --- generate_shopping_list: pantry deduction -----------------------------------
+
+
+async def test_generate_shopping_list_deduct_pantry_subtracts_and_drops_covered_lines(
+    pool, owner
+) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Pantry Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Pantry Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Pantry Flour", quantity=3.0, unit="cup")
+    )
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Pantry Sugar", quantity=1.0, unit="cup")
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Pantry Flour", quantity=1.0, unit="cup")
+    )
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Pantry Sugar", quantity=5.0, unit="cup")
+    )
+
+    slist = await generate_shopping_list(
+        pool, owner, GenerateListRequest(plan_ids=[plan.id], deduct_pantry=True)
+    )
+    names = {i.name for i in slist.items}
+    assert "Ztest Pantry Flour" in names  # 3 needed - 1 on hand = 2 remaining
+    assert "Ztest Pantry Sugar" not in names  # 1 needed - 5 on hand -> fully covered, dropped
+
+    flour = next(i for i in slist.items if i.name == "Ztest Pantry Flour")
+    assert flour.quantity == 2.0
+
+
+async def test_generate_shopping_list_deduct_pantry_false_ignores_pantry(pool, owner) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest No Deduct Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest No Deduct Recipe"))
+    await add_ingredient(
+        pool,
+        recipe.id,
+        RecipeIngredientCreate(name="Ztest No Deduct Milk", quantity=1.0, unit="gal"),
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest No Deduct Milk", quantity=10.0, unit="gal")
+    )
+
+    slist = await generate_shopping_list(pool, owner, GenerateListRequest(plan_ids=[plan.id]))
+    matching = [i for i in slist.items if i.name == "Ztest No Deduct Milk"]
+    assert len(matching) == 1
+    assert matching[0].quantity == 1.0
+
+
+# --- generate_shopping_list: store product mapping ------------------------------
+
+
+async def test_generate_shopping_list_maps_to_store_product(pool, owner) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Store Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Store Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Chicken", quantity=2.0, unit="lb")
+    )
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Unmapped", quantity=1.0, unit="cup")
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    store = await create_store(pool, owner, StoreCreate(name="Ztest Sams"))
+    await add_store_product(
+        pool,
+        owner,
+        store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Chicken",
+            product_name="Chicken Tenders",
+            package_quantity=5.0,
+            package_unit="lb",
+        ),
+    )
+
+    slist = await generate_shopping_list(pool, owner, GenerateListRequest(plan_ids=[plan.id]))
+    chicken = next(i for i in slist.items if i.name == "Ztest Chicken")
+    assert chicken.packages == 1
+    assert chicken.store_product_id is not None
+    assert chicken.store_name == "Ztest Sams"
+    assert chicken.package_label == "5 lb"
+
+    unmapped = next(i for i in slist.items if i.name == "Ztest Unmapped")
+    assert unmapped.packages is None
+    assert unmapped.store_product_id is None
+    assert unmapped.package_label is None
+
+
+async def test_generate_shopping_list_prefers_cheapest_when_no_store_given(pool, owner) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Cheapest Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Cheapest Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Milk", quantity=1.0, unit="gal")
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    store_a = await create_store(pool, owner, StoreCreate(name="Ztest Store A"))
+    store_b = await create_store(pool, owner, StoreCreate(name="Ztest Store B"))
+    await add_store_product(
+        pool,
+        owner,
+        store_a.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Milk",
+            product_name="Milk A",
+            package_quantity=1.0,
+            package_unit="gal",
+            price_cents=500,
+        ),
+    )
+    await add_store_product(
+        pool,
+        owner,
+        store_b.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Milk",
+            product_name="Milk B",
+            package_quantity=1.0,
+            package_unit="gal",
+            price_cents=100,
+        ),
+    )
+
+    slist_default = await generate_shopping_list(
+        pool, owner, GenerateListRequest(plan_ids=[plan.id])
+    )
+    assert slist_default.items[0].store_name == "Ztest Store B"  # cheaper
+
+
+async def test_generate_shopping_list_prefers_given_store_id_over_price(pool, owner) -> None:
+    plan = await create_meal_plan(
+        pool, owner, MealPlanCreate(name="Ztest Preferred Store Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner, RecipeCreate(name="Ztest Preferred Store Recipe"))
+    await add_ingredient(
+        pool, recipe.id, RecipeIngredientCreate(name="Ztest Eggs", quantity=1.0, unit="dozen")
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner, day.id, recipe.id)
+
+    cheap_store = await create_store(pool, owner, StoreCreate(name="Ztest Cheap Store"))
+    preferred_store = await create_store(pool, owner, StoreCreate(name="Ztest Preferred Store"))
+    await add_store_product(
+        pool,
+        owner,
+        cheap_store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Eggs",
+            product_name="Eggs Cheap",
+            package_quantity=1.0,
+            package_unit="dozen",
+            price_cents=100,
+        ),
+    )
+    await add_store_product(
+        pool,
+        owner,
+        preferred_store.id,
+        StoreProductCreate(
+            ingredient_name="Ztest Eggs",
+            product_name="Eggs Preferred",
+            package_quantity=1.0,
+            package_unit="dozen",
+            price_cents=900,
+        ),
+    )
+
+    slist = await generate_shopping_list(
+        pool, owner, GenerateListRequest(plan_ids=[plan.id], store_id=preferred_store.id)
+    )
+    assert slist.items[0].store_name == "Ztest Preferred Store"

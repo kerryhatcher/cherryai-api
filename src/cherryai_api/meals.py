@@ -7,19 +7,21 @@ access helpers, and the FastAPI router mounted under ``/api/meals``.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from cherryai_api.auth import current_verified_user
 from cherryai_api.meal_units import (
+    AggregatedIngredient,
     aggregate,
     canonicalize,
     format_display,
+    packages_needed,
     to_canonical_unit_factor,
 )
 from cherryai_api.users import User
@@ -388,6 +390,22 @@ class ShoppingListListItem(BaseModel):
     item_purchased: int
     created_at: datetime
     updated_at: datetime
+
+
+class GenerateListRequest(BaseModel):
+    """Body for POST /lists/generate: pick a plan selection, then generation options."""
+
+    plan_ids: list[uuid.UUID] | None = None
+    scope: Literal["future"] | None = None
+    name: str | None = None
+    deduct_pantry: bool = False
+    store_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _validate_selection(self) -> GenerateListRequest:
+        if bool(self.plan_ids) == (self.scope is not None):
+            raise ValueError("Exactly one of plan_ids or scope must be provided")
+        return self
 
 
 # ------------------------------------------------------------------
@@ -1658,23 +1676,165 @@ async def delete_store_product(
 
 
 # ------------------------------------------------------------------
-# Shopping list generation from meal plan
+# Shopping list generation from meal plan(s)
 # ------------------------------------------------------------------
 
 
-async def generate_shopping_list_from_plan(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID
-) -> ShoppingList:
-    """Aggregate all recipe ingredients from a meal plan into a shopping list.
+async def _owned_plan_ids(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, requested_ids: list[uuid.UUID]
+) -> list[uuid.UUID]:
+    rows = await pool.fetch(
+        "SELECT id FROM meal_plans WHERE id = ANY($1::uuid[]) AND owner_id = $2",
+        requested_ids,
+        owner_id,
+    )
+    return [row["id"] for row in rows]
 
-    Ingredients are collected per day-recipe *link*, not per distinct recipe:
-    a recipe assigned to N days on the plan contributes N copies of its
-    ingredients, which :func:`~cherryai_api.meal_units.aggregate` then sums
-    (in a shared canonical unit) into one line per (name, unit dimension).
+
+async def _future_plan_ids(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[uuid.UUID]:
+    today = date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    rows = await pool.fetch(
+        "SELECT id FROM meal_plans WHERE owner_id = $1 AND week_start >= $2",
+        owner_id,
+        this_monday,
+    )
+    return [row["id"] for row in rows]
+
+
+async def _subtract_pantry(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, items: list[AggregatedIngredient]
+) -> list[AggregatedIngredient]:
+    """Subtract pantry on-hand from aggregated needed quantities.
+
+    Matches by (lower(trim(name)), dimension) — the same key aggregate()
+    groups by. Clamps each line at >= 0 and drops lines that hit exactly 0
+    (fully covered by pantry stock). Lines with no quantity (can't be
+    reduced) pass through unchanged.
     """
-    plan = await get_meal_plan(pool, owner_id, plan_id)
-    if plan is None:
-        raise ValueError("Meal plan not found")
+    pantry_rows = await pool.fetch(
+        "SELECT name, quantity, unit FROM pantry_items WHERE owner_id = $1", owner_id
+    )
+    on_hand: dict[tuple[str, str], float] = {}
+    for row in pantry_rows:
+        canonical_qty, dimension, _ = canonicalize(row["quantity"], row["unit"])
+        if canonical_qty is None:
+            continue
+        key = (row["name"].strip().lower(), dimension)
+        on_hand[key] = on_hand.get(key, 0.0) + canonical_qty
+
+    remaining: list[AggregatedIngredient] = []
+    for item in items:
+        if item.quantity is None:
+            remaining.append(item)
+            continue
+        needed_canonical, dimension, _ = canonicalize(item.quantity, item.unit)
+        key = (item.name.strip().lower(), dimension)
+        have = on_hand.get(key, 0.0)
+        remaining_canonical = max((needed_canonical or 0.0) - have, 0.0)
+        if remaining_canonical <= 0:
+            continue
+        factor = to_canonical_unit_factor(item.unit)
+        remaining_qty, remaining_unit = format_display(remaining_canonical / factor, item.unit)
+        remaining.append(
+            AggregatedIngredient(
+                name=item.name, quantity=remaining_qty, unit=remaining_unit, category=item.category
+            )
+        )
+    return remaining
+
+
+async def _map_to_store_products(
+    pool: asyncpg.Pool,
+    owner_id: uuid.UUID,
+    items: list[AggregatedIngredient],
+    store_id: uuid.UUID | None,
+) -> list[ShoppingListItemCreate]:
+    """Map aggregated ingredient lines to a matching store product, when one exists.
+
+    "Best match" when no `store_id` preference is given is the cheapest
+    product across the owner's stores (nulls-last), an arbitrary but
+    deterministic tie-break when price isn't recorded.
+    """
+    if store_id is not None:
+        product_rows = await pool.fetch(
+            "SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
+            "sp.package_unit, st.name AS store_name "
+            "FROM store_products sp JOIN stores st ON st.id = sp.store_id "
+            "WHERE sp.store_id = $1 AND st.owner_id = $2 "
+            "ORDER BY sp.price_cents NULLS LAST",
+            store_id,
+            owner_id,
+        )
+    else:
+        product_rows = await pool.fetch(
+            "SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
+            "sp.package_unit, st.name AS store_name "
+            "FROM store_products sp JOIN stores st ON st.id = sp.store_id "
+            "WHERE st.owner_id = $1 "
+            "ORDER BY sp.price_cents NULLS LAST",
+            owner_id,
+        )
+    products_by_name: dict[str, asyncpg.Record] = {}
+    for row in product_rows:
+        products_by_name.setdefault(row["ingredient_name"].strip().lower(), row)
+
+    results: list[ShoppingListItemCreate] = []
+    for item in items:
+        product = products_by_name.get(item.name.strip().lower())
+        math_result = (
+            packages_needed(
+                item.quantity, item.unit, product["package_quantity"], product["package_unit"]
+            )
+            if product is not None and item.quantity is not None
+            else None
+        )
+        if product is None or math_result is None:
+            results.append(
+                ShoppingListItemCreate(
+                    name=item.name, quantity=item.quantity, unit=item.unit, category=item.category
+                )
+            )
+            continue
+
+        packages, _leftover_qty, _leftover_unit = math_result
+        package_qty: float = product["package_quantity"]
+        qty_str = str(int(package_qty)) if package_qty == int(package_qty) else str(package_qty)
+        package_label = f"{qty_str} {product['package_unit']}"
+        results.append(
+            ShoppingListItemCreate(
+                name=item.name,
+                quantity=item.quantity,
+                unit=item.unit,
+                category=item.category,
+                packages=packages,
+                store_product_id=product["id"],
+                store_name=product["store_name"],
+                package_label=package_label,
+            )
+        )
+    return results
+
+
+async def generate_shopping_list(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, data: GenerateListRequest
+) -> ShoppingList:
+    """Generate an aggregated shopping list from one plan, a selection, or all future plans.
+
+    Pipeline: gather ingredients across every day-recipe link in the
+    selected plans (a recipe on N days contributes N copies) -> aggregate
+    (D1) -> optionally subtract pantry on-hand, clamped >= 0, dropping
+    covered lines -> map each line to a store product for package math,
+    preferring `store_id` if given -> insert the shopping_lists row + items.
+    """
+    if data.plan_ids:
+        plan_ids = await _owned_plan_ids(pool, owner_id, data.plan_ids)
+        if not plan_ids:
+            raise ValueError("No matching meal plans found")
+    else:
+        plan_ids = await _future_plan_ids(pool, owner_id)
+        if not plan_ids:
+            raise ValueError("No future meal plans found")
 
     # One row per day-recipe link joined to its ingredients — deliberately
     # not DISTINCT, so a recipe assigned to N days contributes N sets of
@@ -1684,45 +1844,55 @@ async def generate_shopping_list_from_plan(
         "FROM meal_plan_day_recipes dr "
         "JOIN meal_plan_days d ON d.id = dr.day_id "
         "JOIN recipe_ingredients ri ON ri.recipe_id = dr.recipe_id "
-        "WHERE d.plan_id = $1 "
+        "WHERE d.plan_id = ANY($1::uuid[]) "
         "ORDER BY ri.category, ri.name",
-        plan_id,
+        plan_ids,
     )
-
     if not rows:
-        raise ValueError("Meal plan has no recipes assigned")
+        raise ValueError("No recipes assigned to the selected plans")
 
     aggregated = aggregate(
         (row["name"], row["quantity"], row["unit"], row["category"]) for row in rows
     )
 
-    # Create the shopping list
+    if data.deduct_pantry:
+        # An empty result here is a legitimate outcome (pantry already covers
+        # everything needed), not an error — the list is created with 0 items.
+        aggregated = await _subtract_pantry(pool, owner_id, aggregated)
+
+    mapped = await _map_to_store_products(pool, owner_id, aggregated, data.store_id)
+
+    name = data.name
+    if not name:
+        if len(plan_ids) == 1:
+            plan = await get_meal_plan(pool, owner_id, plan_ids[0])
+            name = f"Shopping list for {plan.name}" if plan else "Shopping list"
+        else:
+            name = f"Shopping list for {len(plan_ids)} plans"
+
     slist = await create_shopping_list(
         pool,
         owner_id,
         ShoppingListCreate(
-            name=f"Shopping list for {plan.name}",
-            plan_id=plan_id,
+            name=name,
+            plan_id=plan_ids[0] if len(plan_ids) == 1 else None,
         ),
     )
 
-    # Add aggregated items
     items: list[ShoppingListItem] = []
-    for entry in aggregated:
-        item = await add_list_item(
-            pool,
-            slist.id,
-            ShoppingListItemCreate(
-                name=entry.name,
-                quantity=entry.quantity,
-                unit=entry.unit,
-                category=entry.category,
-            ),
-        )
+    for entry in mapped:
+        item = await add_list_item(pool, slist.id, entry)
         items.append(item)
 
     slist.items = items
     return slist
+
+
+async def generate_shopping_list_from_plan(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID
+) -> ShoppingList:
+    """Backwards-compatible single-plan wrapper over :func:`generate_shopping_list`."""
+    return await generate_shopping_list(pool, owner_id, GenerateListRequest(plan_ids=[plan_id]))
 
 
 # ------------------------------------------------------------------
@@ -1891,6 +2061,19 @@ async def generate_list(
 ) -> dict:
     try:
         slist = await generate_shopping_list_from_plan(_pool(request), user.id, plan_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return slist.model_dump(mode="json")
+
+
+@router.post("/lists/generate", status_code=201)
+async def generate_list_endpoint(
+    request: Request,
+    body: GenerateListRequest,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        slist = await generate_shopping_list(_pool(request), user.id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
