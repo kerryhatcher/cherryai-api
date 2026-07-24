@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime
 import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.admin import router as admin_router
@@ -27,10 +26,12 @@ from cherryai_api.db import build_database, make_session_title
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
+from cherryai_api.frontend_errors import FrontendError
 from cherryai_api.integrations import router as integrations_router
 from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.meals import router as meals_router
 from cherryai_api.memory import build_memory
+from cherryai_api.orm import get_async_session
 from cherryai_api.planner import router as planner_router
 from cherryai_api.settings import get_settings
 from cherryai_api.telemetry import setup_telemetry
@@ -38,6 +39,28 @@ from cherryai_api.users import User, UserCreate, UserRead, UserUpdate
 from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
 from cherryai_api.workflows import router as workflows_router
+
+# Per-field caps for POST /api/log/error. This is an unauthenticated,
+# fire-and-forget diagnostic sink that now writes to Postgres instead of an
+# append-only file, so unbounded input becomes a storage-abuse vector.
+# Values are generous enough to hold a real browser stack trace in full
+# (errorLogger.ts already caps its own `stack` at 4096 chars, so 16384
+# leaves headroom for other/future callers) while still bounding worst-case
+# row size to a few tens of KB. Oversized input is truncated rather than
+# rejected with a 422 — see the field_validator below and the docstring on
+# `log_error` for why.
+_MAX_MESSAGE_LEN = 4096
+_MAX_SOURCE_LEN = 2048
+_MAX_STACK_LEN = 16384
+_MAX_URL_LEN = 2048
+_MAX_USER_AGENT_LEN = 512
+_MAX_TIMESTAMP_LEN = 64
+_MAX_CONTEXT_LEN = 256
+# `lineno`/`colno` land in PG `integer` columns; anything outside int4 range
+# raises a DataError at commit time and would silently drop the whole report,
+# so clamp instead.
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
 
 
 class CreateSessionRequest(BaseModel):
@@ -58,6 +81,48 @@ class LogErrorRequest(BaseModel):
     user_agent: str | None = None
     timestamp: str | None = None
     context: str | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _truncate_message(cls, value: str) -> str:
+        return value[:_MAX_MESSAGE_LEN]
+
+    @field_validator("source")
+    @classmethod
+    def _truncate_source(cls, value: str | None) -> str | None:
+        return value[:_MAX_SOURCE_LEN] if value is not None else None
+
+    @field_validator("lineno", "colno")
+    @classmethod
+    def _clamp_position(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        return max(_INT32_MIN, min(_INT32_MAX, value))
+
+    @field_validator("stack")
+    @classmethod
+    def _truncate_stack(cls, value: str | None) -> str | None:
+        return value[:_MAX_STACK_LEN] if value is not None else None
+
+    @field_validator("url")
+    @classmethod
+    def _truncate_url(cls, value: str | None) -> str | None:
+        return value[:_MAX_URL_LEN] if value is not None else None
+
+    @field_validator("user_agent")
+    @classmethod
+    def _truncate_user_agent(cls, value: str | None) -> str | None:
+        return value[:_MAX_USER_AGENT_LEN] if value is not None else None
+
+    @field_validator("timestamp")
+    @classmethod
+    def _truncate_timestamp(cls, value: str | None) -> str | None:
+        return value[:_MAX_TIMESTAMP_LEN] if value is not None else None
+
+    @field_validator("context")
+    @classmethod
+    def _truncate_context(cls, value: str | None) -> str | None:
+        return value[:_MAX_CONTEXT_LEN] if value is not None else None
 
 
 @asynccontextmanager
@@ -161,35 +226,55 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 @app.post("/api/log/error")
-async def log_error(body: LogErrorRequest, request: Request) -> dict:
-    """Accept a frontend error report and write it to a JSONL log file.
+async def log_error(
+    body: LogErrorRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+) -> dict:
+    """Accept a frontend error report and persist it to Postgres.
 
     No authentication required — this is a fire-and-forget diagnostic sink.
+    A persistence failure is logged and swallowed rather than surfaced to
+    the caller: `errorLogger.ts` fires this request with `keepalive: true`
+    and ignores the response entirely, so failing loudly here would only
+    lose the report with no compensating benefit — a 500 would additionally
+    fill the API's own logs with noise during the exact incident the report
+    is meant to help diagnose.
     """
-    settings = get_settings()
-    log_path = Path(settings.log_dir) / "frontend-errors.jsonl"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    url = body.url or request.headers.get("referer", "")
+    user_agent = body.user_agent or request.headers.get("user-agent", "")
 
-    record = {
-        "message": body.message,
-        "source": body.source,
-        "lineno": body.lineno,
-        "colno": body.colno,
-        "stack": body.stack,
-        "url": body.url or str(request.headers.get("referer", "")),
-        "user_agent": body.user_agent or request.headers.get("user-agent", ""),
-        "client_ip": request.client.host if request.client else "",
-        "received_at": datetime.datetime.now(datetime.UTC).isoformat(),
-        "client_timestamp": body.timestamp,
-        "context": body.context,
-    }
+    row = FrontendError(
+        message=body.message,
+        source=body.source,
+        lineno=body.lineno,
+        colno=body.colno,
+        stack=body.stack,
+        url=url[:_MAX_URL_LEN],
+        user_agent=user_agent[:_MAX_USER_AGENT_LEN],
+        client_ip=request.client.host if request.client else "",
+        client_timestamp=body.timestamp,
+        context=body.context,
+    )
 
     try:
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
-    except OSError as exc:
-        logger.warning(f"Failed to write frontend error log: {exc}")
-        return {"status": "error", "detail": str(exc)}
+        session.add(row)
+        await session.commit()
+    except Exception as exc:
+        # Deliberately broad: no failure mode of this write may escape. Not
+        # every failure is a SQLAlchemyError — when Postgres is unreachable,
+        # asyncio's socket layer raises ConnectionRefusedError (an OSError)
+        # before asyncpg produces anything SQLAlchemy can wrap, and that is
+        # precisely the incident the frontend is trying to report.
+        # CancelledError is a BaseException, so client disconnects still
+        # cancel normally.
+        #
+        # The exception text stays server-side: SQLAlchemy renders the failing
+        # statement and its bound parameters into str(exc), and connection
+        # errors render the database host and port — none of which belongs in
+        # a response to an unauthenticated caller.
+        logger.warning(f"Failed to persist frontend error report: {exc}")
+        return {"status": "error", "detail": "failed to persist error report"}
 
     return {"status": "ok"}
 

@@ -28,8 +28,15 @@ async def _clean_test_rows(pool) -> None:
     await pool.execute("DELETE FROM wiki_entries WHERE slug LIKE $1", f"{_TEST_SLUG_PREFIX}%")
     await pool.execute("DELETE FROM feedback_entries WHERE title LIKE $1", f"{_TEST_TITLE_PREFIX}%")
     await pool.execute("DELETE FROM sessions WHERE title LIKE 'Ztest%'")
+    # `user` and `frontend_errors` are the Alembic-only tables — unlike the
+    # others, `build_database()` does not create them — so an unmigrated
+    # database must not fail every pool-using test.
     try:
         await pool.execute("DELETE FROM \"user\" WHERE email LIKE 'ztest-%'")
+    except asyncpg.UndefinedTableError:
+        pass
+    try:
+        await pool.execute("DELETE FROM frontend_errors WHERE message LIKE 'Ztest%'")
     except asyncpg.UndefinedTableError:
         pass
 
