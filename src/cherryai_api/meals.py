@@ -2536,121 +2536,6 @@ async def delete_store_product_endpoint(
 
 
 # ------------------------------------------------------------------
-# Agent tool formatting helpers
-# ------------------------------------------------------------------
-
-
-def _fmt_qty(quantity: float | None, unit: str | None) -> str:
-    """Render a "2 cups"-style prefix, or "" when there's nothing to show."""
-    if quantity is not None:
-        qty_str = f"{quantity:g}"
-        return f"{qty_str} {unit} ".lstrip() if unit else f"{qty_str} "
-    return f"{unit} " if unit else ""
-
-
-def format_recipe_list(recipes: list[RecipeListItem]) -> str:
-    """Render a recipe list for the agent's search_recipes tool."""
-    if not recipes:
-        return "No recipes found."
-    lines = []
-    for r in recipes:
-        times = [
-            t
-            for t in (
-                f"{r.prep_minutes}m prep" if r.prep_minutes else None,
-                f"{r.cook_minutes}m cook" if r.cook_minutes else None,
-            )
-            if t
-        ]
-        time_str = f" ({', '.join(times)})" if times else ""
-        lines.append(f"{r.name} — id {r.id}{time_str}, {r.ingredient_count} ingredients")
-    return "\n".join(lines)
-
-
-def format_recipe(recipe: Recipe) -> str:
-    """Render one recipe in full for the agent's get_recipe tool."""
-    lines = [f"{recipe.name} (id {recipe.id}) — {recipe.servings} servings"]
-    if recipe.description:
-        lines.append(recipe.description)
-    if recipe.ingredients:
-        lines.append("Ingredients:")
-        lines.extend(f"  - {_fmt_qty(i.quantity, i.unit)}{i.name}" for i in recipe.ingredients)
-    if recipe.instructions:
-        lines.append(f"Instructions:\n{recipe.instructions}")
-    return "\n".join(lines)
-
-
-def format_meal_plan_list(plans: list[MealPlanListItem]) -> str:
-    """Render a meal plan list for the agent's list_meal_plans tool."""
-    if not plans:
-        return "No meal plans found."
-    return "\n".join(
-        f"{p.name} — id {p.id}, week of {p.week_start}, "
-        f"{p.day_count} days, {p.recipe_count} recipes"
-        for p in plans
-    )
-
-
-def format_meal_plan(plan: MealPlan, days: list[MealPlanDay]) -> str:
-    """Render one meal plan with its days and recipes for the agent's get_meal_plan tool."""
-    lines = [f"{plan.name} (id {plan.id}) — week of {plan.week_start}"]
-    for day in days:
-        recipe_names = ", ".join(r.name for r in day.recipes) if day.recipes else "(no recipes)"
-        consumed = " [consumed]" if day.consumed_at else ""
-        lines.append(
-            f"  {day.day_date} {day.meal_type} (day id {day.id}){consumed}: {recipe_names}"
-        )
-    return "\n".join(lines)
-
-
-def format_shopping_list_list(lists: list[ShoppingListListItem]) -> str:
-    """Render a shopping list index for the agent's list_shopping_lists tool."""
-    if not lists:
-        return "No shopping lists found."
-    return "\n".join(
-        f"{sl.name} — id {sl.id}, {sl.item_purchased}/{sl.item_total} purchased" for sl in lists
-    )
-
-
-def format_shopping_list(slist: ShoppingList) -> str:
-    """Render one shopping list with its items for the agent's get_shopping_list tool."""
-    lines = [f"{slist.name} (id {slist.id})"]
-    for item in slist.items:
-        check = "[x]" if item.purchased else "[ ]"
-        package = f" ({item.package_label})" if item.package_label else ""
-        lines.append(
-            f"  {check} {_fmt_qty(item.quantity, item.unit)}{item.name}{package} "
-            f"— item id {item.id}"
-        )
-    return "\n".join(lines)
-
-
-def format_pantry(items: list[PantryItem]) -> str:
-    """Render pantry contents for the agent's get_pantry tool."""
-    if not items:
-        return "Pantry is empty."
-    return "\n".join(f"  {_fmt_qty(i.quantity, i.unit)}{i.name} — item id {i.id}" for i in items)
-
-
-def format_stores(stores: list[Store]) -> str:
-    """Render a store list for the agent's list_stores tool."""
-    if not stores:
-        return "No stores found."
-    return "\n".join(f"{s.name} — id {s.id}" for s in stores)
-
-
-def format_store_products(products: list[StoreProduct]) -> str:
-    """Render a store's products for the agent's list_store_products tool."""
-    if not products:
-        return "No products found."
-    return "\n".join(
-        f"{p.ingredient_name} -> {p.product_name}, "
-        f"{p.package_quantity:g} {p.package_unit} — product id {p.id}"
-        for p in products
-    )
-
-
-# ------------------------------------------------------------------
 # Agent tool registration
 # ------------------------------------------------------------------
 
@@ -2687,48 +2572,84 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
     ``tool_plain``) and scopes its query by ``ctx.deps.user_id`` — identical
     bounds to the HTTP API, so RBAC is inherited: `AgentDeps` is only ever
     built after the `require_chat` role gate, and restricted users can't
-    reach chat (and therefore these tools) at all.
+    reach chat (and therefore these tools) at all. Never call this on the
+    workflow agents in workflows.py — those run workspace-scoped, unattached
+    to any one user, and meals is personal per-owner data.
 
     Tools are thin wrappers over the module's own data-access functions,
     referenced via the ``_*_fn`` module-level aliases above where a tool's
-    name would otherwise shadow the function it calls.
+    name would otherwise shadow the function it calls. Every tool returns a
+    JSON-serializable dict (or list of dicts) built from the same pydantic
+    models the HTTP API returns (``model.model_dump(mode="json")``), so the
+    model sees the identical shape a REST client would. Failures return
+    ``{"error": "..."}`` (or ``[{"error": "..."}]`` for list-returning
+    tools) rather than raising, so a bad call never crashes the turn.
     """
 
     def _unavailable(name: str) -> str:
         return f"{name} is unavailable: no database is configured."
 
+    async def _resolve_plan_ids(owner_id: uuid.UUID, plans: list[str]) -> list[uuid.UUID] | str:
+        """Resolve a mixed list of plan UUIDs and/or names (case-insensitive) to UUIDs.
+
+        Returns an error string instead of a list if any entry can't be resolved.
+        """
+        all_plans = await _list_meal_plans_fn(database.pool, owner_id)  # type: ignore[union-attr]
+        by_name = {p.name.strip().lower(): p.id for p in all_plans}
+        resolved: list[uuid.UUID] = []
+        for entry in plans:
+            try:
+                resolved.append(uuid.UUID(entry))
+                continue
+            except ValueError:
+                pass
+            match = by_name.get(entry.strip().lower())
+            if match is None:
+                return f"No meal plan found named or with id '{entry}'."
+            resolved.append(match)
+        return resolved
+
     # -- Recipes --
 
     @agent.tool
-    async def search_recipes(ctx: RunContext[AgentDeps], query: str = "") -> str:
-        """Search this user's recipes by name. Leave `query` empty to list all."""
+    async def search_recipes(ctx: RunContext[AgentDeps], query: str = "") -> list[dict]:
+        """Search this user's recipes by name (case-insensitive substring match).
+
+        Leave `query` empty to list every recipe. Returns a list of recipe
+        summaries (id, name, description, prep/cook time, ingredient_count) —
+        call get_recipe with an id from this list for the full ingredient
+        list and instructions.
+        """
         if database is None:
-            return _unavailable("search_recipes")
+            return [{"error": _unavailable("search_recipes")}]
         try:
             recipes = await _recipes_fn(database.pool, ctx.deps.user_id)
         except Exception as error:
             logger.bind(query=query).warning(f"search_recipes failed: {error}")
-            return f"search_recipes failed: {error}"
+            return [{"error": f"search_recipes failed: {error}"}]
         needle = query.strip().lower()
         if needle:
             recipes = [r for r in recipes if needle in r.name.lower()]
-        return format_recipe_list(recipes)
+        return [r.model_dump(mode="json") for r in recipes]
 
     @agent.tool
-    async def get_recipe(ctx: RunContext[AgentDeps], recipe_id: str) -> str:
-        """Fetch one recipe in full, including its ingredients and instructions."""
+    async def get_recipe(ctx: RunContext[AgentDeps], recipe_id: str) -> dict:
+        """Fetch one recipe in full, including its ingredients and instructions.
+
+        `recipe_id` is the UUID from search_recipes or create_recipe.
+        """
         if database is None:
-            return _unavailable("get_recipe")
+            return {"error": _unavailable("get_recipe")}
         try:
             recipe = await _get_recipe_fn(database.pool, ctx.deps.user_id, uuid.UUID(recipe_id))
         except ValueError as error:
-            return f"get_recipe failed: {error}"
+            return {"error": f"get_recipe failed: {error}"}
         except Exception as error:
             logger.bind(recipe_id=recipe_id).warning(f"get_recipe failed: {error}")
-            return f"get_recipe failed: {error}"
+            return {"error": f"get_recipe failed: {error}"}
         if recipe is None:
-            return f"No recipe found with id {recipe_id}."
-        return format_recipe(recipe)
+            return {"error": f"No recipe found with id {recipe_id}."}
+        return recipe.model_dump(mode="json")
 
     @agent.tool
     async def create_recipe(
@@ -2738,10 +2659,15 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         description: str = "",
         instructions: str = "",
         servings: int = 4,
-    ) -> str:
-        """Create a new recipe, optionally with its ingredient list."""
+    ) -> dict:
+        """Create a new recipe, optionally with its ingredient list.
+
+        Each ingredient needs a `name`; `quantity` (a number) and `unit`
+        (free text like "cup", "lb", "oz") are optional — omit both for a
+        to-taste ingredient like salt.
+        """
         if database is None:
-            return _unavailable("create_recipe")
+            return {"error": _unavailable("create_recipe")}
         try:
             recipe = await _create_recipe_fn(
                 database.pool,
@@ -2755,11 +2681,11 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 ),
             )
         except ValueError as error:
-            return f"create_recipe failed: {error}"
+            return {"error": f"create_recipe failed: {error}"}
         except Exception as error:
             logger.bind(name=name).warning(f"create_recipe failed: {error}")
-            return f"create_recipe failed: {error}"
-        return f"Created recipe '{recipe.name}' (id {recipe.id})."
+            return {"error": f"create_recipe failed: {error}"}
+        return recipe.model_dump(mode="json")
 
     @agent.tool
     async def update_recipe(
@@ -2769,10 +2695,15 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         description: str | None = None,
         instructions: str | None = None,
         servings: int | None = None,
-    ) -> str:
-        """Update a recipe's name, description, instructions, and/or servings."""
+    ) -> dict:
+        """Update a recipe's name, description, instructions, and/or servings.
+
+        Only fields you provide are changed; omitted fields keep their
+        current value. Does not touch ingredients — there's no separate
+        ingredient-editing tool yet, so mention that limitation if asked.
+        """
         if database is None:
-            return _unavailable("update_recipe")
+            return {"error": _unavailable("update_recipe")}
         try:
             recipe = await _update_recipe_fn(
                 database.pool,
@@ -2786,60 +2717,69 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 ),
             )
         except ValueError as error:
-            return f"update_recipe failed: {error}"
+            return {"error": f"update_recipe failed: {error}"}
         except Exception as error:
             logger.bind(recipe_id=recipe_id).warning(f"update_recipe failed: {error}")
-            return f"update_recipe failed: {error}"
+            return {"error": f"update_recipe failed: {error}"}
         if recipe is None:
-            return f"No recipe found with id {recipe_id}."
-        return f"Updated recipe '{recipe.name}' (id {recipe.id})."
+            return {"error": f"No recipe found with id {recipe_id}."}
+        return recipe.model_dump(mode="json")
 
     # -- Meal plans --
 
     @agent.tool
-    async def list_meal_plans(ctx: RunContext[AgentDeps]) -> str:
-        """List this user's meal plans."""
+    async def list_meal_plans(ctx: RunContext[AgentDeps]) -> list[dict]:
+        """List this user's meal plans (id, name, week_start, day/recipe counts)."""
         if database is None:
-            return _unavailable("list_meal_plans")
+            return [{"error": _unavailable("list_meal_plans")}]
         try:
             plans = await _list_meal_plans_fn(database.pool, ctx.deps.user_id)
         except Exception as error:
             logger.warning(f"list_meal_plans failed: {error}")
-            return f"list_meal_plans failed: {error}"
-        return format_meal_plan_list(plans)
+            return [{"error": f"list_meal_plans failed: {error}"}]
+        return [p.model_dump(mode="json") for p in plans]
 
     @agent.tool
-    async def get_meal_plan(ctx: RunContext[AgentDeps], plan_id: str) -> str:
-        """Fetch one meal plan with all its days and assigned recipes."""
+    async def get_meal_plan(ctx: RunContext[AgentDeps], plan_id: str) -> dict:
+        """Fetch one meal plan with all its days, assigned recipes, and consumed status.
+
+        `plan_id` is the UUID from list_meal_plans or create_meal_plan. Each
+        day includes `consumed_at` (null if not yet marked consumed).
+        """
         if database is None:
-            return _unavailable("get_meal_plan")
+            return {"error": _unavailable("get_meal_plan")}
         try:
             plan_uuid = uuid.UUID(plan_id)
             plan = await _get_meal_plan_fn(database.pool, ctx.deps.user_id, plan_uuid)
         except ValueError as error:
-            return f"get_meal_plan failed: {error}"
+            return {"error": f"get_meal_plan failed: {error}"}
         except Exception as error:
             logger.bind(plan_id=plan_id).warning(f"get_meal_plan failed: {error}")
-            return f"get_meal_plan failed: {error}"
+            return {"error": f"get_meal_plan failed: {error}"}
         if plan is None:
-            return f"No meal plan found with id {plan_id}."
+            return {"error": f"No meal plan found with id {plan_id}."}
         days = await list_plan_days(database.pool, plan_uuid)
-        return format_meal_plan(plan, days)
+        return {**plan.model_dump(mode="json"), "days": [d.model_dump(mode="json") for d in days]}
 
     @agent.tool
-    async def create_meal_plan(ctx: RunContext[AgentDeps], name: str, week_start: str) -> str:
-        """Create a new meal plan. `week_start` must be a Monday, as YYYY-MM-DD."""
+    async def create_meal_plan(ctx: RunContext[AgentDeps], name: str, week_start: str) -> dict:
+        """Create a new meal plan (a calendar week).
+
+        `week_start` must be a Monday, formatted YYYY-MM-DD — if the date
+        you're given isn't a Monday, find that week's Monday yourself before
+        calling this (e.g. "next week" -> the Monday starting next week).
+        """
         if database is None:
-            return _unavailable("create_meal_plan")
+            return {"error": _unavailable("create_meal_plan")}
         try:
             data = MealPlanCreate(name=name, week_start=date.fromisoformat(week_start))
             plan = await _create_meal_plan_fn(database.pool, ctx.deps.user_id, data)
         except ValueError as error:
-            return f"create_meal_plan failed: {error}"
+            return {"error": f"create_meal_plan failed: {error}"}
         except Exception as error:
             logger.bind(name=name).warning(f"create_meal_plan failed: {error}")
-            return f"create_meal_plan failed: {error}"
-        return f"Created meal plan '{plan.name}' (id {plan.id}), week of {plan.week_start}."
+            return {"error": f"create_meal_plan failed: {error}"}
+        return plan.model_dump(mode="json")
 
     @agent.tool
     async def assign_recipe_to_day(
@@ -2848,25 +2788,28 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         day_date: str,
         recipe_id: str,
         meal_type: str = "dinner",
-    ) -> str:
-        """Assign a recipe to a day on a meal plan. `day_date` is YYYY-MM-DD.
+    ) -> dict:
+        """Assign a recipe to a day on a meal plan.
 
+        `day_date` is YYYY-MM-DD and must fall within the plan's week.
         `meal_type` is one of breakfast/lunch/dinner/snack. Creates the day
-        slot if one doesn't already exist for that date and meal type.
+        slot automatically if one doesn't already exist for that date and
+        meal type; adding a second recipe to an existing slot just adds it
+        alongside the first. Returns the day's current state.
         """
         if database is None:
-            return _unavailable("assign_recipe_to_day")
+            return {"error": _unavailable("assign_recipe_to_day")}
         try:
             plan_uuid = uuid.UUID(plan_id)
             recipe_uuid = uuid.UUID(recipe_id)
             parsed_date = date.fromisoformat(day_date)
             meal_type_enum = MealType(meal_type)
         except ValueError as error:
-            return f"assign_recipe_to_day failed: {error}"
+            return {"error": f"assign_recipe_to_day failed: {error}"}
 
         plan = await _get_meal_plan_fn(database.pool, ctx.deps.user_id, plan_uuid)
         if plan is None:
-            return f"No meal plan found with id {plan_id}."
+            return {"error": f"No meal plan found with id {plan_id}."}
 
         try:
             days = await list_plan_days(database.pool, plan_uuid)
@@ -2875,7 +2818,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 None,
             )
             if existing is None:
-                await upsert_plan_day(
+                day = await upsert_plan_day(
                     database.pool,
                     plan_uuid,
                     MealPlanDayCreate(
@@ -2887,90 +2830,121 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                     database.pool, ctx.deps.user_id, existing.id, recipe_uuid
                 )
                 if ref is None:
-                    return "assign_recipe_to_day failed: day not found."
+                    return {"error": "assign_recipe_to_day failed: day not found."}
+                day = await get_plan_day(database.pool, ctx.deps.user_id, existing.id)
         except Exception as error:
             logger.bind(plan_id=plan_id).warning(f"assign_recipe_to_day failed: {error}")
-            return f"assign_recipe_to_day failed: {error}"
-        return f"Assigned recipe {recipe_id} to {parsed_date} {meal_type} on plan {plan_id}."
+            return {"error": f"assign_recipe_to_day failed: {error}"}
+        assert day is not None
+        return day.model_dump(mode="json")
 
     @agent.tool
     async def remove_recipe_from_day(
         ctx: RunContext[AgentDeps], day_id: str, recipe_id: str
-    ) -> str:
-        """Remove a recipe from a day on a meal plan."""
+    ) -> dict:
+        """Remove a recipe from a day on a meal plan. Leaves the day slot itself in place."""
         if database is None:
-            return _unavailable("remove_recipe_from_day")
+            return {"error": _unavailable("remove_recipe_from_day")}
         try:
             removed = await _remove_recipe_from_day_fn(
                 database.pool, ctx.deps.user_id, uuid.UUID(day_id), uuid.UUID(recipe_id)
             )
         except ValueError as error:
-            return f"remove_recipe_from_day failed: {error}"
+            return {"error": f"remove_recipe_from_day failed: {error}"}
         except Exception as error:
             logger.bind(day_id=day_id).warning(f"remove_recipe_from_day failed: {error}")
-            return f"remove_recipe_from_day failed: {error}"
+            return {"error": f"remove_recipe_from_day failed: {error}"}
         if not removed:
-            return "That recipe wasn't found on that day."
-        return "Removed the recipe from that day."
+            return {"error": "That recipe wasn't found on that day.", "removed": False}
+        return {"removed": True}
 
     @agent.tool
     async def mark_meal_consumed(
         ctx: RunContext[AgentDeps], day_id: str, force: bool = False
-    ) -> str:
+    ) -> dict:
         """Mark a day's meal as consumed, deducting its ingredients from pantry.
 
-        Set `force` to re-consume a day that was already marked consumed.
+        `day_id` is a day's UUID (from get_meal_plan or assign_recipe_to_day).
+        Fails with an error if that day is already marked consumed — pass
+        `force=true` to re-consume it anyway (deducts pantry again). Returns
+        the day plus a per-ingredient report: each line's `status` is
+        "deducted" (enough stock), "insufficient" (ran out, clamped at 0),
+        or "not_tracked" (that ingredient isn't in pantry at all).
         """
         if database is None:
-            return _unavailable("mark_meal_consumed")
+            return {"error": _unavailable("mark_meal_consumed")}
         try:
             day_uuid = uuid.UUID(day_id)
         except ValueError as error:
-            return f"mark_meal_consumed failed: {error}"
+            return {"error": f"mark_meal_consumed failed: {error}"}
         try:
             result = await consume_day(database.pool, ctx.deps.user_id, day_uuid, force=force)
         except DayAlreadyConsumed:
-            return "That day is already marked consumed. Pass force=true to re-consume it."
+            return {
+                "error": "That day is already marked consumed. Pass force=true to re-consume it."
+            }
         except Exception as error:
             logger.bind(day_id=day_id).warning(f"mark_meal_consumed failed: {error}")
-            return f"mark_meal_consumed failed: {error}"
+            return {"error": f"mark_meal_consumed failed: {error}"}
         if result is None:
-            return f"No day found with id {day_id}."
-        _day, report = result
-        lines = [f"Marked {day_id} consumed. Pantry report:"]
-        lines.extend(
-            f"  {line.name}: {line.status}"
-            + (
-                f" ({_fmt_qty(line.deducted_quantity, line.unit)}deducted)"
-                if line.deducted_quantity
-                else ""
-            )
-            for line in report
-        )
-        return "\n".join(lines)
+            return {"error": f"No day found with id {day_id}."}
+        day, report = result
+        return ConsumeResponse(day=day, report=report).model_dump(mode="json")
+
+    @agent.tool
+    async def unmark_meal_consumed(ctx: RunContext[AgentDeps], day_id: str) -> dict:
+        """Clear a day's consumed status and best-effort restore its ingredients to pantry.
+
+        A no-op restoration (but still succeeds) if the day was never marked
+        consumed in the first place — nothing to credit back.
+        """
+        if database is None:
+            return {"error": _unavailable("unmark_meal_consumed")}
+        try:
+            day = await unconsume_day(database.pool, ctx.deps.user_id, uuid.UUID(day_id))
+        except ValueError as error:
+            return {"error": f"unmark_meal_consumed failed: {error}"}
+        except Exception as error:
+            logger.bind(day_id=day_id).warning(f"unmark_meal_consumed failed: {error}")
+            return {"error": f"unmark_meal_consumed failed: {error}"}
+        if day is None:
+            return {"error": f"No day found with id {day_id}."}
+        return day.model_dump(mode="json")
 
     # -- Shopping lists --
 
     @agent.tool
     async def generate_shopping_list(
         ctx: RunContext[AgentDeps],
-        plan_ids: list[str] | None = None,
+        plans: list[str] | None = None,
         scope: str | None = None,
         deduct_pantry: bool = False,
         store_id: str | None = None,
         name: str | None = None,
-    ) -> str:
-        """Generate an aggregated shopping list.
+    ) -> dict:
+        """Generate an aggregated shopping list from one or more meal plans.
 
-        Provide exactly one of `plan_ids` (specific plan UUIDs) or
-        `scope="future"` (all of this user's plans from this week onward).
-        Set `deduct_pantry` to subtract on-hand pantry stock first.
+        Provide exactly one of `plans` (a list of plan names and/or plan
+        UUIDs — names are matched case-insensitively against this user's
+        plans) or `scope="future"` (every one of this user's plans from this
+        week onward). A recipe used on multiple days contributes multiple
+        times, then identical ingredients are summed. Set `deduct_pantry` to
+        subtract on-hand pantry stock first (items pantry fully covers are
+        dropped from the list). `store_id` prefers package sizing from one
+        store; otherwise the cheapest matching product across all stores is
+        used. Returns the created shopping list with its items.
         """
         if database is None:
-            return _unavailable("generate_shopping_list")
+            return {"error": _unavailable("generate_shopping_list")}
         try:
+            plan_ids: list[uuid.UUID] | None = None
+            if plans:
+                resolved = await _resolve_plan_ids(ctx.deps.user_id, plans)
+                if isinstance(resolved, str):
+                    return {"error": resolved}
+                plan_ids = resolved
             request = GenerateListRequest(
-                plan_ids=[uuid.UUID(p) for p in plan_ids] if plan_ids else None,
+                plan_ids=plan_ids,
                 scope=scope,  # type: ignore[arg-type]
                 deduct_pantry=deduct_pantry,
                 store_id=uuid.UUID(store_id) if store_id else None,
@@ -2978,39 +2952,39 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             )
             slist = await _generate_shopping_list_fn(database.pool, ctx.deps.user_id, request)
         except ValueError as error:
-            return f"generate_shopping_list failed: {error}"
+            return {"error": f"generate_shopping_list failed: {error}"}
         except Exception as error:
             logger.warning(f"generate_shopping_list failed: {error}")
-            return f"generate_shopping_list failed: {error}"
-        return format_shopping_list(slist)
+            return {"error": f"generate_shopping_list failed: {error}"}
+        return slist.model_dump(mode="json")
 
     @agent.tool
-    async def list_shopping_lists(ctx: RunContext[AgentDeps]) -> str:
-        """List this user's shopping lists."""
+    async def list_shopping_lists(ctx: RunContext[AgentDeps]) -> list[dict]:
+        """List this user's shopping lists (id, name, purchased/total item counts)."""
         if database is None:
-            return _unavailable("list_shopping_lists")
+            return [{"error": _unavailable("list_shopping_lists")}]
         try:
             lists = await _list_shopping_lists_fn(database.pool, ctx.deps.user_id)
         except Exception as error:
             logger.warning(f"list_shopping_lists failed: {error}")
-            return f"list_shopping_lists failed: {error}"
-        return format_shopping_list_list(lists)
+            return [{"error": f"list_shopping_lists failed: {error}"}]
+        return [ls.model_dump(mode="json") for ls in lists]
 
     @agent.tool
-    async def get_shopping_list(ctx: RunContext[AgentDeps], list_id: str) -> str:
-        """Fetch one shopping list with all its items."""
+    async def get_shopping_list(ctx: RunContext[AgentDeps], list_id: str) -> dict:
+        """Fetch one shopping list with all items, including purchased state and package info."""
         if database is None:
-            return _unavailable("get_shopping_list")
+            return {"error": _unavailable("get_shopping_list")}
         try:
             slist = await _get_shopping_list_fn(database.pool, ctx.deps.user_id, uuid.UUID(list_id))
         except ValueError as error:
-            return f"get_shopping_list failed: {error}"
+            return {"error": f"get_shopping_list failed: {error}"}
         except Exception as error:
             logger.bind(list_id=list_id).warning(f"get_shopping_list failed: {error}")
-            return f"get_shopping_list failed: {error}"
+            return {"error": f"get_shopping_list failed: {error}"}
         if slist is None:
-            return f"No shopping list found with id {list_id}."
-        return format_shopping_list(slist)
+            return {"error": f"No shopping list found with id {list_id}."}
+        return slist.model_dump(mode="json")
 
     @agent.tool
     async def add_shopping_item(
@@ -3020,17 +2994,17 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         quantity: float | None = None,
         unit: str | None = None,
         category: str = "",
-    ) -> str:
+    ) -> dict:
         """Add an item to a shopping list."""
         if database is None:
-            return _unavailable("add_shopping_item")
+            return {"error": _unavailable("add_shopping_item")}
         try:
             list_uuid = uuid.UUID(list_id)
         except ValueError as error:
-            return f"add_shopping_item failed: {error}"
+            return {"error": f"add_shopping_item failed: {error}"}
         slist = await _get_shopping_list_fn(database.pool, ctx.deps.user_id, list_uuid)
         if slist is None:
-            return f"No shopping list found with id {list_id}."
+            return {"error": f"No shopping list found with id {list_id}."}
         try:
             item = await add_list_item(
                 database.pool,
@@ -3038,19 +3012,19 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 ShoppingListItemCreate(name=name, quantity=quantity, unit=unit, category=category),
             )
         except ValueError as error:
-            return f"add_shopping_item failed: {error}"
+            return {"error": f"add_shopping_item failed: {error}"}
         except Exception as error:
             logger.bind(list_id=list_id).warning(f"add_shopping_item failed: {error}")
-            return f"add_shopping_item failed: {error}"
-        return f"Added '{item.name}' (item id {item.id}) to the list."
+            return {"error": f"add_shopping_item failed: {error}"}
+        return item.model_dump(mode="json")
 
     @agent.tool
     async def check_off_item(
         ctx: RunContext[AgentDeps], item_id: str, purchased: bool = True
-    ) -> str:
-        """Check (or uncheck) a shopping list item as purchased."""
+    ) -> dict:
+        """Check (or, with purchased=false, uncheck) a shopping list item as purchased."""
         if database is None:
-            return _unavailable("check_off_item")
+            return {"error": _unavailable("check_off_item")}
         try:
             item = await update_list_item(
                 database.pool,
@@ -3059,28 +3033,27 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 ShoppingListItemUpdate(purchased=purchased),
             )
         except ValueError as error:
-            return f"check_off_item failed: {error}"
+            return {"error": f"check_off_item failed: {error}"}
         except Exception as error:
             logger.bind(item_id=item_id).warning(f"check_off_item failed: {error}")
-            return f"check_off_item failed: {error}"
+            return {"error": f"check_off_item failed: {error}"}
         if item is None:
-            return f"No shopping list item found with id {item_id}."
-        state = "purchased" if item.purchased else "not purchased"
-        return f"'{item.name}' is now marked {state}."
+            return {"error": f"No shopping list item found with id {item_id}."}
+        return item.model_dump(mode="json")
 
     # -- Pantry --
 
     @agent.tool
-    async def get_pantry(ctx: RunContext[AgentDeps]) -> str:
+    async def get_pantry(ctx: RunContext[AgentDeps]) -> list[dict]:
         """List everything currently tracked in this user's pantry."""
         if database is None:
-            return _unavailable("get_pantry")
+            return [{"error": _unavailable("get_pantry")}]
         try:
             items = await list_pantry_items(database.pool, ctx.deps.user_id)
         except Exception as error:
             logger.warning(f"get_pantry failed: {error}")
-            return f"get_pantry failed: {error}"
-        return format_pantry(items)
+            return [{"error": f"get_pantry failed: {error}"}]
+        return [i.model_dump(mode="json") for i in items]
 
     @agent.tool
     async def set_pantry_item(
@@ -3089,10 +3062,14 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         quantity: float | None = None,
         unit: str | None = None,
         category: str = "",
-    ) -> str:
-        """Add (or add onto) a pantry item. Matches an existing item by name and unit."""
+    ) -> dict:
+        """Add to (or create) a pantry item.
+
+        Upserts: matches an existing item by name and unit dimension and
+        adds the quantities together, rather than creating a duplicate entry.
+        """
         if database is None:
-            return _unavailable("set_pantry_item")
+            return {"error": _unavailable("set_pantry_item")}
         try:
             item = await upsert_pantry_item(
                 database.pool,
@@ -3100,43 +3077,43 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 PantryItemCreate(name=name, quantity=quantity, unit=unit, category=category),
             )
         except ValueError as error:
-            return f"set_pantry_item failed: {error}"
+            return {"error": f"set_pantry_item failed: {error}"}
         except Exception as error:
             logger.bind(name=name).warning(f"set_pantry_item failed: {error}")
-            return f"set_pantry_item failed: {error}"
-        return f"Pantry now has {_fmt_qty(item.quantity, item.unit)}{item.name}."
+            return {"error": f"set_pantry_item failed: {error}"}
+        return item.model_dump(mode="json")
 
     # -- Stores --
 
     @agent.tool
-    async def list_stores(ctx: RunContext[AgentDeps]) -> str:
+    async def list_stores(ctx: RunContext[AgentDeps]) -> list[dict]:
         """List this user's stores."""
         if database is None:
-            return _unavailable("list_stores")
+            return [{"error": _unavailable("list_stores")}]
         try:
             stores = await _list_stores_fn(database.pool, ctx.deps.user_id)
         except Exception as error:
             logger.warning(f"list_stores failed: {error}")
-            return f"list_stores failed: {error}"
-        return format_stores(stores)
+            return [{"error": f"list_stores failed: {error}"}]
+        return [s.model_dump(mode="json") for s in stores]
 
     @agent.tool
-    async def list_store_products(ctx: RunContext[AgentDeps], store_id: str) -> str:
-        """List a store's products (ingredient -> product mappings with package sizes)."""
+    async def list_store_products(ctx: RunContext[AgentDeps], store_id: str) -> list[dict]:
+        """List a store's products: ingredient -> product name mappings with package sizes."""
         if database is None:
-            return _unavailable("list_store_products")
+            return [{"error": _unavailable("list_store_products")}]
         try:
             products = await _list_store_products_fn(
                 database.pool, ctx.deps.user_id, uuid.UUID(store_id)
             )
         except ValueError as error:
-            return f"list_store_products failed: {error}"
+            return [{"error": f"list_store_products failed: {error}"}]
         except Exception as error:
             logger.bind(store_id=store_id).warning(f"list_store_products failed: {error}")
-            return f"list_store_products failed: {error}"
+            return [{"error": f"list_store_products failed: {error}"}]
         if products is None:
-            return f"No store found with id {store_id}."
-        return format_store_products(products)
+            return [{"error": f"No store found with id {store_id}."}]
+        return [p.model_dump(mode="json") for p in products]
 
     @agent.tool
     async def upsert_store_product(
@@ -3147,25 +3124,27 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         package_quantity: float,
         package_unit: str,
         price_cents: int | None = None,
-    ) -> str:
+    ) -> dict:
         """Add or update a store's product mapping for an ingredient.
 
         Matches an existing product at that store by `ingredient_name`
-        (case-insensitive); updates it if found, otherwise creates a new one.
+        (case-insensitive); updates it if found, otherwise creates a new
+        one. `package_quantity`/`package_unit` describe one package as sold
+        (e.g. 5 and "lb" for a 5 lb bag).
         """
         if database is None:
-            return _unavailable("upsert_store_product")
+            return {"error": _unavailable("upsert_store_product")}
         try:
             store_uuid = uuid.UUID(store_id)
         except ValueError as error:
-            return f"upsert_store_product failed: {error}"
+            return {"error": f"upsert_store_product failed: {error}"}
         try:
             existing = await _list_store_products_fn(database.pool, ctx.deps.user_id, store_uuid)
         except Exception as error:
             logger.bind(store_id=store_id).warning(f"upsert_store_product failed: {error}")
-            return f"upsert_store_product failed: {error}"
+            return {"error": f"upsert_store_product failed: {error}"}
         if existing is None:
-            return f"No store found with id {store_id}."
+            return {"error": f"No store found with id {store_id}."}
 
         match = next(
             (
@@ -3202,11 +3181,10 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                     ),
                 )
         except ValueError as error:
-            return f"upsert_store_product failed: {error}"
+            return {"error": f"upsert_store_product failed: {error}"}
         except Exception as error:
             logger.bind(store_id=store_id).warning(f"upsert_store_product failed: {error}")
-            return f"upsert_store_product failed: {error}"
+            return {"error": f"upsert_store_product failed: {error}"}
         if product is None:
-            return f"No store found with id {store_id}."
-        verb = "Updated" if match else "Added"
-        return f"{verb} '{product.ingredient_name}' -> '{product.product_name}'."
+            return {"error": f"No store found with id {store_id}."}
+        return {**product.model_dump(mode="json"), "created": match is None}
