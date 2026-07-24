@@ -70,6 +70,7 @@ from fastapi.routing import APIRoute
 
 _PUBLIC_PATHS = {
     "/api/health",
+    "/api/log/error",
     "/auth/login",
     "/auth/logout",
     "/auth/register",
