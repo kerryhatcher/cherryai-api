@@ -18,6 +18,7 @@ from cherryai_api.meals import (
     MealPlanCreate,
     MealPlanDayCreate,
     MealPlanDayUpdate,
+    MealPlanUpdate,
     RecipeCreate,
     RecipeIngredientCreate,
     ShoppingListCreate,
@@ -372,3 +373,30 @@ async def test_list_item_mutation_rejects_other_owner(pool, alice, bob) -> None:
 
     assert await delete_list_item(pool, bob, item.id) is False
     assert await delete_list_item(pool, alice, item.id) is True
+
+
+# --- Monday week_start validation ----------------------------------------------
+
+
+def test_meal_plan_create_accepts_monday() -> None:
+    plan = MealPlanCreate(name="Ztest", week_start=date(2026, 7, 20))  # a Monday
+    assert plan.week_start == date(2026, 7, 20)
+
+
+def test_meal_plan_create_rejects_non_monday() -> None:
+    with pytest.raises(ValueError, match="Monday"):
+        MealPlanCreate(name="Ztest", week_start=date(2026, 7, 21))  # a Tuesday
+
+
+def test_meal_plan_update_accepts_monday() -> None:
+    update = MealPlanUpdate(week_start=date(2026, 7, 27))
+    assert update.week_start == date(2026, 7, 27)
+
+
+def test_meal_plan_update_accepts_none() -> None:
+    assert MealPlanUpdate(week_start=None).week_start is None
+
+
+def test_meal_plan_update_rejects_non_monday() -> None:
+    with pytest.raises(ValueError, match="Monday"):
+        MealPlanUpdate(week_start=date(2026, 7, 22))  # a Wednesday

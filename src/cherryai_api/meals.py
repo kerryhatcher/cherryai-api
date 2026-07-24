@@ -12,7 +12,7 @@ from enum import StrEnum
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from cherryai_api.auth import current_verified_user
 from cherryai_api.meal_units import aggregate
@@ -120,14 +120,30 @@ class MealType(StrEnum):
 # ------------------------------------------------------------------
 
 
+def _require_monday(value: date) -> date:
+    if value.weekday() != 0:
+        raise ValueError("week_start must be a Monday")
+    return value
+
+
 class MealPlanCreate(BaseModel):
     name: str
     week_start: date
+
+    @field_validator("week_start")
+    @classmethod
+    def _validate_week_start(cls, value: date) -> date:
+        return _require_monday(value)
 
 
 class MealPlanUpdate(BaseModel):
     name: str | None = None
     week_start: date | None = None
+
+    @field_validator("week_start")
+    @classmethod
+    def _validate_week_start(cls, value: date | None) -> date | None:
+        return _require_monday(value) if value is not None else None
 
 
 class MealPlan(BaseModel):
