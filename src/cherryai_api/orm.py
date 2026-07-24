@@ -7,6 +7,7 @@ pool in db.py and will be rewritten opportunistically.
 """
 
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -23,11 +24,21 @@ class Base(DeclarativeBase):
 
 
 def sqlalchemy_url() -> str:
-    """Return the database URL with the explicit asyncpg driver marker."""
+    """Return the database URL with the explicit asyncpg driver marker.
+
+    Also rewrites a libpq-style ``sslmode`` query param (as managed Postgres
+    providers like DigitalOcean supply) to ``ssl``: SQLAlchemy's asyncpg
+    dialect forwards unrecognized query params straight through as kwargs to
+    ``asyncpg.connect()``, which has no ``sslmode`` parameter, only ``ssl``.
+    """
     url = get_settings().database_url
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    if "sslmode" in query:
+        query["ssl"] = query.pop("sslmode")
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 engine = create_async_engine(sqlalchemy_url())
