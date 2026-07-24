@@ -64,15 +64,6 @@ CREATE TABLE IF NOT EXISTS meal_plan_days (
 CREATE INDEX IF NOT EXISTS meal_plan_days_plan_idx
     ON meal_plan_days (plan_id, day_date, meal_type);
 
-CREATE TABLE IF NOT EXISTS meal_plan_day_recipes (
-    id UUID PRIMARY KEY,
-    day_id UUID NOT NULL REFERENCES meal_plan_days(id) ON DELETE CASCADE,
-    recipe_id UUID NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS meal_plan_day_recipes_day_idx
-    ON meal_plan_day_recipes (day_id, sort_order);
-
 CREATE TABLE IF NOT EXISTS recipes (
     id UUID PRIMARY KEY,
     owner_id UUID NOT NULL,
@@ -86,6 +77,15 @@ CREATE TABLE IF NOT EXISTS recipes (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS meal_plan_day_recipes (
+    id UUID PRIMARY KEY,
+    day_id UUID NOT NULL REFERENCES meal_plan_days(id) ON DELETE CASCADE,
+    recipe_id UUID NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS meal_plan_day_recipes_day_idx
+    ON meal_plan_day_recipes (day_id, sort_order);
 
 CREATE TABLE IF NOT EXISTS recipe_ingredients (
     id UUID PRIMARY KEY,
