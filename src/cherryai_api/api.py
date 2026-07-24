@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -43,6 +46,18 @@ class CreateSessionRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
+
+
+class LogErrorRequest(BaseModel):
+    message: str
+    source: str | None = None
+    lineno: int | None = None
+    colno: int | None = None
+    stack: str | None = None
+    url: str | None = None
+    user_agent: str | None = None
+    timestamp: str | None = None
+    context: str | None = None
 
 
 @asynccontextmanager
@@ -108,6 +123,43 @@ app.include_router(
 app.include_router(admin_router)
 
 
+# ---------------------------------------------------------------------------
+# Middleware: request ID for correlating frontend error reports with API logs
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Attach a unique request ID to every request for log correlation."""
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = rid
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Exception handler: log unhandled exceptions with full stack traces
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    rid = getattr(request.state, "request_id", "-")
+    logger.opt(exception=True).error(
+        f"Unhandled exception [{rid}] {request.method} {request.url.path}: {exc}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "request_id": rid},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
 async def _neo4j_reachable() -> bool:
     """Verify the Neo4j server answers before reporting it healthy."""
     settings = get_settings()
@@ -126,6 +178,40 @@ async def _neo4j_reachable() -> bool:
     except Exception as error:
         logger.warning(f"Neo4j health check failed: {error}")
         return False
+
+
+@app.post("/api/log/error")
+async def log_error(body: LogErrorRequest, request: Request) -> dict:
+    """Accept a frontend error report and write it to a JSONL log file.
+
+    No authentication required — this is a fire-and-forget diagnostic sink.
+    """
+    settings = get_settings()
+    log_path = Path(settings.log_dir) / "frontend-errors.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    record = {
+        "message": body.message,
+        "source": body.source,
+        "lineno": body.lineno,
+        "colno": body.colno,
+        "stack": body.stack,
+        "url": body.url or str(request.headers.get("referer", "")),
+        "user_agent": body.user_agent or request.headers.get("user-agent", ""),
+        "client_ip": request.client.host if request.client else "",
+        "received_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "client_timestamp": body.timestamp,
+        "context": body.context,
+    }
+
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except OSError as exc:
+        logger.warning(f"Failed to write frontend error log: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+    return {"status": "ok"}
 
 
 @app.get("/api/health")

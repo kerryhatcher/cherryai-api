@@ -77,6 +77,41 @@ Match the model to the task, not the project's importance. Prefer running indepe
 - **[cherryai-web README](../cherryai-web/README.md)** — React frontend that consumes this API
 - **[Demo Design Spec](../docs/superpowers/specs/2026-07-18-cherryai-demo-design.md)** — Technical design and implementation plan
 
+## Frontend Error Logging
+
+The API accepts error reports from the frontend at `POST /api/log/error` and writes them to a JSONL log file. This is a pass-through diagnostic sink — no authentication required.
+
+- **Log file:** `logs/frontend-errors.jsonl` (relative to the API working directory; configurable via the `log_dir` setting)
+- **Endpoint:** `POST /api/log/error` — defined in `src/cherryai_api/api.py` (search for `log_error`)
+- **Format:** One JSON object per line, with fields: `message`, `source`, `lineno`, `colno`, `stack`, `url`, `user_agent`, `client_ip`, `received_at`, `client_timestamp`
+
+### Reading the log
+
+```bash
+# Tail the log in real time
+tail -f logs/frontend-errors.jsonl | python3 -m json.tool
+
+# Pretty-print the last 20 errors
+uv run python3 -c "
+import json
+with open('logs/frontend-errors.jsonl') as f:
+    for line in f.readlines()[-20:]:
+        print(json.dumps(json.loads(line), indent=2))
+        print('---')
+"
+
+# Filter by error message
+uv run python3 -c "
+import json, sys
+with open('logs/frontend-errors.jsonl') as f:
+    for line in f:
+        rec = json.loads(line)
+        if sys.argv[1].lower() in rec.get('message','').lower():
+            print(json.dumps(rec, indent=2))
+            print('---')
+" 'TypeError'
+```
+
 ## GitHub Actions
 
 - **Always pin actions to full commit SHAs, never git tags** (tags are mutable and can be repointed at malicious code; SHAs are immutable). Keep the human-readable version in a trailing comment:
