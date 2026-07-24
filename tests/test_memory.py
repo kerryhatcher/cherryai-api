@@ -18,6 +18,17 @@ def _memory() -> CogneeMemory:
     return CogneeMemory("test_dataset", "test-session", top_k=3)
 
 
+def test_graph_database_provider_is_postgres_not_neo4j() -> None:
+    """Locks in the switch away from a separate Neo4j graph store.
+
+    Cognee reads its config at import time, so this asserts the env var it
+    already read rather than re-triggering configuration.
+    """
+    import os
+
+    assert os.environ["GRAPH_DATABASE_PROVIDER"] == "postgres"
+
+
 async def test_remember_fact_saves_with_no_session_id_and_user_facts_node_set(
     monkeypatch,
 ) -> None:

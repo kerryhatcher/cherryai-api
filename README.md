@@ -14,8 +14,7 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 
 - **AI Model**: Ollama cloud's `gpt-oss:120b` model via Pydantic AI
 - **Memory Layer**: Cognee configured for fast session learning using:
-  - PostgreSQL (pgvector) for vector embeddings (similarity search)
-  - Neo4j for graph-structured knowledge and relationships
+  - PostgreSQL (pgvector) for vector embeddings (similarity search) and, via Cognee's Postgres graph adapter, graph-structured knowledge and relationships — no separate graph database
   - Local fastembed for embedding generation (no extra API key)
 - **Data Storage**: PostgreSQL for chat sessions, messages, and vector storage
 - **CLI**: Typer-based command-line interface for admin tasks and smoke testing
@@ -25,7 +24,7 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 ### Prerequisites
 
 - **Python 3.13+** (managed via `uv`)
-- **Docker** and **docker-compose** (for PostgreSQL with pgvector and Neo4j)
+- **Docker** and **docker-compose** (for PostgreSQL with pgvector)
 - **API Keys**: 
   - `OLLAMA_API_KEY` — from Ollama cloud (serves the chat agent and feedback workflows)
   - `TAVILY_API_KEY` — from Tavily for web search (free tier available)
@@ -45,19 +44,14 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
    TAVILY_API_KEY=your_key_here
    BRAVE_API_KEY=your_key_here
 
-   # Database (PostgreSQL with pgvector)
+   # Database (PostgreSQL with pgvector) — also backs Cognee's graph store
    DATABASE_URL=postgresql://cherryai:cherryai_dev@localhost:5442/cherryai
-
-   # Graph Store (Neo4j)
-   NEO4J_URI=neo4j://localhost:7484
-   NEO4J_USER=neo4j
-   NEO4J_PASSWORD=cherryai_dev
 
    # Observability (optional — see below)
    # LOGFIRE_TOKEN=your_write_token_here
    ```
 
-   **Important:** The docker-compose configuration below maps ports `5442` (Postgres) and `7484`/`7697` (Neo4j) to avoid conflicts with system services. Your `.env` must match these port mappings.
+   **Important:** The docker-compose configuration below maps port `5442` (Postgres) to avoid conflicts with system services. Your `.env` must match this port mapping.
 
    **Observability (Pydantic Logfire):** the API exports traces, metrics, and logs to Logfire only when credentials are present (`send_to_logfire="if-token-present"`), so everything works without them. For local development run `logfire auth` then `logfire projects use --org '<org>' '<project>'` (stores gitignored credentials in `.logfire/`); for deployments set `LOGFIRE_TOKEN` to a write token instead. Never commit the token.
 
@@ -69,7 +63,6 @@ A production-oriented backend API for the CherryAI chat system. The server hosts
 
    This starts:
    - **PostgreSQL** (image: `pgvector/pgvector`) on `localhost:5442`
-   - **Neo4j** (image: `neo4j:5`) on `localhost:7484` (Bolt) and `7697` (HTTPS)
 
    Verify they're running:
    ```bash
@@ -173,7 +166,7 @@ src/cherryai_api/
 ### Key Modules
 
 - **`settings.py`**: Loads and validates environment configuration via Pydantic Settings. Env vars must be set *before* importing the memory module.
-- **`memory.py`**: Configures Cognee with PostgreSQL (pgvector) + Neo4j. Provides `remember()` and `recall()` methods for storing and retrieving learned facts.
+- **`memory.py`**: Configures Cognee entirely on PostgreSQL (pgvector for vectors, Cognee's Postgres adapter for the graph). Provides `remember()` and `recall()` methods for storing and retrieving learned facts.
 - **`agent.py`**: Defines the Pydantic AI agent with the system prompt and three tools (web_search, web_fetch, search_memory). Uses `OpenAIChatModel` with `OllamaProvider` (Ollama cloud).
 - **`db.py`**: SQLAlchemy-based async session/message store. Persists all chat turns to Postgres.
 - **`api.py`**: FastAPI application. Exposes `/api/health`, `/api/sessions/*`, and `/api/sessions/*/messages` endpoints with SSE streaming support.
@@ -212,10 +205,9 @@ Tests cover:
 
 ## Deployment Notes
 
-- **Static Hosting**: This API is not meant for static hosting; it requires a running Python environment and access to PostgreSQL/Neo4j.
+- **Static Hosting**: This API is not meant for static hosting; it requires a running Python environment and access to PostgreSQL.
 - **Production**: Before deploying to production, configure:
   - Real PostgreSQL database with backups
-  - Real Neo4j instance (or managed Neo4j Aura)
   - Proper authentication and CORS policies (currently allows `http://localhost:5173` for development)
   - Environment-specific settings (database URLs, API keys, etc.)
 

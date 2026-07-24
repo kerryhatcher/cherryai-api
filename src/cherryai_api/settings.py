@@ -36,9 +36,6 @@ class Settings(BaseSettings):
         default="postgresql://cherryai:cherryai_dev@localhost:5432/cherryai",
         repr=False,
     )
-    neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = Field(default="cherryai_dev", repr=False)
 
     # --- Cognee memory ---
     # Cognee's cognify extraction LLM. Local Ollama by default: OpenRouter's

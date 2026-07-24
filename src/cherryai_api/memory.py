@@ -1,4 +1,8 @@
-"""Cognee-backed session memory wired to Postgres, pgvector, and Neo4j.
+"""Cognee-backed session memory wired to a single Postgres instance.
+
+Postgres serves as the relational store, the pgvector-backed vector store,
+and (via Cognee's Postgres graph adapter) the knowledge-graph store — no
+separate graph database is needed.
 
 Cognee reads most of its configuration while it is being imported, so every
 environment variable it depends on must be set *before* ``import cognee`` runs
@@ -57,11 +61,12 @@ def _configure_relational_and_vector() -> None:
 
 
 def _configure_graph() -> None:
-    """Point Cognee's knowledge graph at the demo Neo4j instance."""
-    os.environ["GRAPH_DATABASE_PROVIDER"] = "neo4j"
-    os.environ["GRAPH_DATABASE_URL"] = _settings.neo4j_uri
-    os.environ["GRAPH_DATABASE_USERNAME"] = _settings.neo4j_user
-    os.environ["GRAPH_DATABASE_PASSWORD"] = _settings.neo4j_password
+    """Point Cognee's knowledge graph at the same Postgres instance.
+
+    No separate host/user/password is set: Cognee's Postgres graph adapter
+    falls back to the relational config set by ``_configure_relational_and_vector``.
+    """
+    os.environ["GRAPH_DATABASE_PROVIDER"] = "postgres"
 
 
 def _configure_cognee_llm() -> None:

@@ -160,26 +160,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # ---------------------------------------------------------------------------
 
 
-async def _neo4j_reachable() -> bool:
-    """Verify the Neo4j server answers before reporting it healthy."""
-    settings = get_settings()
-    try:
-        from neo4j import AsyncGraphDatabase
-
-        driver = AsyncGraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_user, settings.neo4j_password),
-        )
-        try:
-            await driver.verify_connectivity()
-            return True
-        finally:
-            await driver.close()
-    except Exception as error:
-        logger.warning(f"Neo4j health check failed: {error}")
-        return False
-
-
 @app.post("/api/log/error")
 async def log_error(body: LogErrorRequest, request: Request) -> dict:
     """Accept a frontend error report and write it to a JSONL log file.
@@ -220,9 +200,8 @@ async def health() -> dict:
     db_ok = False
     with contextlib.suppress(Exception):
         db_ok = await app.state.db.ping()
-    neo4j_ok = await _neo4j_reachable()
-    status = "ok" if db_ok and neo4j_ok else "degraded"
-    return {"status": status, "postgres": db_ok, "neo4j": neo4j_ok}
+    status = "ok" if db_ok else "degraded"
+    return {"status": status, "postgres": db_ok}
 
 
 @app.get("/api/sessions")

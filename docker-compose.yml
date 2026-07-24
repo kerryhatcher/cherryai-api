@@ -17,25 +17,5 @@ services:
       timeout: 5s
       retries: 10
 
-  neo4j:
-    image: neo4j:5
-    container_name: cherryai-neo4j
-    environment:
-      NEO4J_AUTH: neo4j/cherryai_dev
-      # Cognee's Neo4j adapter requires APOC (e.g. apoc.create.addLabels).
-      NEO4J_PLUGINS: '["apoc"]'
-    ports:
-      # Host 7484/7697 -> container 7474/7687 (defaults are taken on this host).
-      - "7484:7474"
-      - "7697:7687"
-    volumes:
-      - cherryai_neo4jdata:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
 volumes:
   cherryai_pgdata:
-  cherryai_neo4jdata:
