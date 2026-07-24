@@ -9,13 +9,19 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Literal
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from cherryai_api.auth import current_verified_user
-from cherryai_api.meal_units import aggregate
+from cherryai_api.meal_units import (
+    aggregate,
+    canonicalize,
+    format_display,
+    to_canonical_unit_factor,
+)
 from cherryai_api.users import User
 
 # ------------------------------------------------------------------
@@ -100,7 +106,30 @@ CREATE TABLE IF NOT EXISTS shopping_list_items (
 );
 CREATE INDEX IF NOT EXISTS shopping_list_items_list_idx
     ON shopping_list_items (list_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS pantry_items (
+    id UUID PRIMARY KEY,
+    owner_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    quantity REAL,
+    unit TEXT,
+    category TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS pantry_items_owner_idx ON pantry_items (owner_id, name);
 """
+
+# Additive schema evolution: CREATE TABLE IF NOT EXISTS (above) can't alter
+# existing tables, so new columns on already-shipped tables go here as
+# idempotent ALTER TABLE statements. Executed in order by Database.connect()
+# right after CREATE_MEALS_TABLES.
+MEALS_MIGRATIONS: list[str] = [
+    "ALTER TABLE meal_plan_days ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",
+    "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS packages INTEGER",
+    "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS store_product_id UUID",
+    "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS store_name TEXT",
+    "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS package_label TEXT",
+]
 
 
 # ------------------------------------------------------------------
@@ -192,6 +221,7 @@ class MealPlanDay(BaseModel):
     recipes: list[RecipeRef] = []
     notes: str
     sort_order: int
+    consumed_at: datetime | None = None
 
 
 # ------------------------------------------------------------------
@@ -286,6 +316,10 @@ class ShoppingListItemCreate(BaseModel):
     quantity: float | None = None
     unit: str | None = None
     category: str = ""
+    packages: int | None = None
+    store_product_id: uuid.UUID | None = None
+    store_name: str | None = None
+    package_label: str | None = None
 
 
 class ShoppingListItemUpdate(BaseModel):
@@ -305,6 +339,10 @@ class ShoppingListItem(BaseModel):
     category: str
     purchased: bool
     sort_order: int
+    packages: int | None = None
+    store_product_id: uuid.UUID | None = None
+    store_name: str | None = None
+    package_label: str | None = None
 
 
 class ShoppingList(BaseModel):
@@ -326,6 +364,74 @@ class ShoppingListListItem(BaseModel):
     item_purchased: int
     created_at: datetime
     updated_at: datetime
+
+
+# ------------------------------------------------------------------
+# Pydantic models — Pantry
+# ------------------------------------------------------------------
+
+
+class PantryItemCreate(BaseModel):
+    name: str
+    quantity: float | None = None
+    unit: str | None = None
+    category: str = ""
+
+
+class PantryItemUpdate(BaseModel):
+    name: str | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    category: str | None = None
+
+
+class PantryItem(BaseModel):
+    id: uuid.UUID
+    owner_id: uuid.UUID
+    name: str
+    quantity: float | None
+    unit: str | None
+    category: str
+    updated_at: datetime
+
+
+# ------------------------------------------------------------------
+# Pydantic models — Consume / commit-to-pantry
+# ------------------------------------------------------------------
+
+
+class ConsumeRequest(BaseModel):
+    force: bool = False
+
+
+class ConsumeReportLine(BaseModel):
+    name: str
+    status: Literal["deducted", "insufficient", "not_tracked"]
+    deducted_quantity: float | None
+    unit: str | None
+
+
+class ConsumeResponse(BaseModel):
+    day: MealPlanDay
+    report: list[ConsumeReportLine]
+
+
+class CommitToPantryLine(BaseModel):
+    name: str
+    quantity: float | None
+    unit: str | None
+
+
+class CommitToPantryResponse(BaseModel):
+    added: list[CommitToPantryLine]
+
+
+class DayAlreadyConsumed(Exception):
+    """Raised by :func:`consume_day` when ``consumed_at`` is set and ``force`` is False."""
+
+    def __init__(self, day_id: uuid.UUID) -> None:
+        self.day_id = day_id
+        super().__init__(f"Day {day_id} is already marked consumed")
 
 
 # ------------------------------------------------------------------
@@ -418,7 +524,7 @@ async def delete_meal_plan(pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uui
 # Data access — Meal Plan Days
 # ------------------------------------------------------------------
 
-_DAY_COLUMNS = "id, plan_id, day_date, meal_type, notes, sort_order"
+_DAY_COLUMNS = "id, plan_id, day_date, meal_type, notes, sort_order, consumed_at"
 
 
 async def _load_day_recipes(pool: asyncpg.Pool, day_id: uuid.UUID) -> list[RecipeRef]:
@@ -515,7 +621,7 @@ async def update_plan_day(
         "notes = COALESCE($3, d.notes) "
         "FROM meal_plans p "
         "WHERE d.id = $1 AND d.plan_id = p.id AND p.owner_id = $2 "
-        "RETURNING d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order",
+        "RETURNING d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order, d.consumed_at",
         day_id,
         owner_id,
         data.notes,
@@ -535,6 +641,24 @@ async def delete_plan_day(pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.
         owner_id,
     )
     return result.endswith("1")
+
+
+async def get_plan_day(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID
+) -> MealPlanDay | None:
+    """Fetch a single day (with its recipes), verifying ownership through its plan."""
+    row = await pool.fetchrow(
+        "SELECT d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order, d.consumed_at "
+        "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+        "WHERE d.id = $1 AND p.owner_id = $2",
+        day_id,
+        owner_id,
+    )
+    if row is None:
+        return None
+    day = dict(row)
+    day["recipes"] = await _load_day_recipes(pool, day_id)
+    return MealPlanDay(**day)
 
 
 # ------------------------------------------------------------------
@@ -820,6 +944,10 @@ _LIST_LIST_COLUMNS = """
     COALESCE(ic.item_total, 0) AS item_total,
     COALESCE(ic.item_purchased, 0) AS item_purchased
 """
+_ITEM_COLUMNS = (
+    "id, list_id, name, quantity, unit, category, purchased, sort_order, "
+    "packages, store_product_id, store_name, package_label"
+)
 
 
 async def list_shopping_lists(
@@ -855,8 +983,7 @@ async def get_shopping_list(
         return None
     slist = dict(row)
     item_rows = await pool.fetch(
-        "SELECT id, list_id, name, quantity, unit, category, purchased, sort_order "
-        "FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
+        f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
         list_id,
     )
     slist["items"] = [ShoppingListItem(**dict(ir)) for ir in item_rows]
@@ -901,8 +1028,7 @@ async def update_shopping_list(
         return None
     result = dict(row)
     item_rows = await pool.fetch(
-        "SELECT id, list_id, name, quantity, unit, category, purchased, sort_order "
-        "FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
+        f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
         list_id,
     )
     result["items"] = [ShoppingListItem(**dict(ir)) for ir in item_rows]
@@ -934,9 +1060,10 @@ async def add_list_item(
     sort_order = (max_order or -1) + 1
     row = await pool.fetchrow(
         "INSERT INTO shopping_list_items "
-        "(id, list_id, name, quantity, unit, category, sort_order) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
-        "RETURNING id, list_id, name, quantity, unit, category, purchased, sort_order",
+        "(id, list_id, name, quantity, unit, category, sort_order, "
+        "packages, store_product_id, store_name, package_label) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
+        f"RETURNING {_ITEM_COLUMNS}",
         uuid.uuid4(),
         list_id,
         name,
@@ -944,6 +1071,10 @@ async def add_list_item(
         data.unit,
         data.category,
         sort_order,
+        data.packages,
+        data.store_product_id,
+        data.store_name,
+        data.package_label,
     )
     return ShoppingListItem(**dict(row))
 
@@ -964,7 +1095,8 @@ async def update_list_item(
         "FROM shopping_lists l "
         "WHERE it.id = $1 AND it.list_id = l.id AND l.owner_id = $2 "
         "RETURNING it.id, it.list_id, it.name, it.quantity, it.unit, it.category, "
-        "it.purchased, it.sort_order",
+        "it.purchased, it.sort_order, it.packages, it.store_product_id, it.store_name, "
+        "it.package_label",
         item_id,
         owner_id,
         name,
@@ -984,6 +1116,308 @@ async def delete_list_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uui
         owner_id,
     )
     return result.endswith("1")
+
+
+# ------------------------------------------------------------------
+# Data access — Pantry
+# ------------------------------------------------------------------
+
+_PANTRY_COLUMNS = "id, owner_id, name, quantity, unit, category, updated_at"
+
+
+async def list_pantry_items(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[PantryItem]:
+    rows = await pool.fetch(
+        f"SELECT {_PANTRY_COLUMNS} FROM pantry_items WHERE owner_id = $1 ORDER BY name",
+        owner_id,
+    )
+    return [PantryItem(**dict(row)) for row in rows]
+
+
+async def _find_matching_pantry_row(
+    executor, owner_id: uuid.UUID, name: str, dimension: str
+) -> asyncpg.Record | None:
+    """Find the owner's pantry row for `name` whose unit shares `dimension`, if any.
+
+    Uniqueness per (owner, normalized name, dimension) is enforced here in
+    code rather than a DB constraint, since "dimension" is derived from the
+    free-text unit via :func:`canonicalize`, not a stored column.
+    """
+    rows = await executor.fetch(
+        "SELECT id, quantity, unit FROM pantry_items "
+        "WHERE owner_id = $1 AND lower(trim(name)) = $2",
+        owner_id,
+        name.strip().lower(),
+    )
+    for row in rows:
+        if canonicalize(None, row["unit"])[1] == dimension:
+            return row
+    return None
+
+
+async def upsert_pantry_item(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, data: PantryItemCreate
+) -> PantryItem:
+    """Insert a pantry item, or add its quantity onto an existing (owner, name, dimension) match.
+
+    Category on a merge is overwritten by the new value (last-write-wins);
+    quantity stays ``None`` only when both the existing row and the new data
+    have no quantity, otherwise a missing quantity counts as 0 for the sum.
+    """
+    name = data.name.strip()
+    if not name:
+        raise ValueError("Pantry item name must not be empty")
+    _, dimension, _ = canonicalize(None, data.unit)
+    match = await _find_matching_pantry_row(pool, owner_id, name, dimension)
+
+    if match is None:
+        row = await pool.fetchrow(
+            f"INSERT INTO pantry_items (id, owner_id, name, quantity, unit, category) "
+            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_PANTRY_COLUMNS}",
+            uuid.uuid4(),
+            owner_id,
+            name,
+            data.quantity,
+            data.unit,
+            data.category,
+        )
+        return PantryItem(**dict(row))
+
+    if match["quantity"] is None and data.quantity is None:
+        merged_qty, merged_unit = None, match["unit"] or data.unit
+    else:
+        existing_canonical, _, _ = canonicalize(match["quantity"] or 0.0, match["unit"])
+        added_canonical, _, _ = canonicalize(data.quantity or 0.0, data.unit)
+        total = (existing_canonical or 0.0) + (added_canonical or 0.0)
+        merged_unit = match["unit"] or data.unit
+        factor = to_canonical_unit_factor(merged_unit)
+        merged_qty, merged_unit = format_display(total / factor, merged_unit)
+
+    row = await pool.fetchrow(
+        f"UPDATE pantry_items SET quantity = $2, unit = $3, category = $4, updated_at = now() "
+        f"WHERE id = $1 RETURNING {_PANTRY_COLUMNS}",
+        match["id"],
+        merged_qty,
+        merged_unit,
+        data.category,
+    )
+    return PantryItem(**dict(row))
+
+
+async def update_pantry_item(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID, data: PantryItemUpdate
+) -> PantryItem | None:
+    name = data.name.strip() if data.name is not None else None
+    if data.name is not None and not name:
+        raise ValueError("Pantry item name must not be empty")
+    row = await pool.fetchrow(
+        f"UPDATE pantry_items SET "
+        f"name = COALESCE($3, name), "
+        f"quantity = COALESCE($4, quantity), "
+        f"unit = COALESCE($5, unit), "
+        f"category = COALESCE($6, category), "
+        f"updated_at = now() "
+        f"WHERE id = $1 AND owner_id = $2 RETURNING {_PANTRY_COLUMNS}",
+        item_id,
+        owner_id,
+        name,
+        data.quantity,
+        data.unit,
+        data.category,
+    )
+    return PantryItem(**dict(row)) if row else None
+
+
+async def delete_pantry_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID) -> bool:
+    result = await pool.execute(
+        "DELETE FROM pantry_items WHERE id = $1 AND owner_id = $2", item_id, owner_id
+    )
+    return result.endswith("1")
+
+
+async def _add_to_pantry(
+    executor, owner_id: uuid.UUID, name: str, quantity: float | None, unit: str | None
+) -> None:
+    """Add `quantity unit` of `name` into the owner's pantry (upsert-add), best-effort.
+
+    `executor` is a pool or an open connection (both share asyncpg's
+    fetch/fetchrow/execute interface). A no-op when `quantity` is None or
+    `name` is blank — there's nothing quantifiable to add.
+    """
+    name = name.strip()
+    if quantity is None or not name:
+        return
+    _, dimension, _ = canonicalize(None, unit)
+    match = await _find_matching_pantry_row(executor, owner_id, name, dimension)
+    added_canonical, _, _ = canonicalize(quantity, unit)
+
+    if match is None:
+        await executor.execute(
+            "INSERT INTO pantry_items (id, owner_id, name, quantity, unit, category) "
+            "VALUES ($1, $2, $3, $4, $5, '')",
+            uuid.uuid4(),
+            owner_id,
+            name,
+            quantity,
+            unit,
+        )
+        return
+
+    existing_canonical, _, _ = canonicalize(match["quantity"] or 0.0, match["unit"])
+    total = (existing_canonical or 0.0) + (added_canonical or 0.0)
+    display_unit = match["unit"] or unit
+    factor = to_canonical_unit_factor(display_unit)
+    new_qty, new_unit = format_display(total / factor, display_unit)
+    await executor.execute(
+        "UPDATE pantry_items SET quantity = $2, unit = $3, updated_at = now() WHERE id = $1",
+        match["id"],
+        new_qty,
+        new_unit,
+    )
+
+
+async def _deduct_from_pantry(
+    conn, owner_id: uuid.UUID, name: str, quantity: float | None, unit: str | None
+) -> ConsumeReportLine:
+    """Subtract `quantity unit` of `name` from the owner's pantry, clamped at 0.
+
+    Runs on an open transaction connection. Returns a report line: "deducted"
+    (enough stock, or nothing was needed), "insufficient" (stock existed but
+    ran out, clamped to 0), or "not_tracked" (no matching pantry row, or the
+    matching row itself has no quantity to draw down).
+    """
+    needed_canonical, dimension, _ = canonicalize(quantity, unit)
+    match = await _find_matching_pantry_row(conn, owner_id, name, dimension)
+    if match is None:
+        return ConsumeReportLine(name=name, status="not_tracked", deducted_quantity=None, unit=unit)
+
+    have_canonical, _, _ = canonicalize(match["quantity"], match["unit"])
+    if have_canonical is None:
+        return ConsumeReportLine(name=name, status="not_tracked", deducted_quantity=None, unit=unit)
+
+    need = needed_canonical or 0.0
+    deducted_canonical = min(have_canonical, need)
+    remaining_canonical = max(have_canonical - need, 0.0)
+
+    factor = to_canonical_unit_factor(match["unit"])
+    remaining_qty, remaining_unit = format_display(remaining_canonical / factor, match["unit"])
+    await conn.execute(
+        "UPDATE pantry_items SET quantity = $2, updated_at = now() WHERE id = $1",
+        match["id"],
+        remaining_qty,
+    )
+
+    deducted_qty, deducted_unit = format_display(deducted_canonical / factor, match["unit"])
+    status: Literal["deducted", "insufficient"] = (
+        "deducted" if have_canonical >= need else "insufficient"
+    )
+    return ConsumeReportLine(
+        name=name,
+        status=status,
+        deducted_quantity=deducted_qty,
+        unit=deducted_unit or remaining_unit,
+    )
+
+
+async def _day_recipe_ingredients(conn, day_id: uuid.UUID):
+    return await conn.fetch(
+        "SELECT ri.name, ri.quantity, ri.unit "
+        "FROM meal_plan_day_recipes dr "
+        "JOIN recipe_ingredients ri ON ri.recipe_id = dr.recipe_id "
+        "WHERE dr.day_id = $1",
+        day_id,
+    )
+
+
+async def consume_day(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, force: bool = False
+) -> tuple[MealPlanDay, list[ConsumeReportLine]] | None:
+    """Mark a day consumed, deducting every ingredient of every recipe on it from pantry.
+
+    Returns None if the day isn't found or isn't owned by `owner_id`. Raises
+    :class:`DayAlreadyConsumed` when the day is already marked consumed and
+    `force` is False.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day_row = await conn.fetchrow(
+                "SELECT d.id, d.consumed_at "
+                "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+                "WHERE d.id = $1 AND p.owner_id = $2 "
+                "FOR UPDATE OF d",
+                day_id,
+                owner_id,
+            )
+            if day_row is None:
+                return None
+            if day_row["consumed_at"] is not None and not force:
+                raise DayAlreadyConsumed(day_id)
+
+            ingredient_rows = await _day_recipe_ingredients(conn, day_id)
+            report = [
+                await _deduct_from_pantry(conn, owner_id, ing["name"], ing["quantity"], ing["unit"])
+                for ing in ingredient_rows
+            ]
+            await conn.execute(
+                "UPDATE meal_plan_days SET consumed_at = now() WHERE id = $1", day_id
+            )
+
+    day = await get_plan_day(pool, owner_id, day_id)
+    assert day is not None  # verified ownership above, inside the same transaction
+    return day, report
+
+
+async def unconsume_day(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID
+) -> MealPlanDay | None:
+    """Clear `consumed_at` and best-effort restore the day's ingredients to pantry.
+
+    A no-op restoration (but still returns the day) when the day was never
+    consumed — there's nothing to credit back. Returns None if the day isn't
+    found or isn't owned by `owner_id`.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            day_row = await conn.fetchrow(
+                "SELECT d.id, d.consumed_at "
+                "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+                "WHERE d.id = $1 AND p.owner_id = $2 "
+                "FOR UPDATE OF d",
+                day_id,
+                owner_id,
+            )
+            if day_row is None:
+                return None
+            if day_row["consumed_at"] is not None:
+                ingredient_rows = await _day_recipe_ingredients(conn, day_id)
+                for ing in ingredient_rows:
+                    await _add_to_pantry(conn, owner_id, ing["name"], ing["quantity"], ing["unit"])
+            await conn.execute("UPDATE meal_plan_days SET consumed_at = NULL WHERE id = $1", day_id)
+
+    return await get_plan_day(pool, owner_id, day_id)
+
+
+async def commit_list_to_pantry(
+    pool: asyncpg.Pool, owner_id: uuid.UUID, list_id: uuid.UUID
+) -> list[CommitToPantryLine] | None:
+    """Add a shopping list's purchased items into pantry stock (upsert-add).
+
+    Returns None if the list isn't found or isn't owned by `owner_id`.
+    """
+    slist = await get_shopping_list(pool, owner_id, list_id)
+    if slist is None:
+        return None
+
+    added: list[CommitToPantryLine] = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for item in slist.items:
+                if not item.purchased or item.quantity is None:
+                    continue
+                await _add_to_pantry(conn, owner_id, item.name, item.quantity, item.unit)
+                added.append(
+                    CommitToPantryLine(name=item.name, quantity=item.quantity, unit=item.unit)
+                )
+    return added
 
 
 # ------------------------------------------------------------------
@@ -1441,3 +1875,102 @@ async def delete_list_item_endpoint(
 ) -> None:
     if not await delete_list_item(_pool(request), user.id, item_id):
         raise HTTPException(status_code=404, detail="Item not found")
+
+
+# -- Pantry --
+
+
+@router.get("/pantry")
+async def list_pantry_endpoint(
+    request: Request,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> list[dict]:
+    items = await list_pantry_items(_pool(request), user.id)
+    return [item.model_dump(mode="json") for item in items]
+
+
+@router.post("/pantry", status_code=201)
+async def upsert_pantry_endpoint(
+    request: Request,
+    body: PantryItemCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        item = await upsert_pantry_item(_pool(request), user.id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return item.model_dump(mode="json")
+
+
+@router.put("/pantry/{item_id}")
+async def update_pantry_endpoint(
+    request: Request,
+    item_id: uuid.UUID,
+    body: PantryItemUpdate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    try:
+        item = await update_pantry_item(_pool(request), user.id, item_id, body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Pantry item not found")
+    return item.model_dump(mode="json")
+
+
+@router.delete("/pantry/{item_id}", status_code=204)
+async def delete_pantry_endpoint(
+    request: Request,
+    item_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> None:
+    if not await delete_pantry_item(_pool(request), user.id, item_id):
+        raise HTTPException(status_code=404, detail="Pantry item not found")
+
+
+# -- Consume / unconsume --
+
+
+@router.post("/plans/days/{day_id}/consume")
+async def consume_day_endpoint(
+    request: Request,
+    day_id: uuid.UUID,
+    body: ConsumeRequest | None = None,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    force = body.force if body is not None else False
+    try:
+        result = await consume_day(_pool(request), user.id, day_id, force=force)
+    except DayAlreadyConsumed as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="Day not found")
+    day, report = result
+    return ConsumeResponse(day=day, report=report).model_dump(mode="json")
+
+
+@router.post("/plans/days/{day_id}/unconsume")
+async def unconsume_day_endpoint(
+    request: Request,
+    day_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    day = await unconsume_day(_pool(request), user.id, day_id)
+    if day is None:
+        raise HTTPException(status_code=404, detail="Day not found")
+    return day.model_dump(mode="json")
+
+
+# -- Commit shopping list to pantry --
+
+
+@router.post("/lists/{list_id}/commit-to-pantry")
+async def commit_to_pantry_endpoint(
+    request: Request,
+    list_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+) -> dict:
+    added = await commit_list_to_pantry(_pool(request), user.id, list_id)
+    if added is None:
+        raise HTTPException(status_code=404, detail="Shopping list not found")
+    return CommitToPantryResponse(added=added).model_dump(mode="json")

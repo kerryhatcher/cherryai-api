@@ -83,6 +83,18 @@ def _normalize_unit_key(unit: str) -> str:
     return " ".join(unit.strip().lower().split())
 
 
+def to_canonical_unit_factor(unit: str | None) -> float:
+    """Return the factor that converts one ``unit`` into its dimension's canonical unit.
+
+    1.0 for a blank/``None`` unit (the count dimension) or an unrecognized
+    unit (its canonical unit *is* itself, so no conversion is needed).
+    """
+    if not unit or not unit.strip():
+        return 1.0
+    alias = _UNIT_ALIASES.get(_normalize_unit_key(unit))
+    return alias[0] if alias else 1.0
+
+
 def canonicalize(quantity: float | None, unit: str | None) -> tuple[float | None, str, str]:
     """Convert a quantity + free-text unit into a canonical dimension.
 
@@ -214,9 +226,7 @@ def aggregate(
             display_qty = group["total"]
             out_unit = None
         else:
-            alias = _UNIT_ALIASES.get(_normalize_unit_key(display_unit))
-            factor = alias[0] if alias else 1.0
-            display_qty = group["total"] / factor
+            display_qty = group["total"] / to_canonical_unit_factor(display_unit)
             out_unit = display_unit
         rounded_qty, rounded_unit = format_display(display_qty, out_unit)
         results.append(

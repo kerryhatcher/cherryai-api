@@ -12,13 +12,21 @@ from datetime import date
 
 import pytest
 
-from cherryai_api.meal_units import aggregate, canonicalize, format_display
+from cherryai_api.meal_units import (
+    aggregate,
+    canonicalize,
+    format_display,
+    to_canonical_unit_factor,
+)
 from cherryai_api.meals import (
+    DayAlreadyConsumed,
     IngredientUpdate,
     MealPlanCreate,
     MealPlanDayCreate,
     MealPlanDayUpdate,
     MealPlanUpdate,
+    PantryItemCreate,
+    PantryItemUpdate,
     RecipeCreate,
     RecipeIngredientCreate,
     ShoppingListCreate,
@@ -27,17 +35,25 @@ from cherryai_api.meals import (
     add_ingredient,
     add_list_item,
     add_recipe_to_day,
+    commit_list_to_pantry,
+    consume_day,
     create_meal_plan,
     create_recipe,
     create_shopping_list,
     delete_ingredient,
     delete_list_item,
+    delete_pantry_item,
     delete_plan_day,
     generate_shopping_list_from_plan,
+    get_plan_day,
+    list_pantry_items,
     remove_recipe_from_day,
+    unconsume_day,
     update_ingredient,
     update_list_item,
+    update_pantry_item,
     update_plan_day,
+    upsert_pantry_item,
     upsert_plan_day,
 )
 
@@ -400,3 +416,316 @@ def test_meal_plan_update_accepts_none() -> None:
 def test_meal_plan_update_rejects_non_monday() -> None:
     with pytest.raises(ValueError, match="Monday"):
         MealPlanUpdate(week_start=date(2026, 7, 22))  # a Wednesday
+
+
+# --- to_canonical_unit_factor --------------------------------------------------
+
+
+def test_to_canonical_unit_factor_known_unit() -> None:
+    assert to_canonical_unit_factor("lb") == pytest.approx(453.592)
+
+
+def test_to_canonical_unit_factor_blank_or_none_is_one() -> None:
+    assert to_canonical_unit_factor(None) == 1.0
+    assert to_canonical_unit_factor("  ") == 1.0
+
+
+def test_to_canonical_unit_factor_unknown_unit_is_one() -> None:
+    assert to_canonical_unit_factor("pinch") == 1.0
+
+
+# --- Pantry: upsert-merge semantics --------------------------------------------
+
+
+async def test_upsert_pantry_creates_new_item(pool, owner) -> None:
+    item = await upsert_pantry_item(
+        pool,
+        owner,
+        PantryItemCreate(name="Ztest Flour", quantity=2.0, unit="cup", category="baking"),
+    )
+    assert item.name == "Ztest Flour"
+    assert item.quantity == 2.0
+    assert item.unit == "cup"
+    assert item.category == "baking"
+
+
+async def test_upsert_pantry_merges_same_dimension(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Sugar", quantity=1.0, unit="lb")
+    )
+    merged = await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="ztest sugar", quantity=8.0, unit="oz")
+    )
+    items = await list_pantry_items(pool, owner)
+    matching = [i for i in items if i.name.lower() == "ztest sugar"]
+    assert len(matching) == 1
+    assert matching[0].id == merged.id
+    assert matching[0].quantity == 1.5
+    assert matching[0].unit == "lb"
+
+
+async def test_upsert_pantry_keeps_different_dimensions_separate(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Milk", quantity=1.0, unit="cup")
+    )
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Milk", quantity=200.0, unit="g")
+    )
+    items = await list_pantry_items(pool, owner)
+    matching = [i for i in items if i.name.lower() == "ztest milk"]
+    assert len(matching) == 2
+    units = {i.unit for i in matching}
+    assert units == {"cup", "g"}
+
+
+async def test_upsert_pantry_both_none_quantity_stays_none(pool, owner) -> None:
+    await upsert_pantry_item(pool, owner, PantryItemCreate(name="Ztest Salt"))
+    merged = await upsert_pantry_item(pool, owner, PantryItemCreate(name="Ztest Salt"))
+    assert merged.quantity is None
+
+
+async def test_upsert_pantry_none_quantity_does_not_zero_existing(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Rice", quantity=5.0, unit="lb")
+    )
+    merged = await upsert_pantry_item(pool, owner, PantryItemCreate(name="Ztest Rice", unit="lb"))
+    assert merged.quantity == 5.0
+
+
+async def test_upsert_pantry_category_overwritten_on_merge(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Butter", quantity=1.0, unit="lb", category="old")
+    )
+    merged = await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Butter", quantity=1.0, unit="lb", category="new")
+    )
+    assert merged.category == "new"
+
+
+async def test_upsert_pantry_rejects_blank_name(pool, owner) -> None:
+    with pytest.raises(ValueError):
+        await upsert_pantry_item(pool, owner, PantryItemCreate(name="   "))
+
+
+# --- Pantry: CRUD + ownership ---------------------------------------------------
+
+
+async def test_pantry_update_and_delete_rejects_other_owner(pool, alice, bob) -> None:
+    item = await upsert_pantry_item(pool, alice, PantryItemCreate(name="Ztest Eggs", quantity=12))
+    assert await update_pantry_item(pool, bob, item.id, PantryItemUpdate(quantity=1)) is None
+    updated = await update_pantry_item(pool, alice, item.id, PantryItemUpdate(quantity=6))
+    assert updated is not None and updated.quantity == 6
+
+    assert await delete_pantry_item(pool, bob, item.id) is False
+    assert await delete_pantry_item(pool, alice, item.id) is True
+
+
+async def test_pantry_list_scoped_to_owner(pool, alice, bob) -> None:
+    await upsert_pantry_item(pool, alice, PantryItemCreate(name="Ztest Alice Only", quantity=1))
+    bob_items = await list_pantry_items(pool, bob)
+    assert all(i.name != "Ztest Alice Only" for i in bob_items)
+
+
+# --- Consume / unconsume --------------------------------------------------------
+
+
+async def _plan_day_with_recipe(
+    pool, owner_id, *, ingredient_qty, ingredient_unit, ingredient_name
+):
+    plan = await create_meal_plan(
+        pool, owner_id, MealPlanCreate(name="Ztest Consume Plan", week_start=date(2026, 7, 20))
+    )
+    recipe = await create_recipe(pool, owner_id, RecipeCreate(name="Ztest Consume Recipe"))
+    await add_ingredient(
+        pool,
+        recipe.id,
+        RecipeIngredientCreate(name=ingredient_name, quantity=ingredient_qty, unit=ingredient_unit),
+    )
+    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
+    await add_recipe_to_day(pool, owner_id, day.id, recipe.id)
+    return day
+
+
+async def test_consume_deducts_sufficient_pantry_stock(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Flour A", quantity=5.0, unit="cup")
+    )
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=2.0, ingredient_unit="cup", ingredient_name="Ztest Flour A"
+    )
+
+    result = await consume_day(pool, owner, day.id)
+    assert result is not None
+    updated_day, report = result
+    assert updated_day.consumed_at is not None
+    assert len(report) == 1
+    assert report[0].status == "deducted"
+    assert report[0].deducted_quantity == 2.0
+
+    pantry = await list_pantry_items(pool, owner)
+    remaining = next(i for i in pantry if i.name == "Ztest Flour A")
+    assert remaining.quantity == 3.0
+
+
+async def test_consume_clamps_at_zero_when_insufficient(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Flour B", quantity=1.0, unit="cup")
+    )
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=5.0, ingredient_unit="cup", ingredient_name="Ztest Flour B"
+    )
+
+    result = await consume_day(pool, owner, day.id)
+    assert result is not None
+    _, report = result
+    assert report[0].status == "insufficient"
+    assert report[0].deducted_quantity == 1.0
+
+    pantry = await list_pantry_items(pool, owner)
+    remaining = next(i for i in pantry if i.name == "Ztest Flour B")
+    assert remaining.quantity == 0.0
+
+
+async def test_consume_reports_not_tracked_when_no_pantry_row(pool, owner) -> None:
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=1.0, ingredient_unit="cup", ingredient_name="Ztest Untracked"
+    )
+    result = await consume_day(pool, owner, day.id)
+    assert result is not None
+    _, report = result
+    assert report[0].status == "not_tracked"
+    assert report[0].deducted_quantity is None
+
+
+async def test_consume_twice_without_force_raises_409_signal(pool, owner) -> None:
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=1.0, ingredient_unit="cup", ingredient_name="Ztest Repeat"
+    )
+    await consume_day(pool, owner, day.id)
+    with pytest.raises(DayAlreadyConsumed):
+        await consume_day(pool, owner, day.id)
+
+
+async def test_consume_twice_with_force_succeeds(pool, owner) -> None:
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=1.0, ingredient_unit="cup", ingredient_name="Ztest Force"
+    )
+    await consume_day(pool, owner, day.id)
+    result = await consume_day(pool, owner, day.id, force=True)
+    assert result is not None
+
+
+async def test_consume_rejects_other_owner(pool, alice, bob) -> None:
+    day = await _plan_day_with_recipe(
+        pool,
+        alice,
+        ingredient_qty=1.0,
+        ingredient_unit="cup",
+        ingredient_name="Ztest Alice Ingredient",
+    )
+    assert await consume_day(pool, bob, day.id) is None
+
+
+async def test_unconsume_restores_pantry_and_clears_consumed_at(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Flour C", quantity=5.0, unit="cup")
+    )
+    day = await _plan_day_with_recipe(
+        pool, owner, ingredient_qty=2.0, ingredient_unit="cup", ingredient_name="Ztest Flour C"
+    )
+    await consume_day(pool, owner, day.id)
+
+    restored_day = await unconsume_day(pool, owner, day.id)
+    assert restored_day is not None
+    assert restored_day.consumed_at is None
+
+    pantry = await list_pantry_items(pool, owner)
+    restored = next(i for i in pantry if i.name == "Ztest Flour C")
+    assert restored.quantity == 5.0
+
+
+async def test_unconsume_never_consumed_is_a_noop(pool, owner) -> None:
+    day = await _plan_day_with_recipe(
+        pool,
+        owner,
+        ingredient_qty=1.0,
+        ingredient_unit="cup",
+        ingredient_name="Ztest Never Consumed",
+    )
+    result = await unconsume_day(pool, owner, day.id)
+    assert result is not None
+    assert result.consumed_at is None
+    # No pantry row should have been created by a no-op restore.
+    pantry = await list_pantry_items(pool, owner)
+    assert all(i.name != "Ztest Never Consumed" for i in pantry)
+
+
+async def test_unconsume_rejects_other_owner(pool, alice, bob) -> None:
+    day = await _plan_day_with_recipe(
+        pool,
+        alice,
+        ingredient_qty=1.0,
+        ingredient_unit="cup",
+        ingredient_name="Ztest Alice Unconsume",
+    )
+    await consume_day(pool, alice, day.id)
+    assert await unconsume_day(pool, bob, day.id) is None
+
+
+async def test_get_plan_day_rejects_other_owner(pool, alice, bob) -> None:
+    day = await _plan_day_with_recipe(
+        pool,
+        alice,
+        ingredient_qty=1.0,
+        ingredient_unit="cup",
+        ingredient_name="Ztest Alice Get Day",
+    )
+    assert await get_plan_day(pool, bob, day.id) is None
+    assert await get_plan_day(pool, alice, day.id) is not None
+
+
+# --- Commit shopping list to pantry ---------------------------------------------
+
+
+async def test_commit_to_pantry_adds_only_purchased_items(pool, owner) -> None:
+    slist = await create_shopping_list(pool, owner, ShoppingListCreate(name="Ztest Commit List"))
+    purchased = await add_list_item(
+        pool, slist.id, ShoppingListItemCreate(name="Ztest Bought Milk", quantity=1.0, unit="gal")
+    )
+    unpurchased = await add_list_item(
+        pool, slist.id, ShoppingListItemCreate(name="Ztest Unbought Eggs", quantity=12)
+    )
+    await update_list_item(pool, owner, purchased.id, ShoppingListItemUpdate(purchased=True))
+
+    added = await commit_list_to_pantry(pool, owner, slist.id)
+    assert added is not None
+    names = {a.name for a in added}
+    assert "Ztest Bought Milk" in names
+    assert "Ztest Unbought Eggs" not in names
+
+    pantry = await list_pantry_items(pool, owner)
+    assert any(i.name == "Ztest Bought Milk" and i.quantity == 1.0 for i in pantry)
+    assert unpurchased.name == "Ztest Unbought Eggs"  # keeps the reference used, not just created
+
+
+async def test_commit_to_pantry_merges_into_existing_stock(pool, owner) -> None:
+    await upsert_pantry_item(
+        pool, owner, PantryItemCreate(name="Ztest Existing Rice", quantity=1.0, unit="lb")
+    )
+    slist = await create_shopping_list(pool, owner, ShoppingListCreate(name="Ztest Commit Merge"))
+    item = await add_list_item(
+        pool, slist.id, ShoppingListItemCreate(name="Ztest Existing Rice", quantity=2.0, unit="lb")
+    )
+    await update_list_item(pool, owner, item.id, ShoppingListItemUpdate(purchased=True))
+
+    await commit_list_to_pantry(pool, owner, slist.id)
+    pantry = await list_pantry_items(pool, owner)
+    merged = next(i for i in pantry if i.name == "Ztest Existing Rice")
+    assert merged.quantity == 3.0
+
+
+async def test_commit_to_pantry_rejects_other_owner(pool, alice, bob) -> None:
+    slist = await create_shopping_list(
+        pool, alice, ShoppingListCreate(name="Ztest Alice List Commit")
+    )
+    assert await commit_list_to_pantry(pool, bob, slist.id) is None
