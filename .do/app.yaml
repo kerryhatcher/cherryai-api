@@ -56,6 +56,12 @@ services:
         type: SECRET
       - key: CHERRYAI_ADMIN_PASSWORD
         type: SECRET
+      # Enables Logfire export in telemetry.py (send_to_logfire="if-token-present").
+      # RUN_TIME only: telemetry is configured at process start, so the build
+      # stage has no need for the credential. Not set on the migrate job.
+      - key: LOGFIRE_TOKEN
+        type: SECRET
+        scope: RUN_TIME
 
 jobs:
   - name: migrate
