@@ -26,6 +26,7 @@ from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract
 from cherryai_api.feedback import router as feedback_router
 from cherryai_api.integrations import router as integrations_router
 from cherryai_api.logging_setup import setup_file_logging
+from cherryai_api.meals import router as meals_router
 from cherryai_api.memory import build_memory
 from cherryai_api.planner import router as planner_router
 from cherryai_api.settings import get_settings
@@ -91,6 +92,7 @@ app.include_router(calendar_router)
 app.include_router(contacts_router)
 app.include_router(email_router)
 app.include_router(integrations_router)
+app.include_router(meals_router)
 app.include_router(planner_router)
 app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(
