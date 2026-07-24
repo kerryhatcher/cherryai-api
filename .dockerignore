@@ -1,0 +1,12 @@
+.venv
+.git
+.env
+.env.*
+.cognee
+logs
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+.logfire
+tests
