@@ -20,12 +20,15 @@ from sse_starlette.sse import EventSourceResponse
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users_app, require_chat
+from cherryai_api.authz import assert_rls_enforced
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
 from cherryai_api.db_migrations import run_migrations_to_head
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
+from cherryai_api.families import families_router
+from cherryai_api.family_context import FamilyContextMiddleware
 from cherryai_api.feedback import router as feedback_router
 from cherryai_api.frontend_errors import (
     FRONTEND_ERROR_RETENTION_DAYS,
@@ -177,6 +180,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await asyncio.to_thread(run_migrations_to_head)
     database = build_database()
     await database.connect()
+    await assert_rls_enforced(database.pool)
     # Kept solely for the workflow runtime, which is a workspace-level
     # background pipeline not tied to a requesting user. Per-request chat
     # traffic builds its own memory in send_message.
@@ -206,6 +210,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="CherryAI API", lifespan=lifespan)
+app.add_middleware(FamilyContextMiddleware)
 # Must stay at module scope, before the app ever serves an ASGI scope. Moving
 # this into the lifespan silently disables all HTTP span collection — Starlette
 # caches its middleware stack during the "lifespan" scope, before the lifespan
@@ -228,6 +233,7 @@ app.include_router(email_router)
 app.include_router(integrations_router)
 app.include_router(meals_router)
 app.include_router(planner_router)
+app.include_router(families_router)
 app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(
     fastapi_users_app.get_register_router(UserRead, UserCreate),
