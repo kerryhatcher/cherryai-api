@@ -44,8 +44,12 @@ def cap(user, family=None):
 
 
 def _unprivileged_dsn() -> str:
-    """The app's DATABASE_URL with credentials swapped for the temp test role."""
-    parts = urlsplit(get_settings().database_url)
+    """The app's DSN with credentials swapped for the temp test role.
+
+    ``asyncpg_dsn``, not ``database_url``: asyncpg rejects the
+    ``postgresql+asyncpg://`` scheme the raw settings field may carry.
+    """
+    parts = urlsplit(get_settings().asyncpg_dsn)
     netloc = f"{_RLS_TEST_ROLE}:{_RLS_TEST_PASSWORD}@{parts.hostname}"
     if parts.port:
         netloc += f":{parts.port}"
