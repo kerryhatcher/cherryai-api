@@ -654,6 +654,12 @@ def families_set_perm(family_id: uuid.UUID, email: str, module: str, level: str)
 @families_app.command("add-member")
 def families_add_member(family_id: uuid.UUID, email: str, role: str = typer.Option(...)) -> None:
     """Add an existing user to a family with a specified role."""
+    from cherryai_api.families import FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD
+
+    allowed_roles = (FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD)
+    if role not in allowed_roles:
+        typer.echo(f"role must be one of {allowed_roles}", err=True)
+        raise typer.Exit(2)
 
     async def run() -> None:
         from cherryai_api.families import add_member
@@ -678,6 +684,7 @@ def families_transfer(family_id: uuid.UUID, email: str) -> None:
         from sqlalchemy import select
 
         from cherryai_api.families import (
+            FAMILY_ROLE_ADMIN,
             FAMILY_ROLE_ORGANIZER,
             FamilyMembership,
             get_membership,
@@ -696,6 +703,9 @@ def families_transfer(family_id: uuid.UUID, email: str) -> None:
             target = await get_membership(session, family_id, user.id)
             if target is None:
                 typer.echo("target is not a member", err=True)
+                raise typer.Exit(1)
+            if target.role != FAMILY_ROLE_ADMIN:
+                typer.echo("transfer target must be an admin", err=True)
                 raise typer.Exit(1)
             current_organizer = (
                 await session.execute(
