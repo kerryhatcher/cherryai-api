@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, ConfigDict
+from fastapi_users import exceptions as fastapi_users_exceptions
+from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -342,16 +344,16 @@ class MemberAdd(BaseModel):
 class ChildCreate(BaseModel):
     display_name: str
     password: str
-    email: str | None = None
+    email: EmailStr | None = None
 
 
 class MemberPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    role: str | None = None
-    perm_wiki: str | None = None
-    perm_meals: str | None = None
-    perm_planner: str | None = None
+    role: Literal[FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD] | None = None
+    perm_wiki: Literal[PERM_NONE, PERM_VIEW, PERM_EDIT] | None = None
+    perm_meals: Literal[PERM_NONE, PERM_VIEW, PERM_EDIT] | None = None
+    perm_planner: Literal[PERM_NONE, PERM_VIEW, PERM_EDIT] | None = None
     chat_enabled: bool | None = None
     web_enabled: bool | None = None
 
@@ -516,14 +518,17 @@ async def create_child_route(
     user_manager=Depends(get_user_manager),  # noqa: B008
 ):
     await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
-    membership = await create_child_account(
-        session,
-        user_manager,
-        family_id=family_id,
-        display_name=payload.display_name,
-        password=payload.password,
-        email=payload.email,
-    )
+    try:
+        membership = await create_child_account(
+            session,
+            user_manager,
+            family_id=family_id,
+            display_name=payload.display_name,
+            password=payload.password,
+            email=payload.email,
+        )
+    except fastapi_users_exceptions.UserAlreadyExists as err:
+        raise HTTPException(status_code=409, detail={"code": "email_taken"}) from err
     return MemberOut.model_validate(membership, from_attributes=True)
 
 

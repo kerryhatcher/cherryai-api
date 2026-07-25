@@ -186,9 +186,11 @@ async def test_patch_role_to_organizer_rejected(org_and_family):
         f"/api/families/{fam_id}/members",
         json={"email": other.email, "role": "adult"},
     )
+    # "organizer" isn't in MemberPatch.role's Literal (admin|adult|child), so
+    # this is now rejected by schema validation before it reaches the
+    # (still-present, now unreachable-via-HTTP) use_transfer business check.
     r = await client.patch(f"/api/families/{fam_id}/members/{other.id}", json={"role": "organizer"})
-    assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "use_transfer"
+    assert r.status_code == 422
 
 
 async def test_patch_rejects_unknown_field(org_and_family):
@@ -227,6 +229,51 @@ async def test_organizer_cannot_be_removed(org_and_family):
     r = await client.request("DELETE", f"/api/families/{fam_id}/members/{org.id}")
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "organizer_must_transfer_first"
+
+
+async def test_patch_rejects_invalid_role(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    r = await client.patch(f"/api/families/{fam_id}/members/{other.id}", json={"role": "banana"})
+    assert r.status_code == 422
+
+
+async def test_patch_rejects_invalid_perm(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    r = await client.patch(
+        f"/api/families/{fam_id}/members/{other.id}", json={"perm_wiki": "banana"}
+    )
+    assert r.status_code == 422
+
+
+async def test_create_child_duplicate_email_returns_409(org_and_family):
+    client, fam_id, org, other = org_and_family
+    r = await client.post(
+        f"/api/families/{fam_id}/children",
+        json={"display_name": "Ztest Kid", "password": "kid-password-123", "email": other.email},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "email_taken"
+
+
+async def test_create_child_malformed_email_returns_422(org_and_family):
+    client, fam_id, org, other = org_and_family
+    r = await client.post(
+        f"/api/families/{fam_id}/children",
+        json={
+            "display_name": "Ztest Kid",
+            "password": "kid-password-123",
+            "email": "not-an-email",
+        },
+    )
+    assert r.status_code == 422
 
 
 async def test_transfer_swaps_roles(org_and_family):
