@@ -36,6 +36,14 @@ class Settings(BaseSettings):
         default="postgresql://cherryai:cherryai_dev@localhost:5432/cherryai",
         repr=False,
     )
+    # Run `alembic upgrade head` in-process at API startup, before the
+    # asyncpg pool opens or the agent is built (see db_migrations.py). The
+    # DO App Platform PRE_DEPLOY migration job proved unreliable, so this is
+    # now the source of truth for schema migration. Tests disable it because
+    # they manage their own scratch/dev schema (see tests/conftest.py) and
+    # never trigger the app's lifespan anyway; the flag also doubles as an
+    # operational escape hatch if a migration ever needs to be skipped.
+    run_migrations_on_startup: bool = True
 
     # --- Cognee memory ---
     # Cognee's cognify extraction LLM. Local Ollama by default: OpenRouter's

@@ -17,6 +17,12 @@ import pytest
 # Tests must never export telemetry, even with local Logfire credentials
 # present. Set before any cherryai_api import can trigger logfire.configure().
 os.environ.setdefault("LOGFIRE_SEND_TO_LOGFIRE", "false")
+# Tests manage their own scratch/dev schema (see the `pool` fixture and
+# test_migrations.py's own scratch database) — the app's startup migration
+# must not also race against that. No test currently drives the real
+# `cherryai_api.api.lifespan` end to end, but this keeps it disabled if one
+# ever does.
+os.environ.setdefault("RUN_MIGRATIONS_ON_STARTUP", "false")
 
 from cherryai_api.db import build_database  # noqa: E402
 

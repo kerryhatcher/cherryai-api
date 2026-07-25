@@ -19,7 +19,14 @@ from cherryai_api.users import AccessToken, User  # noqa: F401 (register tables)
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ``disable_existing_loggers=False`` is load-bearing, not cosmetic. This
+    # env runs in-process inside the API (see db_migrations.py), not only
+    # under the `alembic` CLI. fileConfig's default of True would disable
+    # every logger absent from alembic.ini — including `uvicorn`,
+    # `uvicorn.error` and `uvicorn.access` — for the life of the process,
+    # silencing access logs and, worse, the "Application startup failed"
+    # traceback, so a failed boot would exit with no explanation at all.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 if not config.get_main_option("sqlalchemy.url"):
     config.set_main_option("sqlalchemy.url", sqlalchemy_url())

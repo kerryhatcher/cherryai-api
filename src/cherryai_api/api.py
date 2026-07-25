@@ -23,6 +23,7 @@ from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
+from cherryai_api.db_migrations import run_migrations_to_head
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
@@ -169,6 +170,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     setup_file_logging(settings.log_dir)
     setup_telemetry(app)
+    if settings.run_migrations_on_startup:
+        await asyncio.to_thread(run_migrations_to_head)
     database = build_database()
     await database.connect()
     # Kept solely for the workflow runtime, which is a workspace-level
