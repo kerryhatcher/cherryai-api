@@ -7,6 +7,7 @@ mapping is a relabeling, not a redesign.
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException
@@ -186,3 +187,62 @@ def scope_clause(model, capability: Capability):
     if capability.family_id is None:
         return and_(model.family_id.is_(None), model.owner_id == capability.user_id)
     return model.family_id == capability.family_id
+
+
+# Tables with RLS enabled. EMPTY in phase 1 by design: legacy module queries
+# don't set GUCs yet, and FORCE RLS would blank them. Each module phase
+# appends its tables here in the same commit that adopts scoped queries.
+RLS_TABLES: tuple[str, ...] = ()
+
+
+def rls_policy_sql(table: str) -> list[str]:
+    """DDL enabling fail-closed family isolation on a root content table.
+
+    current_setting(..., true) returns NULL (not an error) when the GUC is
+    unset → no branch matches → zero rows. FORCE subjects even the table
+    owner to the policy, so the app's role cannot silently bypass it.
+    """
+    predicate = (
+        "((family_id IS NULL AND owner_id::text = current_setting('app.user_id', true)) "
+        "OR (family_id IS NOT NULL AND family_id::text = current_setting('app.family_id', true)))"
+    )
+    return [
+        f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY",
+        f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY",
+        f"CREATE POLICY {table}_family_isolation ON {table} "
+        f"USING {predicate} WITH CHECK {predicate}",
+    ]
+
+
+@asynccontextmanager
+async def scoped_connection(pool, capability: Capability):
+    """asyncpg connection inside a transaction with the RLS GUCs set.
+
+    SET LOCAL via set_config(..., true): transaction-scoped, auto-reverts on
+    commit/rollback — never leaks across pooled connections. All legacy
+    raw-SQL module queries must run through this from phase 2 on.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT set_config('app.user_id', $1, true), set_config('app.family_id', $2, true)",
+                str(capability.user_id),
+                str(capability.family_id) if capability.family_id else "",
+            )
+            yield conn
+
+
+async def assert_rls_enforced(pool) -> None:
+    """Startup self-check: abort boot if any registered table lost FORCE RLS."""
+    if not RLS_TABLES:
+        return
+    rows = await pool.fetch(
+        "SELECT c.relname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relname = ANY($1::text[]) "
+        "AND NOT c.relforcerowsecurity",
+        list(RLS_TABLES),
+    )
+    if rows:
+        missing = ", ".join(r["relname"] for r in rows)
+        raise RuntimeError(f"FORCE ROW LEVEL SECURITY missing on: {missing} — refusing to start")

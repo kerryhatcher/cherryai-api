@@ -9,12 +9,14 @@ pool in db.py and will be rewritten opportunistically.
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import Session as _SyncSession
 
 from cherryai_api.settings import get_settings
 
@@ -49,3 +51,20 @@ async def get_async_session() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency yielding one AsyncSession per request."""
     async with async_session_maker() as session:
         yield session
+
+
+@event.listens_for(_SyncSession, "after_begin")
+def _set_rls_gucs(session, transaction, connection) -> None:
+    """Stamp RLS GUCs on every ORM transaction from the request ContextVars.
+
+    Import inside the handler to avoid an orm↔family_context import cycle at
+    module load.
+    """
+    from cherryai_api.family_context import active_family_var, current_user_var
+
+    user_id = current_user_var.get()
+    family_id = active_family_var.get()
+    connection.execute(
+        text("SELECT set_config('app.user_id', :u, true), set_config('app.family_id', :f, true)"),
+        {"u": str(user_id) if user_id else "", "f": str(family_id) if family_id else ""},
+    )

@@ -20,6 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users_app, require_chat
+from cherryai_api.authz import assert_rls_enforced
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
@@ -179,6 +180,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await asyncio.to_thread(run_migrations_to_head)
     database = build_database()
     await database.connect()
+    await assert_rls_enforced(database.pool)
     # Kept solely for the workflow runtime, which is a workspace-level
     # background pipeline not tied to a requesting user. Per-request chat
     # traffic builds its own memory in send_message.
