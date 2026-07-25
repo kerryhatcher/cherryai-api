@@ -26,6 +26,7 @@ from cherryai_api.db import build_database, make_session_title
 from cherryai_api.db_migrations import run_migrations_to_head
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
+from cherryai_api.family_context import FamilyContextMiddleware
 from cherryai_api.feedback import router as feedback_router
 from cherryai_api.frontend_errors import (
     FRONTEND_ERROR_RETENTION_DAYS,
@@ -206,6 +207,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="CherryAI API", lifespan=lifespan)
+app.add_middleware(FamilyContextMiddleware)
 # Must stay at module scope, before the app ever serves an ASGI scope. Moving
 # this into the lifespan silently disables all HTTP span collection — Starlette
 # caches its middleware stack during the "lifespan" scope, before the lifespan
