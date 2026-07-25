@@ -3,6 +3,7 @@
 import uuid
 
 import pytest
+from sqlalchemy import text
 
 from cherryai_api.authz import get_capability
 from cherryai_api.families import (
@@ -99,3 +100,46 @@ async def test_organizer_capability(pool):
         cap = await get_capability(user=org, session=session)
         assert cap.has("family:own") and cap.has("family:manage")
         assert cap.has("wiki:read:adult") and cap.has("email")
+
+
+async def _current_guc(session, name: str) -> str:
+    row = (await session.execute(text("SELECT current_setting(:n, true)"), {"n": name})).scalar()
+    return row or ""
+
+
+@pytest.mark.asyncio
+async def test_bogus_active_family_does_not_leak_into_guc(pool):
+    """The ORM's after_begin GUC listener stamps app.family_id straight from
+    the request's active_family_var when a transaction begins — which
+    typically happens before get_capability has validated that id against
+    the caller's memberships. get_capability must restamp the
+    already-open transaction with the validated value once it knows better,
+    not leave the unvalidated/bogus request id sitting in the GUC."""
+    async with async_session_maker() as session:
+        org, kid, fam = await _fixture(session)
+        # A transaction begun (and GUC-stamped by the listener) before
+        # validation, using a family id that is not one of org's memberships
+        # — exactly the "request input, unvalidated" state the listener sees.
+        bogus = uuid.uuid4()
+        await session.execute(
+            text(
+                "SELECT set_config('app.user_id', :u, true), set_config('app.family_id', :f, true)"
+            ),
+            {"u": "", "f": str(bogus)},
+        )
+        active_family_var.set(bogus)
+        cap = await get_capability(user=org, session=session)
+        assert cap.family_id is None  # fell back to personal (spec §7)
+        assert await _current_guc(session, "app.family_id") == ""
+        assert await _current_guc(session, "app.user_id") == str(org.id)
+
+
+@pytest.mark.asyncio
+async def test_valid_active_family_restamps_guc(pool):
+    async with async_session_maker() as session:
+        org, kid, fam = await _fixture(session)
+        active_family_var.set(fam.id)
+        cap = await get_capability(user=org, session=session)
+        assert cap.family_id == fam.id
+        assert await _current_guc(session, "app.family_id") == str(fam.id)
+        assert await _current_guc(session, "app.user_id") == str(org.id)

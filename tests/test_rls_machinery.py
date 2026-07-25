@@ -136,3 +136,20 @@ async def test_unscoped_connection_sees_nothing(unprivileged_pool, scratch_table
 @pytest.mark.asyncio
 async def test_assert_rls_enforced_passes_on_empty_registry(pool):
     await assert_rls_enforced(pool)  # RLS_TABLES is () in phase 1
+
+
+@pytest.mark.asyncio
+async def test_assert_rls_enforced_catches_disable_row_level_security(
+    pool, scratch_table, monkeypatch
+):
+    """DISABLE ROW LEVEL SECURITY clears relrowsecurity but leaves the FORCE
+    bit set — a predicate that only checks relforcerowsecurity would miss it.
+    """
+    import cherryai_api.authz as authz_module
+
+    monkeypatch.setattr(authz_module, "RLS_TABLES", (scratch_table,))
+    await assert_rls_enforced(pool)  # policies applied by the fixture → passes
+
+    await pool.execute(f"ALTER TABLE {scratch_table} DISABLE ROW LEVEL SECURITY")
+    with pytest.raises(RuntimeError, match=scratch_table):
+        await assert_rls_enforced(pool)

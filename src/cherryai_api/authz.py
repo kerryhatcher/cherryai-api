@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cherryai_api.auth import current_verified_user
@@ -109,6 +109,7 @@ async def get_capability(
     active = next((m for m in rows if m.family_id == requested), None)
     if active is None:
         active_family_var.set(None)  # stale/invalid → personal (spec §7)
+        await _restamp_gucs(session, user_id=user.id, family_id=None)
         return Capability(
             user_id=user.id,
             family_id=None,
@@ -126,6 +127,7 @@ async def get_capability(
         "meals": active.perm_meals,
         "planner": active.perm_planner,
     }
+    await _restamp_gucs(session, user_id=user.id, family_id=active.family_id)
     return Capability(
         user_id=user.id,
         family_id=active.family_id,
@@ -137,6 +139,27 @@ async def get_capability(
             web_enabled=web_enabled,
             is_child_anywhere=is_child_anywhere,
         ),
+    )
+
+
+async def _restamp_gucs(
+    session: AsyncSession, *, user_id: uuid.UUID, family_id: uuid.UUID | None
+) -> None:
+    """Re-stamp the session's already-open transaction with validated GUCs.
+
+    The ORM ``after_begin`` listener (orm.py) stamps GUCs from the request
+    ContextVars when the transaction *begins* — which for most requests is
+    during fastapi-users' token lookup, well before this function has
+    validated ``active_family_var`` against the caller's memberships. A
+    ContextVar update after that point can't reach an already-open
+    transaction, so without this explicit restamp a bogus/unauthorized
+    family id from the request would sit in ``app.family_id`` for the whole
+    request. This runs after validation, on the same session, so it always
+    reflects the resolved Capability rather than raw request input.
+    """
+    await session.execute(
+        text("SELECT set_config('app.user_id', :u, true), set_config('app.family_id', :f, true)"),
+        {"u": str(user_id), "f": str(family_id) if family_id else ""},
     )
 
 
@@ -240,7 +263,7 @@ async def assert_rls_enforced(pool) -> None:
         "SELECT c.relname FROM pg_class c "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = 'public' AND c.relname = ANY($1::text[]) "
-        "AND NOT c.relforcerowsecurity",
+        "AND NOT (c.relrowsecurity AND c.relforcerowsecurity)",
         list(RLS_TABLES),
     )
     if rows:
