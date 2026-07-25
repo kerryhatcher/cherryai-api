@@ -26,12 +26,16 @@ from cherryai_api.db import build_database, make_session_title
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
 from cherryai_api.feedback import router as feedback_router
-from cherryai_api.frontend_errors import FrontendError
+from cherryai_api.frontend_errors import (
+    FRONTEND_ERROR_RETENTION_DAYS,
+    FrontendError,
+    prune_frontend_errors,
+)
 from cherryai_api.integrations import router as integrations_router
 from cherryai_api.logging_setup import setup_file_logging
 from cherryai_api.meals import router as meals_router
 from cherryai_api.memory import build_memory
-from cherryai_api.orm import get_async_session
+from cherryai_api.orm import async_session_maker, get_async_session
 from cherryai_api.planner import router as planner_router
 from cherryai_api.settings import get_settings
 from cherryai_api.telemetry import setup_telemetry
@@ -127,6 +131,38 @@ class LogErrorRequest(BaseModel):
         return value[:_MAX_CONTEXT_LEN] if value is not None else None
 
 
+# How often the background prune loop below wakes up. DO App Platform's job
+# kinds (PRE_DEPLOY / POST_DEPLOY / FAILED_DEPLOY) have no scheduled/cron
+# option, and the API runs with instance_count: 1, so an in-process asyncio
+# loop is the retention mechanism rather than an external scheduler. The
+# retention window itself lives in `FRONTEND_ERROR_RETENTION_DAYS`
+# (frontend_errors.py) — not duplicated here.
+_FRONTEND_ERROR_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _prune_frontend_errors_periodically() -> None:
+    """Delete old `frontend_errors` rows once at startup, then roughly daily, forever.
+
+    Runs as a long-lived background task for the life of the process (see
+    `lifespan`), which cancels it on shutdown. Each pass opens its own
+    session rather than sharing one across the whole task lifetime, and is
+    wrapped in a broad except: a prune failure (e.g. a transient database
+    blip) must never crash the process — matching how `log_error` already
+    tolerates database failure. It simply logs and tries again next tick.
+    """
+    while True:
+        try:
+            async with async_session_maker() as session:
+                deleted = await prune_frontend_errors(session)
+            logger.info(
+                f"Pruned {deleted} frontend_errors row(s) older than "
+                f"{FRONTEND_ERROR_RETENTION_DAYS}d"
+            )
+        except Exception as exc:
+            logger.warning(f"Frontend error prune pass failed: {exc}")
+        await asyncio.sleep(_FRONTEND_ERROR_PRUNE_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Open the database pool and build the agent once per process."""
@@ -151,10 +187,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         app.state.fact_extractor_agent = None
         app.state.fact_judge_agent = None
+    prune_task = asyncio.create_task(_prune_frontend_errors_periodically())
     logger.info("CherryAI API started")
     try:
         yield
     finally:
+        prune_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prune_task
         await database.close()
         logger.info("CherryAI API stopped")
 

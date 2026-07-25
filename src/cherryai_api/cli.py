@@ -7,6 +7,14 @@ import uuid
 
 import typer
 
+# Only a lightweight constant, not the rest of `cherryai_api` (unlike every
+# other command below, which imports lazily inside its function body to keep
+# `cherryai --help` fast) — Typer needs the real default at decoration time
+# so `--help` can display it, and importing it doesn't pull in anything
+# heavier than `cherryai_api.orm` (which builds a `create_async_engine()`
+# object but performs no I/O until first use).
+from cherryai_api.frontend_errors import FRONTEND_ERROR_RETENTION_DAYS
+
 app = typer.Typer(help="CherryAI API management commands.", no_args_is_help=True)
 sessions_app = typer.Typer(help="Inspect chat sessions.")
 app.add_typer(sessions_app, name="sessions")
@@ -500,6 +508,29 @@ def errors_show(error_id: str) -> None:
     if error.stack:
         typer.echo("stack:")
         typer.echo(error.stack)
+
+
+@errors_app.command("prune")
+def errors_prune(
+    days: int = typer.Option(
+        FRONTEND_ERROR_RETENTION_DAYS,
+        "--days",
+        help="Delete reports older than this many days.",
+    ),
+) -> None:
+    """Delete frontend error reports older than the retention window.
+
+    The API also runs this automatically roughly once a day (see the
+    lifespan in api.py); this command is for on-demand manual cleanup, e.g.
+    to reclaim space immediately after lowering the retention window.
+    """
+    from cherryai_api.frontend_errors import prune_frontend_errors
+
+    async def _do(session):
+        return await prune_frontend_errors(session, retention_days=days)
+
+    deleted = _run_with_session(_do)
+    typer.echo(f"Deleted {deleted} frontend error report(s) older than {days} day(s).")
 
 
 def main() -> None:

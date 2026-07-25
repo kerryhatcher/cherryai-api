@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from typer.testing import CliRunner
 
@@ -227,3 +228,72 @@ def test_errors_show_invalid_id(pool):
     result = CliRunner().invoke(app, ["errors", "show", "not-a-uuid"])
 
     assert result.exit_code == 1
+
+
+def _count_older_than(days: int) -> int:
+    """Rows the prune is about to delete, including any not inserted by this test.
+
+    `prune_frontend_errors` deletes by age alone — it has no `Ztest` message
+    filter — so a database holding real reports older than the window makes
+    any hardcoded expected count wrong. Row-count assertions are stated
+    relative to this baseline instead.
+    """
+    from sqlalchemy import func, select
+
+    async def _do():
+        try:
+            cutoff = datetime.now(UTC) - timedelta(days=days)
+            async with async_session_maker() as session:
+                return await session.scalar(
+                    select(func.count())
+                    .select_from(FrontendError)
+                    .where(FrontendError.created_at < cutoff)
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_do())
+
+
+def test_errors_prune_deletes_old_rows_and_reports_count(pool):
+    baseline = _count_older_than(14)
+    old_id = _insert_error(
+        message="Ztest prune old", created_at=datetime.now(UTC) - timedelta(days=30)
+    )
+    kept_id = _insert_error(
+        message="Ztest prune keep", created_at=datetime.now(UTC) - timedelta(days=1)
+    )
+
+    result = CliRunner().invoke(app, ["errors", "prune", "--days", "14"])
+
+    assert result.exit_code == 0
+    assert f"Deleted {baseline + 1} frontend error report(s) older than 14 day(s)." in result.stdout
+
+    show_old = CliRunner().invoke(app, ["errors", "show", str(old_id)])
+    assert show_old.exit_code == 1
+    show_kept = CliRunner().invoke(app, ["errors", "show", str(kept_id)])
+    assert show_kept.exit_code == 0
+
+
+def test_errors_prune_defaults_to_14_days(pool):
+    """Bare invocation (no `--days`) uses the shared retention constant."""
+    old_id = _insert_error(
+        message="Ztest prune default", created_at=datetime.now(UTC) - timedelta(days=15)
+    )
+
+    result = CliRunner().invoke(app, ["errors", "prune"])
+
+    assert result.exit_code == 0
+    assert "older than 14 day(s)" in result.stdout
+    show_old = CliRunner().invoke(app, ["errors", "show", str(old_id)])
+    assert show_old.exit_code == 1
+
+
+def test_errors_prune_with_no_matching_rows(pool):
+    """A second prune with the same window is a no-op — nothing is left to delete."""
+    CliRunner().invoke(app, ["errors", "prune", "--days", "14"])
+
+    result = CliRunner().invoke(app, ["errors", "prune", "--days", "14"])
+
+    assert result.exit_code == 0
+    assert "Deleted 0 frontend error report(s)" in result.stdout

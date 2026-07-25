@@ -7,12 +7,19 @@ since the container filesystem is ephemeral) with a Postgres table.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import DateTime, Index, Integer, String, Text, func, text
+from sqlalchemy import DateTime, Index, Integer, String, Text, delete, func, text
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from cherryai_api.orm import Base
+
+# How long a frontend error report is kept before `prune_frontend_errors`
+# deletes it. One constant shared by the periodic in-process prune (see
+# `api.py`'s lifespan) and the `cherryai errors prune` CLI command, so the
+# retention window can never drift between the two call sites.
+FRONTEND_ERROR_RETENTION_DAYS = 14
 
 
 class FrontendError(Base):
@@ -48,3 +55,18 @@ class FrontendError(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+async def prune_frontend_errors(
+    session: AsyncSession, retention_days: int = FRONTEND_ERROR_RETENTION_DAYS
+) -> int:
+    """Delete ``frontend_errors`` rows older than ``retention_days`` and return the count.
+
+    Shared by the periodic in-process prune in `api.py`'s lifespan and the
+    `cherryai errors prune` CLI command — both pass through here rather than
+    each building their own DELETE, so the two call sites cannot drift.
+    """
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    result = await session.execute(delete(FrontendError).where(FrontendError.created_at < cutoff))
+    await session.commit()
+    return result.rowcount

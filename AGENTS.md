@@ -118,7 +118,12 @@ cherryai errors list
 
 ### Retention and cleanup
 
-Retention/cleanup for the `frontend_errors` table is an **unresolved open question** — the table grows without bound. However, requiring authentication means the write rate is now bounded by the verified user count rather than by the open internet. A future cleanup policy should consider: log retention period (e.g., 30/60/90 days), archival strategy, and automated deletion of old rows.
+Reports are kept for **14 days**, set in the `FRONTEND_ERROR_RETENTION_DAYS` constant in `src/cherryai_api/frontend_errors.py`. Both cleanup paths below call the same `prune_frontend_errors(session, retention_days=...)` function, so the window can't drift between them:
+
+- **Automatic:** the FastAPI `lifespan` in `src/cherryai_api/api.py` starts a background asyncio task on startup that prunes once immediately, then roughly every 24 hours for the life of the process. DO App Platform has no scheduled/cron job kind (only PRE_DEPLOY / POST_DEPLOY / FAILED_DEPLOY), and the API runs with `instance_count: 1`, so this in-process loop — not an external scheduler, and deliberately not hung off the PRE_DEPLOY `migrate` job — is the retention mechanism. It's cancelled cleanly on shutdown and never crashes the app: each pass is wrapped in a broad try/except, logging failures via loguru (matching how `log_error` itself tolerates database failure) and simply retrying on the next tick. Each prune pass logs the number of rows deleted at INFO level, visible via `doctl apps logs`.
+- **Manual:** `cherryai errors prune` (optionally `--days N` to override the window) for on-demand cleanup, e.g. immediately after lowering the retention window.
+
+The retention period and prune interval are plain module constants rather than `Settings` fields — changing either is a deliberate, infrequent decision that should go through a code review and redeploy, not a runtime toggle. The tradeoff: changing the window requires a redeploy rather than an env var flip.
 
 ## GitHub Actions
 
