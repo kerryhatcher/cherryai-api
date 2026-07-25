@@ -63,22 +63,20 @@ services:
         type: SECRET
         scope: RUN_TIME
 
-jobs:
-  - name: migrate
-    kind: PRE_DEPLOY
-    github:
-      repo: kerryhatcher/cherryai-api
-      branch: main
-      deploy_on_push: false
-    source_dir: /
-    dockerfile_path: Dockerfile
-    instance_count: 1
-    instance_size_slug: basic-xxs
-    run_command: uv run python3 scripts/ensure_pgvector.py && uv run alembic upgrade head && uv run cherryai users bootstrap
-    envs:
-      - key: DATABASE_URL
-        type: SECRET
-      - key: CHERRYAI_ADMIN_EMAIL
-        type: SECRET
-      - key: CHERRYAI_ADMIN_PASSWORD
-        type: SECRET
+# No jobs. There used to be a `migrate` PRE_DEPLOY job running
+# `ensure_pgvector.py && alembic upgrade head && cherryai users bootstrap`.
+# It reported SUCCESS on every deployment without ever executing its
+# run_command — proven by rolling production back to revision 0003 and
+# redeploying twice (it stayed on 0003 while the image demonstrably
+# contained 0004/0005), including once with its DATABASE_URL replaced by a
+# known-good value. It emitted zero log bytes on every deployment.
+#
+# Migrations now run in-process at API startup instead — see
+# src/cherryai_api/db_migrations.py, called from api.py's lifespan before
+# the connection pool opens. A failed migration fails startup by design.
+#
+# The job's other two steps were one-time bootstrap, not per-deploy work,
+# and are now manual for a NEW environment (both are already done in the
+# current production database):
+#   uv run python3 scripts/ensure_pgvector.py   # CREATE EXTENSION vector
+#   uv run cherryai users bootstrap             # seed the admin account
