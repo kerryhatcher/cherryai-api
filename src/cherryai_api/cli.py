@@ -662,7 +662,7 @@ def families_add_member(family_id: uuid.UUID, email: str, role: str = typer.Opti
         raise typer.Exit(2)
 
     async def run() -> None:
-        from cherryai_api.families import add_member
+        from cherryai_api.families import AlreadyMemberError, add_member
         from cherryai_api.orm import async_session_maker
 
         async with async_session_maker() as session:
@@ -671,6 +671,9 @@ def families_add_member(family_id: uuid.UUID, email: str, role: str = typer.Opti
                 typer.echo(f"added {email} as {membership.role} id={membership.id}")
             except LookupError as err:
                 typer.echo(f"no such user: {email}", err=True)
+                raise typer.Exit(1) from err
+            except AlreadyMemberError as err:
+                typer.echo(f"{email} is already a member of this family", err=True)
                 raise typer.Exit(1) from err
 
     asyncio.run(run())

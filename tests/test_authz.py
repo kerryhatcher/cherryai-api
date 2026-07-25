@@ -3,7 +3,15 @@
 import itertools
 import uuid
 
-from cherryai_api.authz import MODULES, SCOPE_ADULT_WIKI, Capability, build_scopes
+import pytest
+
+from cherryai_api.authz import (
+    MODULES,
+    SCOPE_ADULT_WIKI,
+    Capability,
+    build_scopes,
+    require_permission,
+)
 from cherryai_api.families import (
     FAMILY_ROLE_ADMIN,
     FAMILY_ROLE_ADULT,
@@ -80,3 +88,8 @@ def test_gates_control_chat_and_web():
 def test_capability_has():
     cap = Capability(uuid.uuid4(), None, None, frozenset({"wiki:read"}))
     assert cap.has("wiki:read") and not cap.has("wiki:write")
+
+
+def test_require_permission_rejects_invalid_level():
+    with pytest.raises(ValueError, match="level must be one of"):
+        require_permission("wiki", "banana")

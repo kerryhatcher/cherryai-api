@@ -196,6 +196,54 @@ async def test_families_add_member_happy_path(pool):
 
 
 @pytest.mark.asyncio
+async def test_families_add_member_duplicate_rejected(pool):
+    """Re-adding a member who's already in the family exits non-zero with a
+    clear message instead of crashing on the uq_membership_family_user
+    IntegrityError."""
+    organizer_email = f"ztest-{uuid.uuid4().hex[:8]}@example.com"
+    member_email = f"ztest-{uuid.uuid4().hex[:8]}@example.com"
+    async with async_session_maker() as session:
+        await _mk_user(session, organizer_email)
+        await _mk_user(session, member_email)
+        await session.commit()
+
+    created = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cherryai_api.cli",
+            "families",
+            "create",
+            "Ztest Dup Member",
+            "--organizer-email",
+            organizer_email,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0
+    fam_id = created.stdout.strip().split()[-1].split("=")[-1]
+
+    add_args = [
+        sys.executable,
+        "-m",
+        "cherryai_api.cli",
+        "families",
+        "add-member",
+        fam_id,
+        member_email,
+        "--role",
+        "adult",
+    ]
+    first = subprocess.run(add_args, capture_output=True, text=True)
+    assert first.returncode == 0, f"add-member failed: {first.stderr}"
+
+    second = subprocess.run(add_args, capture_output=True, text=True)
+    assert second.returncode != 0
+    assert "already a member" in second.stderr
+
+
+@pytest.mark.asyncio
 async def test_families_transfer_validates_target_role(pool):
     """Test transfer rejects non-admin targets."""
     from sqlalchemy import select

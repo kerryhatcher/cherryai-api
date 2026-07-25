@@ -163,6 +163,23 @@ async def test_admin_cannot_delete_admin(admin_caller):
     assert r.json()["detail"]["code"] == "family_permission_denied"
 
 
+async def test_add_member_duplicate_returns_409(org_and_family):
+    """Re-adding an already-present member violates uq_membership_family_user
+    at the DB level; the route must map that to a 409, not a 500."""
+    client, fam_id, org, other = org_and_family
+    r = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    assert r.status_code == 201
+    r2 = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["code"] == "already_member"
+
+
 async def test_add_member_unknown_email_404(org_and_family):
     client, fam_id, org, other = org_and_family
     r = await client.post(

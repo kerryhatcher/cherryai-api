@@ -35,7 +35,6 @@ from cherryai_api.settings import get_settings
 
 UID_A, UID_B, FAM_A, FAM_B = (uuid.uuid4() for _ in range(4))
 
-_RLS_TEST_ROLE = "ztest_rls_user"
 _RLS_TEST_PASSWORD = "ztest-rls"
 
 
@@ -43,14 +42,14 @@ def cap(user, family=None):
     return Capability(user, family, None, frozenset())
 
 
-def _unprivileged_dsn() -> str:
+def _unprivileged_dsn(role: str) -> str:
     """The app's DSN with credentials swapped for the temp test role.
 
     ``asyncpg_dsn``, not ``database_url``: asyncpg rejects the
     ``postgresql+asyncpg://`` scheme the raw settings field may carry.
     """
     parts = urlsplit(get_settings().asyncpg_dsn)
-    netloc = f"{_RLS_TEST_ROLE}:{_RLS_TEST_PASSWORD}@{parts.hostname}"
+    netloc = f"{role}:{_RLS_TEST_PASSWORD}@{parts.hostname}"
     if parts.port:
         netloc += f":{parts.port}"
     return urlunsplit(parts._replace(netloc=netloc))
@@ -85,23 +84,24 @@ async def scratch_table(pool):
 async def unprivileged_pool(pool, scratch_table):
     """A temp non-superuser/non-BYPASSRLS role, scoped to this test's table.
 
-    Built via the shared superuser `pool` (idempotent create, then teardown
-    via DROP OWNED BY + DROP ROLE) so RLS behavior is observable at all --
-    see the module docstring for why the shared `pool` itself can't show it.
+    Built via the shared superuser `pool` (create, then teardown via DROP
+    OWNED BY + DROP ROLE) so RLS behavior is observable at all -- see the
+    module docstring for why the shared `pool` itself can't show it. The role
+    name is unique per invocation (multiple worktrees share this dev DB) so
+    concurrent test runs never collide on a fixed name.
     """
-    await pool.execute(f"DROP ROLE IF EXISTS {_RLS_TEST_ROLE}")
+    role = f"ztest_rls_{uuid.uuid4().hex[:8]}"
     await pool.execute(
-        f"CREATE ROLE {_RLS_TEST_ROLE} LOGIN PASSWORD '{_RLS_TEST_PASSWORD}' "
-        "NOSUPERUSER NOBYPASSRLS"
+        f"CREATE ROLE {role} LOGIN PASSWORD '{_RLS_TEST_PASSWORD}' NOSUPERUSER NOBYPASSRLS"
     )
-    await pool.execute(f"GRANT SELECT, INSERT ON {scratch_table} TO {_RLS_TEST_ROLE}")
-    temp_pool = await asyncpg.create_pool(_unprivileged_dsn(), min_size=1, max_size=2)
+    await pool.execute(f"GRANT SELECT, INSERT ON {scratch_table} TO {role}")
+    temp_pool = await asyncpg.create_pool(_unprivileged_dsn(role), min_size=1, max_size=2)
     try:
         yield temp_pool
     finally:
         await temp_pool.close()
-        await pool.execute(f"DROP OWNED BY {_RLS_TEST_ROLE}")
-        await pool.execute(f"DROP ROLE {_RLS_TEST_ROLE}")
+        await pool.execute(f"DROP OWNED BY {role}")
+        await pool.execute(f"DROP ROLE {role}")
 
 
 @pytest.mark.asyncio
@@ -152,4 +152,18 @@ async def test_assert_rls_enforced_catches_disable_row_level_security(
 
     await pool.execute(f"ALTER TABLE {scratch_table} DISABLE ROW LEVEL SECURITY")
     with pytest.raises(RuntimeError, match=scratch_table):
+        await assert_rls_enforced(pool)
+
+
+@pytest.mark.asyncio
+async def test_assert_rls_enforced_catches_table_missing_from_database(pool, monkeypatch):
+    """A typo'd registry name (or a migration that never ran) means the table
+    has no pg_class row at all. The old query only ever looked for rows that
+    exist-but-are-unenforced, so a wholly absent table matched nothing and
+    boot proceeded silently -- this must fail loudly instead."""
+    import cherryai_api.authz as authz_module
+
+    bogus_table = f"ztest_nonexistent_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(authz_module, "RLS_TABLES", (bogus_table,))
+    with pytest.raises(RuntimeError, match=bogus_table):
         await assert_rls_enforced(pool)

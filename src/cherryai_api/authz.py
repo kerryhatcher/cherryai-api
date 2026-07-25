@@ -23,7 +23,7 @@ from cherryai_api.families import (
     PERM_VIEW,
     FamilyMembership,
 )
-from cherryai_api.family_context import active_family_var, current_user_var
+from cherryai_api.family_context import active_family_var, current_user_var, validated_family_var
 from cherryai_api.orm import get_async_session
 from cherryai_api.users import User
 
@@ -42,6 +42,7 @@ class Capability:
     scopes: frozenset[str]
 
     def has(self, scope: str) -> bool:
+        """Return whether this capability includes ``scope``."""
         return scope in self.scopes
 
 
@@ -109,6 +110,7 @@ async def get_capability(
     active = next((m for m in rows if m.family_id == requested), None)
     if active is None:
         active_family_var.set(None)  # stale/invalid → personal (spec §7)
+        validated_family_var.set(None)
         await _restamp_gucs(session, user_id=user.id, family_id=None)
         return Capability(
             user_id=user.id,
@@ -127,6 +129,7 @@ async def get_capability(
         "meals": active.perm_meals,
         "planner": active.perm_planner,
     }
+    validated_family_var.set(active.family_id)
     await _restamp_gucs(session, user_id=user.id, family_id=active.family_id)
     return Capability(
         user_id=user.id,
@@ -164,7 +167,13 @@ async def _restamp_gucs(
 
 
 def require_permission(module: str, level: str = "view"):
-    """Endpoint guard: 403 with a stable code unless the scope is held."""
+    """Endpoint guard: 403 with a stable code unless the scope is held.
+
+    Validates ``level`` immediately so a typo'd level fails at route
+    definition/import time, not on the first request that hits it.
+    """
+    if level not in _LEVEL_SCOPE:
+        raise ValueError(f"level must be one of {tuple(_LEVEL_SCOPE)}")
     scope = f"{module}:{_LEVEL_SCOPE[level]}"
 
     async def dependency(
@@ -256,16 +265,25 @@ async def scoped_connection(pool, capability: Capability):
 
 
 async def assert_rls_enforced(pool) -> None:
-    """Startup self-check: abort boot if any registered table lost FORCE RLS."""
+    """Startup self-check: abort boot if any registered table lost FORCE RLS.
+
+    Computes the set of registered tables that ARE present with RLS enabled
+    and forced, then diffs RLS_TABLES against it -- rather than filtering for
+    unenforced rows -- so a typo'd table name or an unrun migration (no
+    pg_class row at all) shows up as missing too, instead of silently
+    matching zero rows and letting boot proceed.
+    """
     if not RLS_TABLES:
         return
     rows = await pool.fetch(
         "SELECT c.relname FROM pg_class c "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = 'public' AND c.relname = ANY($1::text[]) "
-        "AND NOT (c.relrowsecurity AND c.relforcerowsecurity)",
+        "AND c.relrowsecurity AND c.relforcerowsecurity",
         list(RLS_TABLES),
     )
-    if rows:
-        missing = ", ".join(r["relname"] for r in rows)
-        raise RuntimeError(f"FORCE ROW LEVEL SECURITY missing on: {missing} — refusing to start")
+    enforced = {r["relname"] for r in rows}
+    missing_or_unenforced = set(RLS_TABLES) - enforced
+    if missing_or_unenforced:
+        names = ", ".join(sorted(missing_or_unenforced))
+        raise RuntimeError(f"FORCE ROW LEVEL SECURITY missing on: {names} — refusing to start")

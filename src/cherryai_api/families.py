@@ -26,6 +26,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -55,6 +56,8 @@ DEFAULT_PERMS = {FAMILY_ROLE_ADULT: PERM_EDIT, FAMILY_ROLE_CHILD: PERM_NONE}
 
 
 class Family(Base):
+    """An org-like group that owns shared wiki/meals/planner content."""
+
     __tablename__ = "families"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -65,6 +68,8 @@ class Family(Base):
 
 
 class FamilyMembership(Base):
+    """One user's role and per-module permissions within one family."""
+
     __tablename__ = "family_memberships"
     __table_args__ = (
         UniqueConstraint("family_id", "user_id", name="uq_membership_family_user"),
@@ -98,7 +103,12 @@ class FamilyMembership(Base):
 # ---------- service layer (shared by routes and CLI) ----------
 
 
+class AlreadyMemberError(Exception):
+    """Raised by add_member when the user already has a membership in the family."""
+
+
 async def create_family(session: AsyncSession, *, name: str, organizer_id: uuid.UUID) -> Family:
+    """Create a family and add ``organizer_id`` as its organizer."""
     family = Family(name=name)
     session.add(family)
     await session.flush()
@@ -117,6 +127,7 @@ async def create_family(session: AsyncSession, *, name: str, organizer_id: uuid.
 
 
 async def list_memberships(session: AsyncSession, user_id: uuid.UUID):
+    """Return ``(Family, FamilyMembership)`` pairs for every family the user belongs to."""
     rows = await session.execute(
         select(Family, FamilyMembership)
         .join(FamilyMembership, FamilyMembership.family_id == Family.id)
@@ -129,6 +140,7 @@ async def list_memberships(session: AsyncSession, user_id: uuid.UUID):
 async def get_membership(
     session: AsyncSession, family_id: uuid.UUID, user_id: uuid.UUID
 ) -> FamilyMembership | None:
+    """Return the user's membership in the family, or None if they aren't a member."""
     return (
         await session.execute(
             select(FamilyMembership).where(
@@ -140,6 +152,7 @@ async def get_membership(
 
 
 async def rename_family(session: AsyncSession, family_id: uuid.UUID, name: str) -> None:
+    """Rename a family in place."""
     await session.execute(update(Family).where(Family.id == family_id).values(name=name))
     await session.commit()
 
@@ -190,6 +203,11 @@ async def delete_family(
 async def add_member(
     session: AsyncSession, *, family_id: uuid.UUID, email: str, role: str
 ) -> FamilyMembership:
+    """Add the user with ``email`` to ``family_id`` with ``role`` and default perms.
+
+    Raises ``LookupError`` if no user has that email, or ``AlreadyMemberError``
+    if they already have a membership in the family (uq_membership_family_user).
+    """
     user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
     if user is None:
         raise LookupError(email)
@@ -203,7 +221,11 @@ async def add_member(
         perm_planner=default,
     )
     session.add(membership)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as err:
+        await session.rollback()
+        raise AlreadyMemberError(email) from err
     return membership
 
 
@@ -216,6 +238,7 @@ async def create_child_account(
     password: str,
     email: str | None,
 ) -> FamilyMembership:
+    """Create a new user account for a child and add them as a family member."""
     from cherryai_api.users import UserCreate
 
     # `.local` is an IANA special-use TLD that email-validator (and thus
@@ -252,6 +275,7 @@ async def update_member(
     user_id: uuid.UUID,
     changes: dict,
 ) -> FamilyMembership:
+    """Apply ``changes`` (role/perm/gate fields) to an existing membership."""
     membership = await get_membership(session, family_id, user_id)
     if membership is None:
         raise HTTPException(status_code=404)
@@ -263,6 +287,7 @@ async def update_member(
 
 
 async def remove_member(session: AsyncSession, *, family_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Remove a user's membership from a family."""
     await session.execute(
         delete(FamilyMembership).where(
             FamilyMembership.family_id == family_id,
@@ -314,40 +339,56 @@ families_router = APIRouter(prefix="/api/families", tags=["families"])
 
 
 class FamilyCreate(BaseModel):
+    """Body for creating a family."""
+
     name: str
 
 
 class FamilyRename(BaseModel):
+    """Body for renaming a family."""
+
     name: str
 
 
 class FamilyDelete(BaseModel):
+    """Body for deleting a family; requires typing the name back to confirm."""
+
     confirm_name: str
     content: str  # 'delete' | 'keep_personal'
 
 
 class ActiveFamily(BaseModel):
+    """Body for switching (or clearing, with ``None``) the active family."""
+
     family_id: uuid.UUID | None
 
 
 class MembershipOut(BaseModel):
+    """A family the caller belongs to, with their role in it."""
+
     id: uuid.UUID
     name: str
     role: str
 
 
 class MemberAdd(BaseModel):
+    """Body for adding an existing user to a family by email."""
+
     email: str
     role: str
 
 
 class ChildCreate(BaseModel):
+    """Body for creating a new child account within a family."""
+
     display_name: str
     password: str
     email: EmailStr | None = None
 
 
 class MemberPatch(BaseModel):
+    """Partial update to a membership's role, permissions, or gates."""
+
     model_config = ConfigDict(extra="forbid")
 
     role: Literal[FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD] | None = None
@@ -359,10 +400,14 @@ class MemberPatch(BaseModel):
 
 
 class TransferBody(BaseModel):
+    """Body for transferring the organizer role to an existing admin."""
+
     user_id: uuid.UUID
 
 
 class MemberOut(BaseModel):
+    """A family member's role and per-module permissions/gates."""
+
     user_id: uuid.UUID
     role: str
     perm_wiki: str
@@ -391,6 +436,7 @@ async def list_my_families(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """List every family the caller belongs to, with their role in each."""
     return [
         MembershipOut(id=family.id, name=family.name, role=m.role)
         for family, m in await list_memberships(session, user.id)
@@ -403,6 +449,7 @@ async def create_family_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Create a family with the caller as its organizer."""
     family = await create_family(session, name=payload.name, organizer_id=user.id)
     return MembershipOut(id=family.id, name=family.name, role=FAMILY_ROLE_ORGANIZER)
 
@@ -414,6 +461,7 @@ async def set_active_family(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Switch the caller's active family (or clear it, back to personal)."""
     if payload.family_id is None:
         response.delete_cookie(ACTIVE_FAMILY_COOKIE)
         return
@@ -438,6 +486,7 @@ async def rename_family_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Rename a family (organizer only)."""
     await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER,))
     await rename_family(session, family_id, payload.name)
     return {"id": str(family_id), "name": payload.name}
@@ -450,6 +499,7 @@ async def delete_family_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Delete a family (organizer only), after confirming its name."""
     await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER,))
     family = (await session.execute(select(Family).where(Family.id == family_id))).scalar_one()
     if payload.confirm_name != family.name:
@@ -465,6 +515,7 @@ async def list_members_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """List every member of a family (any member may view)."""
     await _require_role(
         session,
         family_id,
@@ -490,6 +541,7 @@ async def add_member_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Add an existing user to a family by email (organizer/admin only)."""
     caller = await _require_role(
         session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
     )
@@ -506,6 +558,8 @@ async def add_member_route(
         )
     except LookupError as err:
         raise HTTPException(status_code=404, detail={"code": "no_such_user"}) from err
+    except AlreadyMemberError as err:
+        raise HTTPException(status_code=409, detail={"code": "already_member"}) from err
     return MemberOut.model_validate(membership, from_attributes=True)
 
 
@@ -517,6 +571,7 @@ async def create_child_route(
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
     user_manager=Depends(get_user_manager),  # noqa: B008
 ):
+    """Create a new child account within a family (organizer/admin only)."""
     await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
     try:
         membership = await create_child_account(
@@ -540,6 +595,7 @@ async def update_member_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Update a member's role, permissions, or gates (organizer/admin only)."""
     caller = await _require_role(
         session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
     )
@@ -570,6 +626,7 @@ async def remove_member_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Remove a member from a family (organizer/admin only)."""
     caller = await _require_role(
         session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
     )
@@ -591,6 +648,7 @@ async def transfer_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
+    """Transfer the organizer role to an existing admin (organizer only)."""
     await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER,))
     target = await get_membership(session, family_id, payload.user_id)
     if target is None:

@@ -21,6 +21,11 @@ ACTIVE_FAMILY_HEADER = "X-CherryAI-Family"
 
 active_family_var: ContextVar[uuid.UUID | None] = ContextVar("active_family", default=None)
 current_user_var: ContextVar[uuid.UUID | None] = ContextVar("current_user", default=None)
+# Set only by authz.get_capability, once it has checked active_family_var
+# against the caller's memberships. The ORM GUC listener (orm.py) reads this
+# one, never active_family_var, so a query that runs without ever calling
+# get_capability can't inherit an attacker-chosen app.family_id.
+validated_family_var: ContextVar[uuid.UUID | None] = ContextVar("validated_family", default=None)
 
 
 def _cookie_value(cookie_header: str, name: str) -> str | None:
@@ -32,6 +37,8 @@ def _cookie_value(cookie_header: str, name: str) -> str | None:
 
 
 class FamilyContextMiddleware:
+    """Parse the active-family id from a header/cookie into request ContextVars."""
+
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
@@ -51,8 +58,10 @@ class FamilyContextMiddleware:
                 family_id = None  # silent fallback to personal (spec §7)
         token_f = active_family_var.set(family_id)
         token_u = current_user_var.set(None)
+        token_v = validated_family_var.set(None)
         try:
             await self.app(scope, receive, send)
         finally:
             active_family_var.reset(token_f)
             current_user_var.reset(token_u)
+            validated_family_var.reset(token_v)
