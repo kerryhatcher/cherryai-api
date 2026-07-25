@@ -154,3 +154,35 @@ def require_permission(module: str, level: str = "view"):
         return capability
 
     return dependency
+
+
+def scope_sql(capability: Capability, *, alias: str = "", start: int = 1) -> tuple[str, list]:
+    """Raw-SQL WHERE fragment limiting rows to the capability's context.
+
+    For the legacy asyncpg queries. Placeholders are numbered from ``start``;
+    append the returned params to the query's argument list in order.
+    """
+    p = f"{alias}." if alias else ""
+    if capability.family_id is None:
+        return f"({p}family_id IS NULL AND {p}owner_id = ${start})", [capability.user_id]
+    return f"({p}family_id = ${start})", [capability.family_id]
+
+
+def wiki_visibility_sql(
+    capability: Capability, *, alias: str = "", start: int = 1
+) -> tuple[str, list]:
+    """scope_sql + the audience predicate (hard invariant #1) for wiki reads."""
+    clause, params = scope_sql(capability, alias=alias, start=start)
+    if capability.family_id is not None and not capability.has(SCOPE_ADULT_WIKI):
+        p = f"{alias}." if alias else ""
+        clause = f"({clause} AND {p}audience = 'family')"
+    return clause, params
+
+
+def scope_clause(model, capability: Capability):
+    """SQLAlchemy predicate for models bearing owner_id/family_id columns."""
+    from sqlalchemy import and_
+
+    if capability.family_id is None:
+        return and_(model.family_id.is_(None), model.owner_id == capability.user_id)
+    return model.family_id == capability.family_id
