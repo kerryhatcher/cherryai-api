@@ -39,7 +39,7 @@ from cherryai_api.memory import build_memory
 from cherryai_api.orm import async_session_maker, get_async_session
 from cherryai_api.planner import router as planner_router
 from cherryai_api.settings import get_settings
-from cherryai_api.telemetry import setup_telemetry
+from cherryai_api.telemetry import configure_telemetry, instrument_dependencies
 from cherryai_api.users import User, UserCreate, UserRead, UserUpdate
 from cherryai_api.wiki import router as wiki_router
 from cherryai_api.workflows import build_workflow_runtime
@@ -169,7 +169,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Open the database pool and build the agent once per process."""
     settings = get_settings()
     setup_file_logging(settings.log_dir)
-    setup_telemetry(app)
+    # FastAPI/ASGI instrumentation is NOT done here — it must happen at import
+    # time or it silently produces no spans. See configure_telemetry's docstring
+    # and its call site below the app definition.
+    instrument_dependencies()
     if settings.run_migrations_on_startup:
         await asyncio.to_thread(run_migrations_to_head)
     database = build_database()
@@ -203,6 +206,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="CherryAI API", lifespan=lifespan)
+# Must stay at module scope, before the app ever serves an ASGI scope. Moving
+# this into the lifespan silently disables all HTTP span collection — Starlette
+# caches its middleware stack during the "lifespan" scope, before the lifespan
+# body runs, so instrumenting from there patches a method that is never called
+# again. No error is raised when this is wrong. See telemetry.configure_telemetry.
+configure_telemetry(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().cors_origin_list,
