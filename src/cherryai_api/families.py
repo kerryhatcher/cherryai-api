@@ -30,7 +30,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from cherryai_api.auth import current_verified_user
 from cherryai_api.family_context import ACTIVE_FAMILY_COOKIE
 from cherryai_api.orm import Base, get_async_session
-from cherryai_api.users import User
+from cherryai_api.users import User, get_user_manager
 
 FAMILY_ROLE_ORGANIZER = "organizer"
 FAMILY_ROLE_ADMIN = "admin"
@@ -185,6 +185,122 @@ async def delete_family(
     await session.commit()
 
 
+async def add_member(
+    session: AsyncSession, *, family_id: uuid.UUID, email: str, role: str
+) -> FamilyMembership:
+    user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
+    if user is None:
+        raise LookupError(email)
+    default = DEFAULT_PERMS.get(role, PERM_EDIT)
+    membership = FamilyMembership(
+        family_id=family_id,
+        user_id=user.id,
+        role=role,
+        perm_wiki=default,
+        perm_meals=default,
+        perm_planner=default,
+    )
+    session.add(membership)
+    await session.commit()
+    return membership
+
+
+async def create_child_account(
+    session: AsyncSession,
+    user_manager,
+    *,
+    family_id: uuid.UUID,
+    display_name: str,
+    password: str,
+    email: str | None,
+) -> FamilyMembership:
+    from cherryai_api.users import UserCreate
+
+    # `.local` is an IANA special-use TLD that email-validator (and thus
+    # fastapi-users' EmailStr field) rejects outright, so the synthetic
+    # address uses `.internal` instead — not deliverable, but not on that
+    # reserved list either.
+    synthetic = email or f"child-{uuid.uuid4().hex}@family.internal"
+    user = await user_manager.create(UserCreate(email=synthetic, password=password), safe=True)
+    # Child accounts are approved by construction: a parent just created them.
+    user.is_verified = True
+    user.display_name = display_name
+    session.add(user)
+    await session.flush()
+    return await add_member(session, family_id=family_id, email=user.email, role=FAMILY_ROLE_CHILD)
+
+
+_MUTABLE_FIELDS = {
+    "perm_wiki",
+    "perm_meals",
+    "perm_planner",
+    "chat_enabled",
+    "web_enabled",
+}
+
+
+async def update_member(
+    session: AsyncSession,
+    *,
+    family_id: uuid.UUID,
+    user_id: uuid.UUID,
+    changes: dict,
+) -> FamilyMembership:
+    membership = await get_membership(session, family_id, user_id)
+    assert membership is not None  # caller checked
+    for field, value in changes.items():
+        setattr(membership, field, value)
+    await session.commit()
+    await session.refresh(membership)
+    return membership
+
+
+async def remove_member(session: AsyncSession, *, family_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    await session.execute(
+        delete(FamilyMembership).where(
+            FamilyMembership.family_id == family_id,
+            FamilyMembership.user_id == user_id,
+        )
+    )
+    await session.commit()
+
+
+async def transfer_organizer(
+    session: AsyncSession,
+    *,
+    family_id: uuid.UUID,
+    from_user_id: uuid.UUID,
+    to_user_id: uuid.UUID,
+) -> None:
+    """Swap organizer->admin and admin->organizer atomically.
+
+    Demote first, then promote, so the partial unique organizer index never
+    sees two organizer rows inside the transaction.
+    """
+    await session.execute(
+        update(FamilyMembership)
+        .where(
+            FamilyMembership.family_id == family_id,
+            FamilyMembership.user_id == from_user_id,
+        )
+        .values(role=FAMILY_ROLE_ADMIN)
+    )
+    await session.execute(
+        update(FamilyMembership)
+        .where(
+            FamilyMembership.family_id == family_id,
+            FamilyMembership.user_id == to_user_id,
+        )
+        .values(
+            role=FAMILY_ROLE_ORGANIZER,
+            perm_wiki=PERM_EDIT,
+            perm_meals=PERM_EDIT,
+            perm_planner=PERM_EDIT,
+        )
+    )
+    await session.commit()
+
+
 # ---------- routes ----------
 
 families_router = APIRouter(prefix="/api/families", tags=["families"])
@@ -211,6 +327,40 @@ class MembershipOut(BaseModel):
     id: uuid.UUID
     name: str
     role: str
+
+
+class MemberAdd(BaseModel):
+    email: str
+    role: str
+
+
+class ChildCreate(BaseModel):
+    display_name: str
+    password: str
+    email: str | None = None
+
+
+class MemberPatch(BaseModel):
+    role: str | None = None
+    perm_wiki: str | None = None
+    perm_meals: str | None = None
+    perm_planner: str | None = None
+    chat_enabled: bool | None = None
+    web_enabled: bool | None = None
+
+
+class TransferBody(BaseModel):
+    user_id: uuid.UUID
+
+
+class MemberOut(BaseModel):
+    user_id: uuid.UUID
+    role: str
+    perm_wiki: str
+    perm_meals: str
+    perm_planner: str
+    chat_enabled: bool
+    web_enabled: bool
 
 
 async def _require_role(
@@ -298,3 +448,135 @@ async def delete_family_route(
     if payload.content not in ("delete", "keep_personal"):
         raise HTTPException(status_code=400, detail={"code": "invalid_content_choice"})
     await delete_family(session, family_id, content=payload.content, organizer_id=user.id)
+
+
+@families_router.get("/{family_id}/members", response_model=list[MemberOut])
+async def list_members_route(
+    family_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+):
+    await _require_role(
+        session,
+        family_id,
+        user.id,
+        (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD),
+    )
+    rows = (
+        (
+            await session.execute(
+                select(FamilyMembership).where(FamilyMembership.family_id == family_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [MemberOut.model_validate(m, from_attributes=True) for m in rows]
+
+
+@families_router.post("/{family_id}/members", status_code=201, response_model=MemberOut)
+async def add_member_route(
+    family_id: uuid.UUID,
+    payload: MemberAdd,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+):
+    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
+    if payload.role not in (FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD):
+        raise HTTPException(status_code=400, detail={"code": "invalid_role"})
+    try:
+        membership = await add_member(
+            session, family_id=family_id, email=payload.email, role=payload.role
+        )
+    except LookupError as err:
+        raise HTTPException(status_code=404, detail={"code": "no_such_user"}) from err
+    return MemberOut.model_validate(membership, from_attributes=True)
+
+
+@families_router.post("/{family_id}/children", status_code=201, response_model=MemberOut)
+async def create_child_route(
+    family_id: uuid.UUID,
+    payload: ChildCreate,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+    user_manager=Depends(get_user_manager),  # noqa: B008
+):
+    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
+    membership = await create_child_account(
+        session,
+        user_manager,
+        family_id=family_id,
+        display_name=payload.display_name,
+        password=payload.password,
+        email=payload.email,
+    )
+    return MemberOut.model_validate(membership, from_attributes=True)
+
+
+@families_router.patch("/{family_id}/members/{member_user_id}", response_model=MemberOut)
+async def update_member_route(
+    family_id: uuid.UUID,
+    member_user_id: uuid.UUID,
+    payload: MemberPatch,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+):
+    caller = await _require_role(
+        session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
+    )
+    target = await get_membership(session, family_id, member_user_id)
+    if target is None:
+        raise HTTPException(status_code=404)
+    if target.role == FAMILY_ROLE_ORGANIZER:
+        raise HTTPException(status_code=400, detail={"code": "cannot_modify_organizer"})
+    changes = payload.model_dump(exclude_none=True)
+    role_change = changes.pop("role", None)
+    if role_change is not None:
+        # admin<->adult (and any admin involvement) is organizer-only (spec §3)
+        if FAMILY_ROLE_ADMIN in (role_change, target.role) and caller.role != FAMILY_ROLE_ORGANIZER:
+            raise HTTPException(status_code=403, detail={"code": "family_permission_denied"})
+        if role_change == FAMILY_ROLE_ORGANIZER:
+            raise HTTPException(status_code=400, detail={"code": "use_transfer"})
+        changes["role"] = role_change
+    illegal = set(changes) - _MUTABLE_FIELDS - {"role"}
+    if illegal:
+        raise HTTPException(status_code=400, detail={"code": "invalid_fields"})
+    membership = await update_member(
+        session, family_id=family_id, user_id=member_user_id, changes=changes
+    )
+    return MemberOut.model_validate(membership, from_attributes=True)
+
+
+@families_router.delete("/{family_id}/members/{member_user_id}", status_code=204)
+async def remove_member_route(
+    family_id: uuid.UUID,
+    member_user_id: uuid.UUID,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+):
+    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
+    target = await get_membership(session, family_id, member_user_id)
+    if target is None:
+        raise HTTPException(status_code=404)
+    if target.role == FAMILY_ROLE_ORGANIZER:
+        raise HTTPException(status_code=400, detail={"code": "organizer_must_transfer_first"})
+    await remove_member(session, family_id=family_id, user_id=member_user_id)
+
+
+@families_router.post("/{family_id}/transfer")
+async def transfer_route(
+    family_id: uuid.UUID,
+    payload: TransferBody,
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+):
+    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER,))
+    target = await get_membership(session, family_id, payload.user_id)
+    if target is None:
+        raise HTTPException(status_code=404)
+    if target.role != FAMILY_ROLE_ADMIN:
+        raise HTTPException(status_code=400, detail={"code": "transfer_target_not_admin"})
+    await transfer_organizer(
+        session, family_id=family_id, from_user_id=user.id, to_user_id=payload.user_id
+    )
+    return {"organizer": str(payload.user_id)}
