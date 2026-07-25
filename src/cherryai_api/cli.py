@@ -18,6 +18,8 @@ users_app = typer.Typer(help="Manage user accounts.")
 app.add_typer(users_app, name="users")
 calendar_app = typer.Typer(help="Inspect Fastmail calendars and events.")
 app.add_typer(calendar_app, name="calendar")
+errors_app = typer.Typer(help="Inspect frontend error reports.")
+app.add_typer(errors_app, name="errors")
 
 
 @app.command()
@@ -386,6 +388,118 @@ def calendar_search(query: str) -> None:
             typer.echo(f"{event.id[:8]}  {event.start.value}  {event.title}{cal}")
 
     asyncio.run(_run())
+
+
+# `errors list` prints fixed-width columns so a screenful stays scannable:
+# messages and stack traces are unbounded (see api.py's 4KB/16KB caps) and
+# would otherwise shred the alignment. The widths below sum to 120 columns.
+_ERROR_ID_PREFIX_LEN = 8
+_ERROR_USER_COL_WIDTH = 28
+_ERROR_CONTEXT_COL_WIDTH = 18
+_ERROR_MESSAGE_PREVIEW_LEN = 40
+# Width of the `label:` gutter in `errors show`, used to indent the
+# continuation lines of multi-line values back under their first line.
+_ERROR_LABEL_WIDTH = 12
+
+
+def _fit(value: str, width: int) -> str:
+    """Truncate `value` to `width` (marking the cut) and pad it out to it."""
+    if len(value) > width:
+        value = value[: width - 1] + "…"
+    return f"{value:<{width}}"
+
+
+@errors_app.command("list")
+def errors_list(
+    limit: int = typer.Option(50, "--limit", help="Maximum rows to show."),
+) -> None:
+    """List recent frontend error reports, newest first.
+
+    Each row is a one-line, truncated summary. The leading short id is
+    enough to identify a row — pass it to `errors show` for the full
+    message, stack trace and request metadata.
+    """
+    from sqlalchemy import select
+
+    from cherryai_api.frontend_errors import FrontendError
+    from cherryai_api.users import User
+
+    async def _do(session):
+        stmt = (
+            select(FrontendError, User.email)
+            .outerjoin(User, FrontendError.user_id == User.id)
+            .order_by(FrontendError.created_at.desc())
+            .limit(limit)
+        )
+        return list((await session.execute(stmt)).all())
+
+    rows = _run_with_session(_do)
+    if not rows:
+        typer.echo("No frontend errors yet.")
+        return
+    for error, email in rows:
+        who = _fit(email or "(anonymous)", _ERROR_USER_COL_WIDTH)
+        context = _fit((error.context or "-").replace("\n", " "), _ERROR_CONTEXT_COL_WIDTH)
+        message = error.message.replace("\n", " ")
+        if len(message) > _ERROR_MESSAGE_PREVIEW_LEN:
+            message = message[: _ERROR_MESSAGE_PREVIEW_LEN - 1] + "…"
+        typer.echo(
+            f"{str(error.id)[:_ERROR_ID_PREFIX_LEN]}  {error.created_at:%Y-%m-%d %H:%M}  "
+            f"{who}  [{context}]  {message}"
+        )
+
+
+def _echo_field(label: str, value: object) -> None:
+    """Print one `label: value` line, indenting any continuation lines."""
+    text = "-" if value is None or value == "" else str(value)
+    first, *rest = text.split("\n")
+    typer.echo(f"{label + ':':<{_ERROR_LABEL_WIDTH}}{first}")
+    for line in rest:
+        typer.echo(f"{'':<{_ERROR_LABEL_WIDTH}}{line}")
+
+
+@errors_app.command("show")
+def errors_show(error_id: str) -> None:
+    """Show one error in full, by its id or any unique prefix of it."""
+    from sqlalchemy import String, select
+
+    from cherryai_api.frontend_errors import FrontendError
+    from cherryai_api.users import User
+
+    async def _do(session):
+        stmt = (
+            select(FrontendError, User.email)
+            .outerjoin(User, FrontendError.user_id == User.id)
+            .where(FrontendError.id.cast(String).startswith(error_id.lower(), autoescape=True))
+            .order_by(FrontendError.created_at.desc())
+            .limit(2)
+        )
+        return list((await session.execute(stmt)).all())
+
+    rows = _run_with_session(_do)
+    if not rows:
+        typer.echo(f"No frontend error with id {error_id}", err=True)
+        raise typer.Exit(code=1)
+    if len(rows) > 1:
+        typer.echo(f"Error: id {error_id!r} is ambiguous — use more characters", err=True)
+        raise typer.Exit(code=1)
+
+    error, email = rows[0]
+    lineno = error.lineno if error.lineno is not None else "-"
+    colno = error.colno if error.colno is not None else "-"
+    _echo_field("id", error.id)
+    _echo_field("created_at", f"{error.created_at:%Y-%m-%d %H:%M:%S %Z}")
+    _echo_field("user", f"{email or '(anonymous)'} ({error.user_id or '-'})")
+    _echo_field("context", error.context)
+    _echo_field("url", error.url)
+    _echo_field("source", f"{error.source or '-'}:{lineno}:{colno}")
+    _echo_field("user_agent", error.user_agent)
+    _echo_field("client_ip", error.client_ip)
+    _echo_field("client_ts", error.client_timestamp)
+    _echo_field("message", error.message)
+    if error.stack:
+        typer.echo("stack:")
+        typer.echo(error.stack)
 
 
 def main() -> None:
