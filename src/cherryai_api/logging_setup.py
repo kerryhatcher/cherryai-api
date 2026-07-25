@@ -21,8 +21,8 @@ class _UvicornLogBridge(logging.Handler):
         # Skip loguru's own internal records to avoid infinite loops.
         if record.name == "loguru":
             return
-        # Map stdlib levels to loguru methods.
-        level = record.levelname.lower()
+        # Map stdlib levels to loguru level names (uppercase).
+        level = record.levelname
         logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
 
 
