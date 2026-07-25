@@ -26,6 +26,7 @@ from cherryai_api.db import build_database, make_session_title
 from cherryai_api.db_migrations import run_migrations_to_head
 from cherryai_api.email import router as email_router
 from cherryai_api.facts import build_extractor_agent, build_judge_agent, extract_and_save_facts
+from cherryai_api.families import families_router
 from cherryai_api.family_context import FamilyContextMiddleware
 from cherryai_api.feedback import router as feedback_router
 from cherryai_api.frontend_errors import (
@@ -230,6 +231,7 @@ app.include_router(email_router)
 app.include_router(integrations_router)
 app.include_router(meals_router)
 app.include_router(planner_router)
+app.include_router(families_router)
 app.include_router(fastapi_users_app.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(
     fastapi_users_app.get_register_router(UserRead, UserCreate),
