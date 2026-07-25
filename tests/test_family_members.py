@@ -41,6 +41,23 @@ async def org_and_family(pool, api_client):
         app.dependency_overrides.pop(current_verified_user, None)
 
 
+@pytest.fixture()
+async def admin_caller(org_and_family):
+    """A third member, added as `admin` by the organizer, for tests that
+    need an admin (not organizer) caller distinct from the target member."""
+    client, fam_id, org, other = org_and_family
+    async with async_session_maker() as session:
+        admin_user = await _mk_user(session, f"ztest-{uuid.uuid4().hex[:8]}@example.com")
+        await session.commit()
+        await session.refresh(admin_user)
+    r = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": admin_user.email, "role": "admin"},
+    )
+    assert r.status_code == 201
+    return client, fam_id, org, other, admin_user
+
+
 async def test_add_member_defaults(org_and_family):
     client, fam_id, org, other = org_and_family
     r = await client.post(
@@ -80,7 +97,7 @@ async def test_patch_member_perms_and_gates(org_and_family):
     assert r.json()["chat_enabled"] is False
 
 
-async def test_admin_demotion_is_organizer_only(org_and_family):
+async def test_organizer_can_change_admin_to_adult(org_and_family):
     client, fam_id, org, other = org_and_family
     await client.post(
         f"/api/families/{fam_id}/members",
@@ -89,6 +106,120 @@ async def test_admin_demotion_is_organizer_only(org_and_family):
     # organizer CAN change admin<->adult
     r = await client.patch(f"/api/families/{fam_id}/members/{other.id}", json={"role": "adult"})
     assert r.status_code == 200
+
+
+async def test_admin_cannot_change_admin_to_adult(admin_caller):
+    client, fam_id, org, other, admin_user = admin_caller
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "admin"},
+    )
+    app.dependency_overrides[current_verified_user] = lambda: admin_user
+    r = await client.patch(f"/api/families/{fam_id}/members/{other.id}", json={"role": "adult"})
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "family_permission_denied"
+
+
+async def test_organizer_can_add_admin(org_and_family):
+    client, fam_id, org, other = org_and_family
+    r = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "admin"},
+    )
+    assert r.status_code == 201
+    assert r.json()["role"] == "admin"
+
+
+async def test_admin_cannot_add_admin(admin_caller):
+    client, fam_id, org, other, admin_user = admin_caller
+    app.dependency_overrides[current_verified_user] = lambda: admin_user
+    r = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "admin"},
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "family_permission_denied"
+
+
+async def test_organizer_can_delete_admin(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "admin"},
+    )
+    r = await client.request("DELETE", f"/api/families/{fam_id}/members/{other.id}")
+    assert r.status_code == 204
+
+
+async def test_admin_cannot_delete_admin(admin_caller):
+    client, fam_id, org, other, admin_user = admin_caller
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "admin"},
+    )
+    app.dependency_overrides[current_verified_user] = lambda: admin_user
+    r = await client.request("DELETE", f"/api/families/{fam_id}/members/{other.id}")
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "family_permission_denied"
+
+
+async def test_add_member_unknown_email_404(org_and_family):
+    client, fam_id, org, other = org_and_family
+    r = await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": "ztest-nobody-zzz@example.com", "role": "adult"},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "no_such_user"
+
+
+async def test_patch_organizer_row_rejected(org_and_family):
+    client, fam_id, org, other = org_and_family
+    r = await client.patch(f"/api/families/{fam_id}/members/{org.id}", json={"perm_wiki": "view"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "cannot_modify_organizer"
+
+
+async def test_patch_role_to_organizer_rejected(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    r = await client.patch(f"/api/families/{fam_id}/members/{other.id}", json={"role": "organizer"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "use_transfer"
+
+
+async def test_patch_rejects_unknown_field(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    r = await client.patch(
+        f"/api/families/{fam_id}/members/{other.id}", json={"email": "x@example.com"}
+    )
+    assert r.status_code == 422
+
+
+async def test_transfer_to_non_admin_rejected(org_and_family):
+    client, fam_id, org, other = org_and_family
+    await client.post(
+        f"/api/families/{fam_id}/members",
+        json={"email": other.email, "role": "adult"},
+    )
+    r = await client.post(f"/api/families/{fam_id}/transfer", json={"user_id": str(other.id)})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "transfer_target_not_admin"
+
+
+async def test_non_member_gets_404_on_members_route(org_and_family):
+    client, fam_id, org, other = org_and_family
+    # `other` was never added to the family — existence-protecting (spec §7)
+    app.dependency_overrides[current_verified_user] = lambda: other
+    r = await client.get(f"/api/families/{fam_id}/members")
+    assert r.status_code == 404
 
 
 async def test_organizer_cannot_be_removed(org_and_family):

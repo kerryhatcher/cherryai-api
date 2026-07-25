@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -221,22 +221,26 @@ async def create_child_account(
     # address uses `.internal` instead — not deliverable, but not on that
     # reserved list either.
     synthetic = email or f"child-{uuid.uuid4().hex}@family.internal"
-    user = await user_manager.create(UserCreate(email=synthetic, password=password), safe=True)
-    # Child accounts are approved by construction: a parent just created them.
-    user.is_verified = True
-    user.display_name = display_name
-    session.add(user)
-    await session.flush()
-    return await add_member(session, family_id=family_id, email=user.email, role=FAMILY_ROLE_CHILD)
-
-
-_MUTABLE_FIELDS = {
-    "perm_wiki",
-    "perm_meals",
-    "perm_planner",
-    "chat_enabled",
-    "web_enabled",
-}
+    user = await user_manager.create(
+        UserCreate(email=synthetic, password=password, display_name=display_name),
+        safe=True,
+    )
+    try:
+        # Child accounts are approved by construction: a parent just created them.
+        user.is_verified = True
+        session.add(user)
+        await session.flush()
+        return await add_member(
+            session, family_id=family_id, email=user.email, role=FAMILY_ROLE_CHILD
+        )
+    except Exception:
+        # user_manager.create() already committed the user row above; if
+        # anything after that fails, compensate by deleting it rather than
+        # leaving an orphaned account with no family membership.
+        await session.rollback()
+        await session.delete(user)
+        await session.commit()
+        raise
 
 
 async def update_member(
@@ -247,7 +251,8 @@ async def update_member(
     changes: dict,
 ) -> FamilyMembership:
     membership = await get_membership(session, family_id, user_id)
-    assert membership is not None  # caller checked
+    if membership is None:
+        raise HTTPException(status_code=404)
     for field, value in changes.items():
         setattr(membership, field, value)
     await session.commit()
@@ -341,6 +346,8 @@ class ChildCreate(BaseModel):
 
 
 class MemberPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str | None = None
     perm_wiki: str | None = None
     perm_meals: str | None = None
@@ -481,9 +488,16 @@ async def add_member_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
-    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
+    caller = await _require_role(
+        session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
+    )
     if payload.role not in (FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD):
         raise HTTPException(status_code=400, detail={"code": "invalid_role"})
+    if payload.role == FAMILY_ROLE_ADMIN and caller.role != FAMILY_ROLE_ORGANIZER:
+        # minting an admin is organizer-only, same as any other admin
+        # involvement in a role change (spec §3) — an admin adding another
+        # admin would let admins bootstrap peers with equal standing.
+        raise HTTPException(status_code=403, detail={"code": "family_permission_denied"})
     try:
         membership = await add_member(
             session, family_id=family_id, email=payload.email, role=payload.role
@@ -538,9 +552,6 @@ async def update_member_route(
         if role_change == FAMILY_ROLE_ORGANIZER:
             raise HTTPException(status_code=400, detail={"code": "use_transfer"})
         changes["role"] = role_change
-    illegal = set(changes) - _MUTABLE_FIELDS - {"role"}
-    if illegal:
-        raise HTTPException(status_code=400, detail={"code": "invalid_fields"})
     membership = await update_member(
         session, family_id=family_id, user_id=member_user_id, changes=changes
     )
@@ -554,12 +565,17 @@ async def remove_member_route(
     user: User = Depends(current_verified_user),  # noqa: B008
     session: AsyncSession = Depends(get_async_session),  # noqa: B008
 ):
-    await _require_role(session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN))
+    caller = await _require_role(
+        session, family_id, user.id, (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN)
+    )
     target = await get_membership(session, family_id, member_user_id)
     if target is None:
         raise HTTPException(status_code=404)
     if target.role == FAMILY_ROLE_ORGANIZER:
         raise HTTPException(status_code=400, detail={"code": "organizer_must_transfer_first"})
+    if target.role == FAMILY_ROLE_ADMIN and caller.role != FAMILY_ROLE_ORGANIZER:
+        # peers can't remove peers; only the organizer can remove an admin
+        raise HTTPException(status_code=403, detail={"code": "family_permission_denied"})
     await remove_member(session, family_id=family_id, user_id=member_user_id)
 
 
