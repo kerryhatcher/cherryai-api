@@ -38,6 +38,10 @@ async def _clean_test_rows(pool) -> None:
     # others, `build_database()` does not create them — so an unmigrated
     # database must not fail every pool-using test.
     try:
+        await pool.execute("DELETE FROM families WHERE name LIKE 'Ztest%'")
+    except asyncpg.UndefinedTableError:
+        pass
+    try:
         await pool.execute("DELETE FROM \"user\" WHERE email LIKE 'ztest-%'")
     except asyncpg.UndefinedTableError:
         pass
