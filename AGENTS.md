@@ -79,38 +79,46 @@ Match the model to the task, not the project's importance. Prefer running indepe
 
 ## Frontend Error Logging
 
-The API accepts error reports from the frontend at `POST /api/log/error` and writes them to a JSONL log file. This is a pass-through diagnostic sink — no authentication required.
+The API accepts error reports from the frontend at `POST /api/log/error` and persists them to a Postgres table. This requires an authenticated, verified session — errors occurring before login are intentionally dropped rather than logged anonymously.
 
-- **Log file:** `logs/frontend-errors.jsonl` (relative to the API working directory; configurable via the `log_dir` setting)
-- **Endpoint:** `POST /api/log/error` — defined in `src/cherryai_api/api.py` (search for `log_error`)
-- **Format:** One JSON object per line, with fields: `message`, `source`, `lineno`, `colno`, `stack`, `url`, `user_agent`, `client_ip`, `received_at`, `client_timestamp`
+- **Endpoint:** `POST /api/log/error` — defined in `src/cherryai_api/api.py` (search for `log_error`); requires `current_verified_user` dependency
+- **Storage:** `frontend_errors` table in Postgres
+- **Model:** `src/cherryai_api/frontend_errors.py` — fields include `id`, `user_id`, `message`, `source`, `lineno`, `colno`, `stack`, `url`, `user_agent`, `client_ip`, `client_timestamp`, `context`, `created_at`
+- **Migrations:** Alembic migrations `0004` and `0005` created the table and added the schema
 
-### Reading the log
+### Reading the logs
+
+Use the CLI commands to list and inspect frontend errors:
 
 ```bash
-# Tail the log in real time
-tail -f logs/frontend-errors.jsonl | python3 -m json.tool
+# List recent errors, newest first (default 50 rows)
+cherryai errors list
 
-# Pretty-print the last 20 errors
-uv run python3 -c "
-import json
-with open('logs/frontend-errors.jsonl') as f:
-    for line in f.readlines()[-20:]:
-        print(json.dumps(json.loads(line), indent=2))
-        print('---')
-"
+# List with a custom limit
+cherryai errors list --limit 100
 
-# Filter by error message
-uv run python3 -c "
-import json, sys
-with open('logs/frontend-errors.jsonl') as f:
-    for line in f:
-        rec = json.loads(line)
-        if sys.argv[1].lower() in rec.get('message','').lower():
-            print(json.dumps(rec, indent=2))
-            print('---')
-" 'TypeError'
+# Show one error in full (accepts any unique prefix of the id)
+cherryai errors show 12345678
+cherryai errors show abc123  # if abc123 uniquely identifies one row
 ```
+
+### Testing the logger
+
+Log in to the app (the endpoint requires authentication), then open the browser console and throw a test error:
+
+```js
+throw new Error('test log from console')
+```
+
+Then list the errors to verify it was recorded:
+
+```bash
+cherryai errors list
+```
+
+### Retention and cleanup
+
+Retention/cleanup for the `frontend_errors` table is an **unresolved open question** — the table grows without bound. However, requiring authentication means the write rate is now bounded by the verified user count rather than by the open internet. A future cleanup policy should consider: log retention period (e.g., 30/60/90 days), archival strategy, and automated deletion of old rows.
 
 ## GitHub Actions
 
