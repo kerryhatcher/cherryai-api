@@ -24,7 +24,7 @@ async def test_sessions_are_scoped_per_user(pool, make_user):
 
     alice = await make_user("ztest-alice@example.com")
     bob = await make_user("ztest-bob@example.com")
-    db = build_database()
+    db = build_database(use_app_role=False)
     await db.connect()
     try:
         mine = await db.create_session("Ztest alice chat", alice["id"])

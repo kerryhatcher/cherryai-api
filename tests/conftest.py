@@ -72,7 +72,7 @@ async def _dispose_sqlalchemy_engine():
 @pytest.fixture
 async def pool():
     """Yield a connected asyncpg pool, cleaning up test rows around each test."""
-    db = build_database()
+    db = build_database(use_app_role=False)
     await db.connect()
     try:
         await _clean_test_rows(db.pool)
