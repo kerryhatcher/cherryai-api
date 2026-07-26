@@ -156,6 +156,9 @@ async def reactivate_user(
 # ── Model configs ────────────────────────────────────────────────────────────
 
 
+model_configs_router = APIRouter(prefix="/admin/model-configs", tags=["admin"])
+
+
 class ModelConfigOut(BaseModel):
     call_site: str
     provider: str
@@ -172,7 +175,7 @@ class ModelConfigUpsert(BaseModel):
     model_name: str = ""
 
 
-@router.get("/model-configs", response_model=list[ModelConfigOut])
+@model_configs_router.get("", response_model=list[ModelConfigOut])
 async def list_model_configs(
     request: Request,
     admin: User = Depends(require_admin),  # noqa: B008
@@ -197,7 +200,7 @@ async def list_model_configs(
     return result
 
 
-@router.put("/model-configs/{call_site}", response_model=ModelConfigOut)
+@model_configs_router.put("/{call_site}", response_model=ModelConfigOut)
 async def update_model_config(
     request: Request,
     call_site: str,
@@ -230,7 +233,7 @@ async def update_model_config(
     }
 
 
-@router.delete("/model-configs/{call_site}", status_code=204)
+@model_configs_router.delete("/{call_site}", status_code=204)
 async def delete_model_config(
     request: Request,
     call_site: str,

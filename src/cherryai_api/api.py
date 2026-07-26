@@ -17,6 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
+from cherryai_api.admin import model_configs_router
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.agent_audit import log_tool_call
@@ -248,6 +249,7 @@ app.include_router(
     tags=["users"],
 )
 app.include_router(admin_router)
+app.include_router(model_configs_router)
 
 
 # ---------------------------------------------------------------------------
