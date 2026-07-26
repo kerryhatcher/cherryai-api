@@ -732,6 +732,59 @@ def families_transfer(family_id: uuid.UUID, email: str) -> None:
     asyncio.run(run())
 
 
+@families_app.command("create-child")
+def families_create_child(
+    family_id: uuid.UUID,
+    display_name: str = typer.Option(..., prompt=True),
+    password: str = typer.Option(..., prompt=True, hide_input=True),
+    email: str = typer.Option(
+        None,
+        help="Optional synthetic email (default: child-<uuid>@family.internal)",
+    ),
+) -> None:
+    """Create a child account within a family (runs as the app user's db role).
+
+    This creates a new verified user and adds them as a Child member.
+    """
+
+    async def run() -> None:
+        from fastapi_users.password import PasswordHelper
+
+        from cherryai_api.families import FAMILY_ROLE_CHILD, add_member
+        from cherryai_api.orm import async_session_maker
+        from cherryai_api.users import User
+
+        synthetic = email or f"child-{uuid.uuid4().hex}@family.internal"
+        hashed = PasswordHelper().hash(password)
+
+        async with async_session_maker() as session:
+            user = User(
+                email=synthetic,
+                hashed_password=hashed,
+                display_name=display_name,
+                is_active=True,
+                is_verified=True,
+                is_superuser=False,
+                role="chat",
+            )
+            session.add(user)
+            await session.flush()
+            try:
+                membership = await add_member(
+                    session, family_id=family_id, email=user.email, role=FAMILY_ROLE_CHILD
+                )
+                typer.echo(
+                    f"Created child '{display_name}' ({synthetic}) "
+                    f"as member id={membership.id} in family {family_id}"
+                )
+            except Exception as err:
+                await session.rollback()
+                typer.echo(f"Failed to add child: {err}", err=True)
+                raise typer.Exit(1) from err
+
+    asyncio.run(run())
+
+
 def main() -> None:
     from cherryai_api.logging_setup import setup_file_logging
     from cherryai_api.settings import get_settings
