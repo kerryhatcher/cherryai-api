@@ -42,7 +42,10 @@ async def _clean_test_rows(pool) -> None:
     except asyncpg.UndefinedTableError:
         pass
     try:
-        await pool.execute("DELETE FROM \"user\" WHERE email LIKE 'ztest-%'")
+        await pool.execute(
+            "DELETE FROM \"user\" WHERE email LIKE 'ztest-%' "
+            "OR email LIKE 'child-%@family.internal'"
+        )
     except asyncpg.UndefinedTableError:
         pass
     try:
