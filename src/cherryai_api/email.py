@@ -420,9 +420,19 @@ CREATE TABLE IF NOT EXISTS email_approvals (
 
 
 async def _ensure_approvals_table(pool) -> None:
-    """Create the email_approvals table if it doesn't exist."""
+    """Create the email_approvals table if it doesn't exist.
+
+    Silently skips permission errors — the table is created by migrations
+    on startup (the superuser connection), and this call is only needed
+    for environments that bypass migrations.
+    """
+    import asyncpg
+
     async with pool.acquire() as conn:
-        await conn.execute(CREATE_EMAIL_APPROVALS_TABLE)
+        try:
+            await conn.execute(CREATE_EMAIL_APPROVALS_TABLE)
+        except asyncpg.InsufficientPrivilegeError:
+            pass
 
 
 async def create_approval(

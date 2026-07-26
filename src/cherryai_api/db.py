@@ -65,7 +65,14 @@ class Database:
         return self._pool
 
     async def connect(self) -> None:
-        """Open the connection pool and create tables if needed."""
+        """Open the connection pool.
+
+        Schema is managed by Alembic migrations (run on startup before this
+        is called). The DDL below is only needed for the very first deploy
+        on a fresh database; subsequent runs are no-ops. When the runtime
+        role (cherryai_app) lacks ALTER/CREATE privileges, DDL errors are
+        silently skipped — the table already exists from migrations.
+        """
         # Local imports keep db.py free of the routers' FastAPI deps.
         from cherryai_api.email import _ensure_approvals_table
         from cherryai_api.feedback import CREATE_FEEDBACK_TABLE
@@ -75,16 +82,23 @@ class Database:
         from cherryai_api.workflows import ensure_workflow_columns
 
         self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
+
+        async def _ddl(conn, sql: str) -> None:
+            try:
+                await conn.execute(sql)
+            except asyncpg.InsufficientPrivilegeError:
+                pass  # DDL handled by migrations — skip if non-superuser role
+
         async with self._pool.acquire() as conn:
-            await conn.execute(_CREATE_TABLES)
-            await conn.execute(CREATE_WIKI_TABLE)
-            await conn.execute(CREATE_FEEDBACK_TABLE)
-            await conn.execute(CREATE_MEALS_TABLES)
+            await _ddl(conn, _CREATE_TABLES)
+            await _ddl(conn, CREATE_WIKI_TABLE)
+            await _ddl(conn, CREATE_FEEDBACK_TABLE)
+            await _ddl(conn, CREATE_MEALS_TABLES)
             for migration in MEALS_MIGRATIONS:
-                await conn.execute(migration)
-            await conn.execute(CREATE_PLANNER_TABLES)
+                await _ddl(conn, migration)
+            await _ddl(conn, CREATE_PLANNER_TABLES)
             for migration in PLANNER_MIGRATIONS:
-                await conn.execute(migration)
+                await _ddl(conn, migration)
         await _ensure_approvals_table(self._pool)
         # Job-state columns + stale-'running' cleanup (crash recovery); needs its
         # own connection since ensure_workflow_columns acquires from the pool.

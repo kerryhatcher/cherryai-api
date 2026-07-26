@@ -99,9 +99,16 @@ class WorkflowRuntime:
 
 
 async def ensure_workflow_columns(pool: asyncpg.Pool) -> None:
-    """Add job-state columns if missing, then clear any stale 'running' jobs."""
+    """Add job-state columns if missing, then clear any stale 'running' jobs.
+
+    DDL is silently skipped when the runtime role lacks ALTER privilege
+    (tables are already up-to-date from migrations run on startup).
+    """
     async with pool.acquire() as conn:
-        await conn.execute(ALTER_FEEDBACK_JOB_COLUMNS)
+        try:
+            await conn.execute(ALTER_FEEDBACK_JOB_COLUMNS)
+        except asyncpg.InsufficientPrivilegeError:
+            pass
         await conn.execute(CLEANUP_STALE_JOBS_SQL, _STALE_JOB_ERROR)
 
 
