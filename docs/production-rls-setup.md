@@ -115,3 +115,19 @@ to `DATABASE_URL`). This makes the API connect as superuser again, bypassing RLS
 - `src/cherryai_api/orm.py` — `app_sqlalchemy_url()` uses app role URL
 - `src/cherryai_api/db.py` — `build_database(use_app_role=True)` connects as app role
 - `tests/test_rls_machinery.py` — demonstrates the same pattern in tests
+
+## Known Issue — DDL Privileges at Startup
+
+The `Database.connect()` method in `db.py` runs `CREATE TABLE IF NOT EXISTS` and
+`ALTER TABLE` statements at startup. These are no-ops when the schema is already
+up to date (which it is — migrations run first), but they still require DDL
+privileges (`ALTER`, `CREATE`) that a non-superuser role may not have.
+
+The fix applied in `src/cherryai_api/db.py`, `email.py`, and `workflows.py`
+wraps DDL statements in `try/except asyncpg.InsufficientPrivilegeError` so the
+app starts successfully even when the runtime role lacks DDL privileges.
+
+If deployment still fails with `APP_DATABASE_URL` set, the runtime role may need
+additional privileges beyond DDL (e.g., Cognee operations). In that case, remove
+`APP_DATABASE_URL` from the app spec to fall back to the superuser connection.
+Application-layer permission scoping (Capability/scope_sql) continues to work.
