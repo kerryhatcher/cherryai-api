@@ -150,8 +150,8 @@ async def test_search_wiki_tool_scopes_to_deps_user(pool, make_user, monkeypatch
 
     seen: dict = {}
 
-    async def fake_search(pool_arg, owner_id, query):
-        seen["owner_id"] = owner_id
+    async def fake_search(pool_arg, capability, query):
+        seen["capability"] = capability
         return []
 
     monkeypatch.setattr(agent_mod, "search_entries", fake_search)
@@ -166,7 +166,7 @@ async def test_search_wiki_tool_scopes_to_deps_user(pool, make_user, monkeypatch
     model = FunctionModel(function=_respond_search_wiki)
     await agent.run("who is in the wiki?", deps=deps, model=model)
 
-    assert seen["owner_id"] == deps.user_id
+    assert seen["capability"].user_id == deps.user_id
 
 
 # --- Meal-planning tools (D6) --------------------------------------------------
