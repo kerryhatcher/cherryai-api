@@ -29,8 +29,9 @@ BEGIN
 END
 $$;
 
--- Schema access
+-- Schema access (CREATE needed for temp tables, Cognee, etc.)
 GRANT USAGE ON SCHEMA public TO cherryai_app;
+GRANT CREATE ON SCHEMA public TO cherryai_app;
 
 -- Full DML on existing tables
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cherryai_app;

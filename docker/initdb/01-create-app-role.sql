@@ -13,8 +13,10 @@ BEGIN
 END
 $$;
 
--- Grant schema access so the role can interact with tables.
+-- Grant schema access so the role can interact with tables and create
+-- temp objects (required by Cognee, agent tooling, etc.).
 GRANT USAGE ON SCHEMA public TO cherryai_app;
+GRANT CREATE ON SCHEMA public TO cherryai_app;
 
 -- Grant full DML on all existing tables. New tables created by migrations
 -- (as superuser) need ALTER DEFAULT PRIVILEGES below to auto-grant.
