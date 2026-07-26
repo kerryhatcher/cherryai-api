@@ -14,8 +14,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from cherryai_api.auth import current_verified_user
-from cherryai_api.users import User
+from cherryai_api.authz import Capability, require_permission, scope_sql, scoped_connection
 
 # ------------------------------------------------------------------
 # SQL
@@ -28,6 +27,7 @@ CREATE TABLE IF NOT EXISTS planner_projects (
     description TEXT NOT NULL DEFAULT '',
     color TEXT,
     owner_id UUID NOT NULL,
+    family_id UUID REFERENCES families(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS planner_subtasks (
 CREATE INDEX IF NOT EXISTS planner_subtasks_task_idx
     ON planner_subtasks (task_id, sort_order);
 """
+
+PLANNER_MIGRATIONS: list[str] = [
+    (
+        "ALTER TABLE planner_projects ADD COLUMN IF NOT EXISTS family_id "
+        "UUID REFERENCES families(id) ON DELETE CASCADE"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS ix_planner_projects_family "
+        "ON planner_projects (family_id, created_at)"
+    ),
+]
 
 
 # ------------------------------------------------------------------
@@ -94,6 +105,7 @@ class Project(BaseModel):
     description: str
     color: str | None
     owner_id: uuid.UUID
+    family_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -105,6 +117,7 @@ class ProjectListItem(BaseModel):
     name: str
     color: str | None
     owner_id: uuid.UUID
+    family_id: uuid.UUID | None = None
     task_total: int
     task_done: int
     created_at: datetime
@@ -176,86 +189,100 @@ class TaskListItem(BaseModel):
 # Data access — Projects
 # ------------------------------------------------------------------
 
-_PROJECT_COLUMNS = "id, name, description, color, owner_id, created_at, updated_at"
+_PROJECT_COLUMNS = "id, name, description, color, owner_id, family_id, created_at, updated_at"
 _PROJECT_LIST_COLUMNS = """
-    p.id, p.name, p.color, p.owner_id, p.created_at, p.updated_at,
+    p.id, p.name, p.color, p.owner_id, p.family_id, p.created_at, p.updated_at,
     COALESCE(tc.total, 0) AS task_total,
     COALESCE(tc.done, 0) AS task_done
 """
 
 
-async def list_projects(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[ProjectListItem]:
-    rows = await pool.fetch(
-        f"""
-        SELECT {_PROJECT_LIST_COLUMNS}
-          FROM planner_projects p
-          LEFT JOIN LATERAL (
-              SELECT count(*) AS total,
-                     count(*) FILTER (WHERE status = 'done') AS done
-                FROM planner_tasks
-               WHERE project_id = p.id
-          ) tc ON true
-         WHERE p.owner_id = $1
-         ORDER BY p.updated_at DESC
-        """,
-        owner_id,
-    )
+async def list_projects(pool: asyncpg.Pool, capability: Capability) -> list[ProjectListItem]:
+    clause, params = scope_sql(capability, alias="p")
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT {_PROJECT_LIST_COLUMNS}
+              FROM planner_projects p
+              LEFT JOIN LATERAL (
+                  SELECT count(*) AS total,
+                         count(*) FILTER (WHERE status = 'done') AS done
+                    FROM planner_tasks
+                   WHERE project_id = p.id
+              ) tc ON true
+             WHERE {clause}
+             ORDER BY p.updated_at DESC
+            """,
+            *params,
+        )
     return [ProjectListItem(**dict(row)) for row in rows]
 
 
 async def get_project(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, project_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, project_id: uuid.UUID
 ) -> Project | None:
-    row = await pool.fetchrow(
-        f"SELECT {_PROJECT_COLUMNS} FROM planner_projects WHERE id = $1 AND owner_id = $2",
-        project_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_PROJECT_COLUMNS} FROM planner_projects p WHERE p.id = $1 AND {clause}",
+            project_id,
+            *params,
+        )
     return Project(**dict(row)) if row else None
 
 
-async def create_project(pool: asyncpg.Pool, owner_id: uuid.UUID, data: ProjectCreate) -> Project:
+async def create_project(
+    pool: asyncpg.Pool, capability: Capability, data: ProjectCreate
+) -> Project:
     name = data.name.strip()
     if not name:
         raise ValueError("Project name must not be empty")
-    row = await pool.fetchrow(
-        f"INSERT INTO planner_projects (id, name, description, color, owner_id) "
-        f"VALUES ($1, $2, $3, $4, $5) RETURNING {_PROJECT_COLUMNS}",
-        uuid.uuid4(),
-        name,
-        data.description,
-        data.color,
-        owner_id,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO planner_projects (id, name, description, color, owner_id, family_id) "
+            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_PROJECT_COLUMNS}",
+            uuid.uuid4(),
+            name,
+            data.description,
+            data.color,
+            capability.user_id,
+            capability.family_id,
+        )
     return Project(**dict(row))
 
 
 async def update_project(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, project_id: uuid.UUID, data: ProjectUpdate
+    pool: asyncpg.Pool, capability: Capability, project_id: uuid.UUID, data: ProjectUpdate
 ) -> Project | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Project name must not be empty")
-    row = await pool.fetchrow(
-        f"UPDATE planner_projects SET "
-        f"name = COALESCE($3, name), "
-        f"description = COALESCE($4, description), "
-        f"color = COALESCE($5, color), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_PROJECT_COLUMNS}",
-        project_id,
-        owner_id,
-        name,
-        data.description,
-        data.color,
-    )
+    clause, params = scope_sql(capability, alias="p", start=6)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE planner_projects p SET "
+            f"name = COALESCE($3, name), "
+            f"description = COALESCE($4, description), "
+            f"color = COALESCE($5, color), "
+            f"updated_at = now() "
+            f"WHERE p.id = $1 AND {clause} RETURNING {_PROJECT_COLUMNS}",
+            project_id,
+            *params,
+            name,
+            data.description,
+            data.color,
+        )
     return Project(**dict(row)) if row else None
 
 
-async def delete_project(pool: asyncpg.Pool, owner_id: uuid.UUID, project_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM planner_projects WHERE id = $1 AND owner_id = $2", project_id, owner_id
-    )
+async def delete_project(pool: asyncpg.Pool, capability: Capability, project_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM planner_projects p WHERE p.id = $1 AND {clause}",
+            project_id,
+            *params,
+        )
     return result.endswith("1")
 
 
@@ -478,7 +505,7 @@ def _pool(request: Request) -> asyncpg.Pool:
 @router.get("/users")
 async def get_planner_users(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "view")),  # noqa: B008
 ) -> list[dict]:
     users = await list_planner_users(_pool(request))
     return [u.model_dump(mode="json") for u in users]
@@ -490,9 +517,9 @@ async def get_planner_users(
 @router.get("/projects")
 async def list_planner_projects(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "view")),  # noqa: B008
 ) -> list[dict]:
-    projects = await list_projects(_pool(request), user.id)
+    projects = await list_projects(_pool(request), capability)
     return [p.model_dump(mode="json") for p in projects]
 
 
@@ -500,10 +527,10 @@ async def list_planner_projects(
 async def create_planner_project(
     request: Request,
     body: ProjectCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        project = await create_project(_pool(request), user.id, body)
+        project = await create_project(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return project.model_dump(mode="json")
@@ -513,9 +540,9 @@ async def create_planner_project(
 async def get_planner_project(
     request: Request,
     project_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "view")),  # noqa: B008
 ) -> dict:
-    project = await get_project(_pool(request), user.id, project_id)
+    project = await get_project(_pool(request), capability, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project.model_dump(mode="json")
@@ -526,10 +553,10 @@ async def update_planner_project(
     request: Request,
     project_id: uuid.UUID,
     body: ProjectUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        project = await update_project(_pool(request), user.id, project_id, body)
+        project = await update_project(_pool(request), capability, project_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if project is None:
@@ -541,9 +568,9 @@ async def update_planner_project(
 async def delete_planner_project(
     request: Request,
     project_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_project(_pool(request), user.id, project_id):
+    if not await delete_project(_pool(request), capability, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
 
 
@@ -554,10 +581,10 @@ async def delete_planner_project(
 async def list_planner_tasks(
     request: Request,
     project_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "view")),  # noqa: B008
 ) -> list[dict]:
-    # Verify project ownership
-    project = await get_project(_pool(request), user.id, project_id)
+    # Verify project access
+    project = await get_project(_pool(request), capability, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     tasks = await list_tasks(_pool(request), project_id)
@@ -569,9 +596,9 @@ async def create_planner_task(
     request: Request,
     project_id: uuid.UUID,
     body: TaskCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
-    project = await get_project(_pool(request), user.id, project_id)
+    project = await get_project(_pool(request), capability, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     try:
@@ -585,13 +612,13 @@ async def create_planner_task(
 async def get_planner_task(
     request: Request,
     task_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "view")),  # noqa: B008
 ) -> dict:
     task = await get_task(_pool(request), task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    # Verify project ownership
-    project = await get_project(_pool(request), user.id, task.project_id)
+    # Verify project access
+    project = await get_project(_pool(request), capability, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task.model_dump(mode="json")
@@ -602,12 +629,12 @@ async def update_planner_task(
     request: Request,
     task_id: uuid.UUID,
     body: TaskUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
     task = await get_task(_pool(request), task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    project = await get_project(_pool(request), user.id, task.project_id)
+    project = await get_project(_pool(request), capability, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Task not found")
     try:
@@ -623,12 +650,12 @@ async def update_planner_task(
 async def delete_planner_task(
     request: Request,
     task_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> None:
     task = await get_task(_pool(request), task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    project = await get_project(_pool(request), user.id, task.project_id)
+    project = await get_project(_pool(request), capability, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Task not found")
     if not await delete_task(_pool(request), task_id):
@@ -643,12 +670,12 @@ async def create_planner_subtask(
     request: Request,
     task_id: uuid.UUID,
     body: SubtaskCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
     task = await get_task(_pool(request), task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    project = await get_project(_pool(request), user.id, task.project_id)
+    project = await get_project(_pool(request), capability, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Task not found")
     try:
@@ -668,7 +695,7 @@ async def update_planner_subtask(
     request: Request,
     subtask_id: uuid.UUID,
     body: SubtaskUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> dict:
     subtask = await update_subtask(_pool(request), subtask_id, body.title, body.completed)
     if subtask is None:
@@ -680,7 +707,7 @@ async def update_planner_subtask(
 async def delete_planner_subtask(
     request: Request,
     subtask_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("planner", "edit")),  # noqa: B008
 ) -> None:
     if not await delete_subtask(_pool(request), subtask_id):
         raise HTTPException(status_code=404, detail="Subtask not found")
