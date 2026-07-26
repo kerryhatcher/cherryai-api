@@ -56,7 +56,7 @@ def chat(prompt: str) -> None:
     from cherryai_api.memory import build_memory
 
     async def _run() -> str:
-        agent = build_agent()
+        agent = await build_agent()
         deps = AgentDeps(memory=build_memory(), user_id=uuid.uuid4())
         result = await run_turn(agent, prompt, deps=deps)
         return result.output

@@ -186,15 +186,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # background pipeline not tied to a requesting user. Per-request chat
     # traffic builds its own memory in send_message.
     default_memory = build_memory()
-    workflows = build_workflow_runtime(settings, database, default_memory)
-    agent = build_agent(settings, database=database, workflows=workflows)
+    pool = database.pool
+    workflows = await build_workflow_runtime(settings, database, default_memory)
+    agent = await build_agent(settings, database=database, workflows=workflows)
     app.state.settings = settings
     app.state.db = database
     app.state.workflows = workflows
     app.state.agent = agent
     if settings.fact_extraction_enabled:
-        app.state.fact_extractor_agent = build_extractor_agent(settings)
-        app.state.fact_judge_agent = build_judge_agent(settings)
+        app.state.fact_extractor_agent = await build_extractor_agent(settings, pool)
+        app.state.fact_judge_agent = await build_judge_agent(settings, pool)
     else:
         app.state.fact_extractor_agent = None
         app.state.fact_judge_agent = None

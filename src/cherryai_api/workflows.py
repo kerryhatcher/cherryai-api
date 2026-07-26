@@ -31,6 +31,12 @@ from cherryai_api.feedback import FeedbackEntry, get_entry
 from cherryai_api.feedback import format_search_results as format_feedback_results
 from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory
+from cherryai_api.model_configs import (
+    CALL_SITE_WORKFLOW_INVESTIGATE,
+    CALL_SITE_WORKFLOW_PLAN,
+    CALL_SITE_WORKFLOW_TRIAGE,
+    resolve_config,
+)
 from cherryai_api.settings import Settings
 from cherryai_api.users import User
 from cherryai_api.wiki import format_search_results as format_wiki_results
@@ -172,10 +178,16 @@ def _apply_triage_section(human_body: str, questions: list[str]) -> str:
 # --- Agent construction ---------------------------------------------------------
 
 
-def _ollama_model(settings: Settings, model_name: str) -> OpenAIChatModel:
+async def _resolved_model(
+    settings: Settings, pool: asyncpg.Pool | None, call_site: str
+) -> OpenAIChatModel:
+    config = await resolve_config(pool, call_site, settings)
+    api_key = config.api_key or settings.ollama_api_key
+    base_url = config.base_url or settings.ollama_base_url
+    model_name = config.model_name
     return OpenAIChatModel(
         model_name,
-        provider=OllamaProvider(base_url=settings.ollama_base_url, api_key=settings.ollama_api_key),
+        provider=OllamaProvider(base_url=base_url, api_key=api_key),
     )
 
 
@@ -247,48 +259,52 @@ PLAN_SYSTEM_PROMPT = (
 )
 
 
-def build_triage_agent(settings: Settings) -> Agent[None, TriageResult]:
+async def build_triage_agent(
+    settings: Settings,
+    pool: asyncpg.Pool | None,
+) -> Agent[None, TriageResult]:
     """Build the triage agent: structured output, no tools."""
     return Agent(
-        _ollama_model(settings, settings.workflow_triage_model),
+        await _resolved_model(settings, pool, CALL_SITE_WORKFLOW_TRIAGE),
         output_type=TriageResult,
         instructions=TRIAGE_SYSTEM_PROMPT,
     )
 
 
-def build_investigate_agent(
-    settings: Settings, database: Database, memory: CogneeMemory
+async def build_investigate_agent(
+    settings: Settings, pool: asyncpg.Pool | None, database: Database, memory: CogneeMemory
 ) -> Agent[None, str]:
     """Build the investigate agent: markdown output, read-only search tools."""
     agent: Agent[None, str] = Agent(
-        _ollama_model(settings, settings.workflow_investigate_model),
+        await _resolved_model(settings, pool, CALL_SITE_WORKFLOW_INVESTIGATE),
         instructions=INVESTIGATE_SYSTEM_PROMPT,
     )
     _register_search_tools(agent, database, memory)
     return agent
 
 
-def build_plan_agent(
-    settings: Settings, database: Database, memory: CogneeMemory
+async def build_plan_agent(
+    settings: Settings, pool: asyncpg.Pool | None, database: Database, memory: CogneeMemory
 ) -> Agent[None, str]:
     """Build the plan agent: markdown output, read-only search tools."""
     agent: Agent[None, str] = Agent(
-        _ollama_model(settings, settings.workflow_plan_model),
+        await _resolved_model(settings, pool, CALL_SITE_WORKFLOW_PLAN),
         instructions=PLAN_SYSTEM_PROMPT,
     )
     _register_search_tools(agent, database, memory)
     return agent
 
 
-def build_workflow_runtime(
+async def build_workflow_runtime(
     settings: Settings, database: Database, memory: CogneeMemory
 ) -> WorkflowRuntime:
     """Build the three workflow agents once, for the app's lifetime."""
+    pool = database.pool
     return WorkflowRuntime(
         settings=settings,
-        triage_agent=build_triage_agent(settings),
-        investigate_agent=build_investigate_agent(settings, database, memory),
-        plan_agent=build_plan_agent(settings, database, memory),
+        triage_agent=await build_triage_agent(settings, pool),
+        investigate_agent=await build_investigate_agent(settings, pool, database, memory),
+        plan_agent=await build_plan_agent(settings, pool, database, memory),
     )
 
 

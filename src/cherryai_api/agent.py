@@ -10,6 +10,7 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+import asyncpg
 import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -57,6 +58,7 @@ from cherryai_api.feedback import create_entry as create_feedback_entry
 from cherryai_api.feedback import format_search_results as format_feedback_results
 from cherryai_api.feedback import search_entries as search_feedback_entries
 from cherryai_api.memory import CogneeMemory
+from cherryai_api.model_configs import CALL_SITE_CHAT, resolve_config
 from cherryai_api.settings import Settings, get_settings
 from cherryai_api.wiki import format_search_results, search_entries
 from cherryai_api.workflows import WorkflowRuntime, fire_and_forget_triage
@@ -225,20 +227,27 @@ def strip_leaked_reasoning(text: str) -> str:
     return cleaned.strip()
 
 
-def build_model(settings: Settings) -> OpenAIChatModel:
-    """Build the chat model, served by Ollama cloud."""
-    if not settings.ollama_api_key:
-        raise ValueError("OLLAMA_API_KEY is missing from .env")
+async def build_model(
+    settings: Settings,
+    pool: asyncpg.Pool | None = None,
+) -> OpenAIChatModel:
+    """Build the chat model, with DB overrides if *pool* is available."""
+    config = await resolve_config(pool, CALL_SITE_CHAT, settings)
+    if not config.api_key:
+        raise ValueError(
+            f"No API key resolved for call_site='{CALL_SITE_CHAT}'; "
+            f"set OLLAMA_API_KEY in .env or configure api_key in model_configs"
+        )
     return OpenAIChatModel(
-        settings.chat_model,
+        config.model_name,
         provider=OllamaProvider(
-            base_url=settings.ollama_base_url,
-            api_key=settings.ollama_api_key,
+            base_url=config.base_url,
+            api_key=config.api_key,
         ),
     )
 
 
-def build_agent(
+async def build_agent(
     settings: Settings | None = None,
     database: Database | None = None,
     workflows: WorkflowRuntime | None = None,
@@ -254,8 +263,9 @@ def build_agent(
     ``AgentDeps`` on each run.
     """
     settings = settings or get_settings()
+    pool = database.pool if database else None
     agent: Agent[AgentDeps, str] = Agent(
-        build_model(settings),
+        await build_model(settings, pool=pool),
         instructions=SYSTEM_PROMPT,
         deps_type=AgentDeps,
     )

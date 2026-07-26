@@ -9,6 +9,11 @@ from typing import Any
 import asyncpg
 from pydantic import BaseModel
 
+from cherryai_api.model_configs import (
+    CREATE_MODEL_CONFIGS_TABLE,
+    ResolvedModelConfig,
+    resolve_config,
+)
 from cherryai_api.settings import get_settings
 
 _SESSION_TITLE_MAX = 60
@@ -100,6 +105,8 @@ class Database:
             for migration in PLANNER_MIGRATIONS:
                 await _ddl(conn, migration)
         await _ensure_approvals_table(self._pool)
+        async with self._pool.acquire() as conn:
+            await _ddl(conn, CREATE_MODEL_CONFIGS_TABLE)
         # Job-state columns + stale-'running' cleanup (crash recovery); needs its
         # own connection since ensure_workflow_columns acquires from the pool.
         await ensure_workflow_columns(self._pool)
@@ -177,6 +184,10 @@ class Database:
     async def set_title(self, session_id: uuid.UUID, title: str) -> None:
         title = (title or "New chat").strip()[:_SESSION_TITLE_MAX] or "New chat"
         await self.pool.execute("UPDATE sessions SET title = $2 WHERE id = $1", session_id, title)
+
+    async def resolve_model(self, call_site: str) -> ResolvedModelConfig:
+        """Resolve model config for *call_site*, merging DB overrides over env vars."""
+        return await resolve_config(self.pool, call_site)
 
 
 def make_session_title(first_user_message: str) -> str:

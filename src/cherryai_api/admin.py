@@ -3,12 +3,18 @@
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cherryai_api.auth import require_admin
+from cherryai_api.model_configs import (
+    ALL_CALL_SITES,
+    delete_config,
+    list_configs,
+    upsert_config,
+)
 from cherryai_api.orm import get_async_session
 from cherryai_api.users import ROLE_ADMIN, ROLE_CHAT, ROLES, AccessToken, User
 
@@ -145,3 +151,98 @@ async def reactivate_user(
     await session.commit()
     await session.refresh(user)
     return user
+
+
+# ── Model configs ────────────────────────────────────────────────────────────
+
+
+class ModelConfigOut(BaseModel):
+    call_site: str
+    provider: str
+    base_url: str
+    has_api_key: bool
+    model_name: str
+    updated_at: datetime
+
+
+class ModelConfigUpsert(BaseModel):
+    provider: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    model_name: str = ""
+
+
+@router.get("/model-configs", response_model=list[ModelConfigOut])
+async def list_model_configs(
+    request: Request,
+    admin: User = Depends(require_admin),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+) -> list[dict]:
+    """List all model configs (masking API keys)."""
+    pool = request.app.state.db.pool
+    rows = await list_configs(pool)
+    result: list[dict] = []
+    for site in ALL_CALL_SITES:
+        row = next((r for r in rows if r.call_site == site), None)
+        result.append(
+            {
+                "call_site": site,
+                "provider": row.provider if row else "",
+                "base_url": row.base_url if row else "",
+                "has_api_key": bool(row.api_key) if row else False,
+                "model_name": row.model_name if row else "",
+                "updated_at": row.updated_at if row else None,
+            }
+        )
+    return result
+
+
+@router.put("/model-configs/{call_site}", response_model=ModelConfigOut)
+async def update_model_config(
+    request: Request,
+    call_site: str,
+    body: ModelConfigUpsert,
+    admin: User = Depends(require_admin),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+) -> dict:
+    """Upsert a model config for *call_site*."""
+    if call_site not in ALL_CALL_SITES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown call_site '{call_site}'. Valid: {', '.join(ALL_CALL_SITES)}",
+        )
+    pool = request.app.state.db.pool
+    row = await upsert_config(
+        pool,
+        call_site=call_site,
+        provider=body.provider,
+        base_url=body.base_url,
+        api_key=body.api_key,
+        model_name=body.model_name,
+    )
+    return {
+        "call_site": row.call_site,
+        "provider": row.provider,
+        "base_url": row.base_url,
+        "has_api_key": bool(row.api_key),
+        "model_name": row.model_name,
+        "updated_at": row.updated_at,
+    }
+
+
+@router.delete("/model-configs/{call_site}", status_code=204)
+async def delete_model_config(
+    request: Request,
+    call_site: str,
+    admin: User = Depends(require_admin),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+) -> None:
+    """Delete a model config, reverting to env-var defaults."""
+    if call_site not in ALL_CALL_SITES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown call_site '{call_site}'. Valid: {', '.join(ALL_CALL_SITES)}",
+        )
+    pool = request.app.state.db.pool
+    if not await delete_config(pool, call_site):
+        raise HTTPException(status_code=404, detail="Model config not found")

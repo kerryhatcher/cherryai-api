@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import asyncpg
 from loguru import logger
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -19,6 +20,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 from cherryai_api.memory import CogneeMemory
+from cherryai_api.model_configs import CALL_SITE_FACT_EXTRACTION, resolve_config
 from cherryai_api.settings import Settings
 
 
@@ -54,18 +56,28 @@ JUDGE_SYSTEM_PROMPT = (
 )
 
 
-def _local_ollama_model(settings: Settings) -> OpenAIChatModel:
-    """Build the OpenAI-compatible model pointed at the local Ollama instance."""
+async def _resolved_fact_model(
+    settings: Settings,
+    pool: asyncpg.Pool | None,
+) -> OpenAIChatModel:
+    """Resolve the fact-extraction model, with DB overrides if *pool* is available."""
+    config = await resolve_config(pool, CALL_SITE_FACT_EXTRACTION, settings)
     return OpenAIChatModel(
-        settings.fact_extraction_model,
-        provider=OllamaProvider(base_url=settings.ollama_local_base_url),
+        config.model_name,
+        provider=OllamaProvider(
+            base_url=config.base_url,
+            api_key=config.api_key,
+        ),
     )
 
 
-def build_extractor_agent(settings: Settings) -> Agent[None, ExtractedFacts]:
+async def build_extractor_agent(
+    settings: Settings,
+    pool: asyncpg.Pool | None,
+) -> Agent[None, ExtractedFacts]:
     """Build the fact-extraction agent: structured output, no tools."""
     return Agent(
-        _local_ollama_model(settings),
+        await _resolved_fact_model(settings, pool),
         output_type=ExtractedFacts,
         instructions=EXTRACT_SYSTEM_PROMPT,
         # qwen3:8b occasionally emits reasoning text instead of the output
@@ -74,10 +86,13 @@ def build_extractor_agent(settings: Settings) -> Agent[None, ExtractedFacts]:
     )
 
 
-def build_judge_agent(settings: Settings) -> Agent[None, FactVerdict]:
+async def build_judge_agent(
+    settings: Settings,
+    pool: asyncpg.Pool | None,
+) -> Agent[None, FactVerdict]:
     """Build the dedup judge agent: structured output, no tools."""
     return Agent(
-        _local_ollama_model(settings),
+        await _resolved_fact_model(settings, pool),
         output_type=FactVerdict,
         instructions=JUDGE_SYSTEM_PROMPT,
         # Same flakiness margin as the extractor agent.
