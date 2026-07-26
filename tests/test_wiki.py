@@ -39,7 +39,7 @@ def _cap(user_id, family_id=None, scopes=frozenset({"wiki:read", "wiki:write", "
     return Capability(user_id=user_id, family_id=family_id, role=None, scopes=scopes)
 
 
-async def _make_family(pool, organizer_id):
+async def _make_family(organizer_id):
     """Create a family and return its id."""
     async with async_session_maker() as session:
         family = await create_family(
@@ -448,7 +448,7 @@ async def test_rename_folder_rejecting_too_deep_leaves_shallow_page_untouched(po
 async def test_family_scoped_list(pool, owner, make_user) -> None:
     """Entries created in a family context are only visible when listing with that family."""
     cap_personal = _cap(owner)
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_family = _cap(owner, family_id=family_id)
 
     personal_entry = await create_entry(
@@ -474,7 +474,7 @@ async def test_family_scoped_list(pool, owner, make_user) -> None:
 async def test_family_scoped_get(pool, owner) -> None:
     """Getting an entry in the wrong family context returns None."""
     cap_personal = _cap(owner)
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_family = _cap(owner, family_id=family_id)
 
     entry = await create_entry(
@@ -492,8 +492,8 @@ async def test_family_scoped_get(pool, owner) -> None:
 @pytest.mark.asyncio
 async def test_cross_family_isolation(pool, owner) -> None:
     """Entries in family A are invisible in family B."""
-    family_a = await _make_family(pool, owner)
-    family_b = await _make_family(pool, owner)
+    family_a = await _make_family(owner)
+    family_b = await _make_family(owner)
     cap_a = _cap(owner, family_id=family_a)
     cap_b = _cap(owner, family_id=family_b)
 
@@ -516,7 +516,7 @@ async def test_cross_family_isolation(pool, owner) -> None:
 @pytest.mark.asyncio
 async def test_child_does_not_see_adult_audience_entries(pool, owner) -> None:
     """A capability without wiki:read:adult must not see adult-audience pages."""
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_adult = _cap(
         owner, family_id=family_id, scopes=frozenset({"wiki:read", "wiki:write", "wiki:read:adult"})
     )
@@ -567,7 +567,7 @@ async def test_audience_filtering_only_applies_in_family_context(pool, owner) ->
 async def test_move_personal_to_family(pool, owner) -> None:
     """Moving a personal entry to a family context updates its family_id."""
     cap_personal = _cap(owner)
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_family = _cap(owner, family_id=family_id)
 
     entry = await create_entry(
@@ -587,7 +587,7 @@ async def test_move_personal_to_family(pool, owner) -> None:
 @pytest.mark.asyncio
 async def test_move_family_to_personal(pool, owner) -> None:
     """Moving a family entry to personal context clears its family_id."""
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_family = _cap(owner, family_id=family_id)
     cap_personal = _cap(owner)
 
@@ -609,7 +609,7 @@ async def test_move_family_to_personal(pool, owner) -> None:
 async def test_move_slug_collision_raises(pool, owner) -> None:
     """Moving to a context where the slug already exists raises SlugExists."""
     cap_personal = _cap(owner)
-    family_id = await _make_family(pool, owner)
+    family_id = await _make_family(owner)
     cap_family = _cap(owner, family_id=family_id)
 
     # Create an entry in the family with a known slug.
