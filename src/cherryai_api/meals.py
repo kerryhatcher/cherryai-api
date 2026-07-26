@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from pydantic_ai import Agent, RunContext
 
 from cherryai_api.agent import AgentDeps
-from cherryai_api.auth import current_verified_user
+from cherryai_api.authz import Capability, require_permission
 from cherryai_api.db import Database
 from cherryai_api.meal_units import (
     AggregatedIngredient,
@@ -28,7 +28,6 @@ from cherryai_api.meal_units import (
     packages_needed,
     to_canonical_unit_factor,
 )
-from cherryai_api.users import User
 
 # AgentDeps is imported here for real (not TYPE_CHECKING-only) because
 # pydantic-ai resolves tool function annotations at runtime via
@@ -168,6 +167,17 @@ MEALS_MIGRATIONS: list[str] = [
     "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS store_product_id UUID",
     "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS store_name TEXT",
     "ALTER TABLE shopping_list_items ADD COLUMN IF NOT EXISTS package_label TEXT",
+    # Family scoping (Phase 3b).
+    "ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS family_id UUID ",
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS family_id UUID ",
+    "ALTER TABLE shopping_lists ADD COLUMN IF NOT EXISTS family_id UUID ",
+    "ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS family_id UUID ",
+    "ALTER TABLE stores ADD COLUMN IF NOT EXISTS family_id UUID ",
+    "CREATE INDEX IF NOT EXISTS ix_meal_plans_family ON meal_plans (family_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_recipes_family ON recipes (family_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_shopping_lists_family ON shopping_lists (family_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_pantry_items_family ON pantry_items (family_id)",
+    "CREATE INDEX IF NOT EXISTS ix_stores_family ON stores (family_id, created_at)",
 ]
 
 
@@ -1944,9 +1954,9 @@ def _pool(request: Request) -> asyncpg.Pool:
 @router.get("/plans")
 async def list_plans(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    plans = await list_meal_plans(_pool(request), user.id)
+    plans = await list_meal_plans(_pool(request), capability.user_id)
     return [p.model_dump(mode="json") for p in plans]
 
 
@@ -1954,10 +1964,10 @@ async def list_plans(
 async def create_plan(
     request: Request,
     body: MealPlanCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        plan = await create_meal_plan(_pool(request), user.id, body)
+        plan = await create_meal_plan(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return plan.model_dump(mode="json")
@@ -1967,9 +1977,9 @@ async def create_plan(
 async def get_plan(
     request: Request,
     plan_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    plan = await get_meal_plan(_pool(request), user.id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     return plan.model_dump(mode="json")
@@ -1980,10 +1990,10 @@ async def update_plan(
     request: Request,
     plan_id: uuid.UUID,
     body: MealPlanUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        plan = await update_meal_plan(_pool(request), user.id, plan_id, body)
+        plan = await update_meal_plan(_pool(request), capability.user_id, plan_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if plan is None:
@@ -1995,9 +2005,9 @@ async def update_plan(
 async def delete_plan(
     request: Request,
     plan_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_meal_plan(_pool(request), user.id, plan_id):
+    if not await delete_meal_plan(_pool(request), capability.user_id, plan_id):
         raise HTTPException(status_code=404, detail="Meal plan not found")
 
 
@@ -2008,9 +2018,9 @@ async def delete_plan(
 async def list_days(
     request: Request,
     plan_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    plan = await get_meal_plan(_pool(request), user.id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     days = await list_plan_days(_pool(request), plan_id)
@@ -2022,9 +2032,9 @@ async def create_day(
     request: Request,
     plan_id: uuid.UUID,
     body: MealPlanDayCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    plan = await get_meal_plan(_pool(request), user.id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     day = await upsert_plan_day(_pool(request), plan_id, body)
@@ -2036,9 +2046,9 @@ async def update_day(
     request: Request,
     day_id: uuid.UUID,
     body: MealPlanDayUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    day = await update_plan_day(_pool(request), user.id, day_id, body)
+    day = await update_plan_day(_pool(request), capability.user_id, day_id, body)
     if day is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return day.model_dump(mode="json")
@@ -2053,9 +2063,9 @@ async def add_recipe_to_day_endpoint(
     request: Request,
     day_id: uuid.UUID,
     body: DayRecipeAction,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    ref = await add_recipe_to_day(_pool(request), user.id, day_id, body.recipe_id)
+    ref = await add_recipe_to_day(_pool(request), capability.user_id, day_id, body.recipe_id)
     if ref is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return ref.model_dump(mode="json")
@@ -2066,9 +2076,9 @@ async def remove_recipe_from_day_endpoint(
     request: Request,
     day_id: uuid.UUID,
     recipe_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await remove_recipe_from_day(_pool(request), user.id, day_id, recipe_id):
+    if not await remove_recipe_from_day(_pool(request), capability.user_id, day_id, recipe_id):
         raise HTTPException(status_code=404, detail="Recipe not found on this day")
 
 
@@ -2076,9 +2086,9 @@ async def remove_recipe_from_day_endpoint(
 async def delete_day(
     request: Request,
     day_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_plan_day(_pool(request), user.id, day_id):
+    if not await delete_plan_day(_pool(request), capability.user_id, day_id):
         raise HTTPException(status_code=404, detail="Day not found")
 
 
@@ -2089,10 +2099,10 @@ async def delete_day(
 async def generate_list(
     request: Request,
     plan_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await generate_shopping_list_from_plan(_pool(request), user.id, plan_id)
+        slist = await generate_shopping_list_from_plan(_pool(request), capability.user_id, plan_id)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2102,10 +2112,10 @@ async def generate_list(
 async def generate_list_endpoint(
     request: Request,
     body: GenerateListRequest,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await generate_shopping_list(_pool(request), user.id, body)
+        slist = await generate_shopping_list(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2117,9 +2127,9 @@ async def generate_list_endpoint(
 @router.get("/recipes")
 async def list_recipe_list(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    recipes = await list_recipes(_pool(request), user.id)
+    recipes = await list_recipes(_pool(request), capability.user_id)
     return [r.model_dump(mode="json") for r in recipes]
 
 
@@ -2127,10 +2137,10 @@ async def list_recipe_list(
 async def create_recipe_endpoint(
     request: Request,
     body: RecipeCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        recipe = await create_recipe(_pool(request), user.id, body)
+        recipe = await create_recipe(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return recipe.model_dump(mode="json")
@@ -2140,9 +2150,9 @@ async def create_recipe_endpoint(
 async def get_recipe_endpoint(
     request: Request,
     recipe_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    recipe = await get_recipe(_pool(request), user.id, recipe_id)
+    recipe = await get_recipe(_pool(request), capability.user_id, recipe_id)
     if recipe is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
     return recipe.model_dump(mode="json")
@@ -2153,10 +2163,10 @@ async def update_recipe_endpoint(
     request: Request,
     recipe_id: uuid.UUID,
     body: RecipeUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        recipe = await update_recipe(_pool(request), user.id, recipe_id, body)
+        recipe = await update_recipe(_pool(request), capability.user_id, recipe_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if recipe is None:
@@ -2168,9 +2178,9 @@ async def update_recipe_endpoint(
 async def delete_recipe_endpoint(
     request: Request,
     recipe_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_recipe(_pool(request), user.id, recipe_id):
+    if not await delete_recipe(_pool(request), capability.user_id, recipe_id):
         raise HTTPException(status_code=404, detail="Recipe not found")
 
 
@@ -2182,9 +2192,9 @@ async def add_recipe_ingredient(
     request: Request,
     recipe_id: uuid.UUID,
     body: RecipeIngredientCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    recipe = await get_recipe(_pool(request), user.id, recipe_id)
+    recipe = await get_recipe(_pool(request), capability.user_id, recipe_id)
     if recipe is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
     try:
@@ -2199,10 +2209,12 @@ async def update_recipe_ingredient(
     request: Request,
     ingredient_id: uuid.UUID,
     body: IngredientUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        ingredient = await update_ingredient(_pool(request), user.id, ingredient_id, body)
+        ingredient = await update_ingredient(
+            _pool(request), capability.user_id, ingredient_id, body
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if ingredient is None:
@@ -2214,9 +2226,9 @@ async def update_recipe_ingredient(
 async def delete_recipe_ingredient(
     request: Request,
     ingredient_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_ingredient(_pool(request), user.id, ingredient_id):
+    if not await delete_ingredient(_pool(request), capability.user_id, ingredient_id):
         raise HTTPException(status_code=404, detail="Ingredient not found")
 
 
@@ -2226,9 +2238,9 @@ async def delete_recipe_ingredient(
 @router.get("/lists")
 async def list_shopping(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    lists = await list_shopping_lists(_pool(request), user.id)
+    lists = await list_shopping_lists(_pool(request), capability.user_id)
     return [item.model_dump(mode="json") for item in lists]
 
 
@@ -2236,10 +2248,10 @@ async def list_shopping(
 async def create_shopping(
     request: Request,
     body: ShoppingListCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await create_shopping_list(_pool(request), user.id, body)
+        slist = await create_shopping_list(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2249,9 +2261,9 @@ async def create_shopping(
 async def get_shopping(
     request: Request,
     list_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    slist = await get_shopping_list(_pool(request), user.id, list_id)
+    slist = await get_shopping_list(_pool(request), capability.user_id, list_id)
     if slist is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     return slist.model_dump(mode="json")
@@ -2262,10 +2274,10 @@ async def update_shopping(
     request: Request,
     list_id: uuid.UUID,
     body: ShoppingListUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await update_shopping_list(_pool(request), user.id, list_id, body)
+        slist = await update_shopping_list(_pool(request), capability.user_id, list_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if slist is None:
@@ -2277,9 +2289,9 @@ async def update_shopping(
 async def delete_shopping(
     request: Request,
     list_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_shopping_list(_pool(request), user.id, list_id):
+    if not await delete_shopping_list(_pool(request), capability.user_id, list_id):
         raise HTTPException(status_code=404, detail="Shopping list not found")
 
 
@@ -2291,9 +2303,9 @@ async def add_list_item_endpoint(
     request: Request,
     list_id: uuid.UUID,
     body: ShoppingListItemCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    slist = await get_shopping_list(_pool(request), user.id, list_id)
+    slist = await get_shopping_list(_pool(request), capability.user_id, list_id)
     if slist is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     try:
@@ -2308,10 +2320,10 @@ async def update_list_item_endpoint(
     request: Request,
     item_id: uuid.UUID,
     body: ShoppingListItemUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await update_list_item(_pool(request), user.id, item_id, body)
+        item = await update_list_item(_pool(request), capability.user_id, item_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if item is None:
@@ -2323,9 +2335,9 @@ async def update_list_item_endpoint(
 async def delete_list_item_endpoint(
     request: Request,
     item_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_list_item(_pool(request), user.id, item_id):
+    if not await delete_list_item(_pool(request), capability.user_id, item_id):
         raise HTTPException(status_code=404, detail="Item not found")
 
 
@@ -2335,9 +2347,9 @@ async def delete_list_item_endpoint(
 @router.get("/pantry")
 async def list_pantry_endpoint(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    items = await list_pantry_items(_pool(request), user.id)
+    items = await list_pantry_items(_pool(request), capability.user_id)
     return [item.model_dump(mode="json") for item in items]
 
 
@@ -2345,10 +2357,10 @@ async def list_pantry_endpoint(
 async def upsert_pantry_endpoint(
     request: Request,
     body: PantryItemCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await upsert_pantry_item(_pool(request), user.id, body)
+        item = await upsert_pantry_item(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return item.model_dump(mode="json")
@@ -2359,10 +2371,10 @@ async def update_pantry_endpoint(
     request: Request,
     item_id: uuid.UUID,
     body: PantryItemUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await update_pantry_item(_pool(request), user.id, item_id, body)
+        item = await update_pantry_item(_pool(request), capability.user_id, item_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if item is None:
@@ -2374,9 +2386,9 @@ async def update_pantry_endpoint(
 async def delete_pantry_endpoint(
     request: Request,
     item_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_pantry_item(_pool(request), user.id, item_id):
+    if not await delete_pantry_item(_pool(request), capability.user_id, item_id):
         raise HTTPException(status_code=404, detail="Pantry item not found")
 
 
@@ -2388,11 +2400,11 @@ async def consume_day_endpoint(
     request: Request,
     day_id: uuid.UUID,
     body: ConsumeRequest | None = None,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     force = body.force if body is not None else False
     try:
-        result = await consume_day(_pool(request), user.id, day_id, force=force)
+        result = await consume_day(_pool(request), capability.user_id, day_id, force=force)
     except DayAlreadyConsumed as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     if result is None:
@@ -2405,9 +2417,9 @@ async def consume_day_endpoint(
 async def unconsume_day_endpoint(
     request: Request,
     day_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    day = await unconsume_day(_pool(request), user.id, day_id)
+    day = await unconsume_day(_pool(request), capability.user_id, day_id)
     if day is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return day.model_dump(mode="json")
@@ -2420,9 +2432,9 @@ async def unconsume_day_endpoint(
 async def commit_to_pantry_endpoint(
     request: Request,
     list_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    added = await commit_list_to_pantry(_pool(request), user.id, list_id)
+    added = await commit_list_to_pantry(_pool(request), capability.user_id, list_id)
     if added is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     return CommitToPantryResponse(added=added).model_dump(mode="json")
@@ -2434,9 +2446,9 @@ async def commit_to_pantry_endpoint(
 @router.get("/stores")
 async def list_stores_endpoint(
     request: Request,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    stores = await list_stores(_pool(request), user.id)
+    stores = await list_stores(_pool(request), capability.user_id)
     return [store.model_dump(mode="json") for store in stores]
 
 
@@ -2444,10 +2456,10 @@ async def list_stores_endpoint(
 async def create_store_endpoint(
     request: Request,
     body: StoreCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        store = await create_store(_pool(request), user.id, body)
+        store = await create_store(_pool(request), capability.user_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return store.model_dump(mode="json")
@@ -2458,10 +2470,10 @@ async def update_store_endpoint(
     request: Request,
     store_id: uuid.UUID,
     body: StoreUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        store = await update_store(_pool(request), user.id, store_id, body)
+        store = await update_store(_pool(request), capability.user_id, store_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if store is None:
@@ -2473,9 +2485,9 @@ async def update_store_endpoint(
 async def delete_store_endpoint(
     request: Request,
     store_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_store(_pool(request), user.id, store_id):
+    if not await delete_store(_pool(request), capability.user_id, store_id):
         raise HTTPException(status_code=404, detail="Store not found")
 
 
@@ -2486,9 +2498,9 @@ async def delete_store_endpoint(
 async def list_store_products_endpoint(
     request: Request,
     store_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    products = await list_store_products(_pool(request), user.id, store_id)
+    products = await list_store_products(_pool(request), capability.user_id, store_id)
     if products is None:
         raise HTTPException(status_code=404, detail="Store not found")
     return [product.model_dump(mode="json") for product in products]
@@ -2499,10 +2511,10 @@ async def add_store_product_endpoint(
     request: Request,
     store_id: uuid.UUID,
     body: StoreProductCreate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        product = await add_store_product(_pool(request), user.id, store_id, body)
+        product = await add_store_product(_pool(request), capability.user_id, store_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if product is None:
@@ -2515,10 +2527,10 @@ async def update_store_product_endpoint(
     request: Request,
     product_id: uuid.UUID,
     body: StoreProductUpdate,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        product = await update_store_product(_pool(request), user.id, product_id, body)
+        product = await update_store_product(_pool(request), capability.user_id, product_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if product is None:
@@ -2530,9 +2542,9 @@ async def update_store_product_endpoint(
 async def delete_store_product_endpoint(
     request: Request,
     product_id: uuid.UUID,
-    user: User = Depends(current_verified_user),  # noqa: B008
+    capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_store_product(_pool(request), user.id, product_id):
+    if not await delete_store_product(_pool(request), capability.user_id, product_id):
         raise HTTPException(status_code=404, detail="Store product not found")
 
 
@@ -2562,6 +2574,16 @@ _list_shopping_lists_fn = list_shopping_lists
 _get_shopping_list_fn = get_shopping_list
 _list_stores_fn = list_stores
 _list_store_products_fn = list_store_products
+
+
+def _cap(deps):
+    """Build a Capability from agent deps, falling back to personal context."""
+    cap = getattr(deps, "capability", None)
+    if cap is not None:
+        return cap
+    from cherryai_api.authz import Capability
+
+    return Capability(user_id=deps.user_id, family_id=None, role=None, scopes=frozenset())
 
 
 def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None) -> None:
@@ -2624,7 +2646,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("search_recipes")}]
         try:
-            recipes = await _recipes_fn(database.pool, ctx.deps.user_id)
+            recipes = await _recipes_fn(database.pool, _cap(ctx.deps).user_id)
         except Exception as error:
             logger.bind(query=query).warning(f"search_recipes failed: {error}")
             return [{"error": f"search_recipes failed: {error}"}]
@@ -2642,7 +2664,9 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("get_recipe")}
         try:
-            recipe = await _get_recipe_fn(database.pool, ctx.deps.user_id, uuid.UUID(recipe_id))
+            recipe = await _get_recipe_fn(
+                database.pool, _cap(ctx.deps).user_id, uuid.UUID(recipe_id)
+            )
         except ValueError as error:
             return {"error": f"get_recipe failed: {error}"}
         except Exception as error:
@@ -2734,7 +2758,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_meal_plans")}]
         try:
-            plans = await _list_meal_plans_fn(database.pool, ctx.deps.user_id)
+            plans = await _list_meal_plans_fn(database.pool, _cap(ctx.deps).user_id)
         except Exception as error:
             logger.warning(f"list_meal_plans failed: {error}")
             return [{"error": f"list_meal_plans failed: {error}"}]
@@ -2751,7 +2775,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": _unavailable("get_meal_plan")}
         try:
             plan_uuid = uuid.UUID(plan_id)
-            plan = await _get_meal_plan_fn(database.pool, ctx.deps.user_id, plan_uuid)
+            plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, plan_uuid)
         except ValueError as error:
             return {"error": f"get_meal_plan failed: {error}"}
         except Exception as error:
@@ -2774,7 +2798,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": _unavailable("create_meal_plan")}
         try:
             data = MealPlanCreate(name=name, week_start=date.fromisoformat(week_start))
-            plan = await _create_meal_plan_fn(database.pool, ctx.deps.user_id, data)
+            plan = await _create_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, data)
         except ValueError as error:
             return {"error": f"create_meal_plan failed: {error}"}
         except Exception as error:
@@ -2808,7 +2832,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"assign_recipe_to_day failed: {error}"}
 
-        plan = await _get_meal_plan_fn(database.pool, ctx.deps.user_id, plan_uuid)
+        plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, plan_uuid)
         if plan is None:
             return {"error": f"No meal plan found with id {plan_id}."}
 
@@ -2832,7 +2856,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 )
                 if ref is None:
                     return {"error": "assign_recipe_to_day failed: day not found."}
-                day = await get_plan_day(database.pool, ctx.deps.user_id, existing.id)
+                day = await get_plan_day(database.pool, _cap(ctx.deps).user_id, existing.id)
         except Exception as error:
             logger.bind(plan_id=plan_id).warning(f"assign_recipe_to_day failed: {error}")
             return {"error": f"assign_recipe_to_day failed: {error}"}
@@ -2879,7 +2903,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"mark_meal_consumed failed: {error}"}
         try:
-            result = await consume_day(database.pool, ctx.deps.user_id, day_uuid, force=force)
+            result = await consume_day(database.pool, _cap(ctx.deps).user_id, day_uuid, force=force)
         except DayAlreadyConsumed:
             return {
                 "error": "That day is already marked consumed. Pass force=true to re-consume it."
@@ -2902,7 +2926,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("unmark_meal_consumed")}
         try:
-            day = await unconsume_day(database.pool, ctx.deps.user_id, uuid.UUID(day_id))
+            day = await unconsume_day(database.pool, _cap(ctx.deps).user_id, uuid.UUID(day_id))
         except ValueError as error:
             return {"error": f"unmark_meal_consumed failed: {error}"}
         except Exception as error:
@@ -2951,7 +2975,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 store_id=uuid.UUID(store_id) if store_id else None,
                 name=name,
             )
-            slist = await _generate_shopping_list_fn(database.pool, ctx.deps.user_id, request)
+            slist = await _generate_shopping_list_fn(database.pool, _cap(ctx.deps).user_id, request)
         except ValueError as error:
             return {"error": f"generate_shopping_list failed: {error}"}
         except Exception as error:
@@ -2965,7 +2989,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_shopping_lists")}]
         try:
-            lists = await _list_shopping_lists_fn(database.pool, ctx.deps.user_id)
+            lists = await _list_shopping_lists_fn(database.pool, _cap(ctx.deps).user_id)
         except Exception as error:
             logger.warning(f"list_shopping_lists failed: {error}")
             return [{"error": f"list_shopping_lists failed: {error}"}]
@@ -2977,7 +3001,9 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("get_shopping_list")}
         try:
-            slist = await _get_shopping_list_fn(database.pool, ctx.deps.user_id, uuid.UUID(list_id))
+            slist = await _get_shopping_list_fn(
+                database.pool, _cap(ctx.deps).user_id, uuid.UUID(list_id)
+            )
         except ValueError as error:
             return {"error": f"get_shopping_list failed: {error}"}
         except Exception as error:
@@ -3003,7 +3029,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             list_uuid = uuid.UUID(list_id)
         except ValueError as error:
             return {"error": f"add_shopping_item failed: {error}"}
-        slist = await _get_shopping_list_fn(database.pool, ctx.deps.user_id, list_uuid)
+        slist = await _get_shopping_list_fn(database.pool, _cap(ctx.deps).user_id, list_uuid)
         if slist is None:
             return {"error": f"No shopping list found with id {list_id}."}
         try:
@@ -3050,7 +3076,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("get_pantry")}]
         try:
-            items = await list_pantry_items(database.pool, ctx.deps.user_id)
+            items = await list_pantry_items(database.pool, _cap(ctx.deps).user_id)
         except Exception as error:
             logger.warning(f"get_pantry failed: {error}")
             return [{"error": f"get_pantry failed: {error}"}]
@@ -3092,7 +3118,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_stores")}]
         try:
-            stores = await _list_stores_fn(database.pool, ctx.deps.user_id)
+            stores = await _list_stores_fn(database.pool, _cap(ctx.deps).user_id)
         except Exception as error:
             logger.warning(f"list_stores failed: {error}")
             return [{"error": f"list_stores failed: {error}"}]
@@ -3140,7 +3166,9 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"upsert_store_product failed: {error}"}
         try:
-            existing = await _list_store_products_fn(database.pool, ctx.deps.user_id, store_uuid)
+            existing = await _list_store_products_fn(
+                database.pool, _cap(ctx.deps).user_id, store_uuid
+            )
         except Exception as error:
             logger.bind(store_id=store_id).warning(f"upsert_store_product failed: {error}")
             return {"error": f"upsert_store_product failed: {error}"}

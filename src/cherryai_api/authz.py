@@ -224,7 +224,15 @@ def scope_clause(model, capability: Capability):
 # Tables with RLS enabled. EMPTY in phase 1 by design: legacy module queries
 # don't set GUCs yet, and FORCE RLS would blank them. Each module phase
 # appends its tables here in the same commit that adopts scoped queries.
-RLS_TABLES: tuple[str, ...] = ("wiki_entries", "planner_projects")
+RLS_TABLES: tuple[str, ...] = (
+    "wiki_entries",
+    "planner_projects",
+    "meal_plans",
+    "recipes",
+    "shopping_lists",
+    "pantry_items",
+    "stores",
+)
 
 
 def rls_policy_sql(table: str) -> list[str]:
