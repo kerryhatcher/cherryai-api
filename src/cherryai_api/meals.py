@@ -18,7 +18,12 @@ from pydantic import BaseModel, field_validator, model_validator
 from pydantic_ai import Agent, RunContext
 
 from cherryai_api.agent import AgentDeps
-from cherryai_api.authz import Capability, require_permission
+from cherryai_api.authz import (
+    Capability,
+    require_permission,
+    scope_sql,
+    scoped_connection,
+)
 from cherryai_api.db import Database
 from cherryai_api.meal_units import (
     AggregatedIngredient,
@@ -564,78 +569,88 @@ _PLAN_LIST_COLUMNS = """
 """
 
 
-async def list_meal_plans(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[MealPlanListItem]:
-    rows = await pool.fetch(
-        f"""
-        SELECT {_PLAN_LIST_COLUMNS}
-          FROM meal_plans p
-          LEFT JOIN LATERAL (
-              SELECT count(DISTINCT d.id) AS day_count,
-                     count(dr.id) AS recipe_count
-                FROM meal_plan_days d
-                LEFT JOIN meal_plan_day_recipes dr ON dr.day_id = d.id
-               WHERE d.plan_id = p.id
-          ) dc ON true
-         WHERE p.owner_id = $1
-         ORDER BY p.week_start DESC
-        """,
-        owner_id,
-    )
+async def list_meal_plans(pool: asyncpg.Pool, capability: Capability) -> list[MealPlanListItem]:
+    clause, params = scope_sql(capability, alias="p")
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT {_PLAN_LIST_COLUMNS}
+              FROM meal_plans p
+              LEFT JOIN LATERAL (
+                  SELECT count(DISTINCT d.id) AS day_count,
+                         count(dr.id) AS recipe_count
+                    FROM meal_plan_days d
+                    LEFT JOIN meal_plan_day_recipes dr ON dr.day_id = d.id
+                   WHERE d.plan_id = p.id
+              ) dc ON true
+             WHERE {clause}
+             ORDER BY p.week_start DESC
+            """,
+            *params,
+        )
     return [MealPlanListItem(**dict(row)) for row in rows]
 
 
 async def get_meal_plan(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID
 ) -> MealPlan | None:
-    row = await pool.fetchrow(
-        f"SELECT {_PLAN_COLUMNS} FROM meal_plans WHERE id = $1 AND owner_id = $2",
-        plan_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_PLAN_COLUMNS} FROM meal_plans WHERE id = $1 AND {clause}",
+            plan_id,
+            *params,
+        )
     return MealPlan(**dict(row)) if row else None
 
 
 async def create_meal_plan(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, data: MealPlanCreate
+    pool: asyncpg.Pool, capability: Capability, data: MealPlanCreate
 ) -> MealPlan:
     name = data.name.strip()
     if not name:
         raise ValueError("Meal plan name must not be empty")
-    row = await pool.fetchrow(
-        f"INSERT INTO meal_plans (id, name, owner_id, week_start) "
-        f"VALUES ($1, $2, $3, $4) RETURNING {_PLAN_COLUMNS}",
-        uuid.uuid4(),
-        name,
-        owner_id,
-        data.week_start,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO meal_plans (id, name, owner_id, family_id, week_start) "
+            f"VALUES ($1, $2, $3, $4, $5) RETURNING {_PLAN_COLUMNS}",
+            uuid.uuid4(),
+            name,
+            capability.user_id,
+            capability.family_id,
+            data.week_start,
+        )
     return MealPlan(**dict(row))
 
 
 async def update_meal_plan(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID, data: MealPlanUpdate
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID, data: MealPlanUpdate
 ) -> MealPlan | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Meal plan name must not be empty")
-    row = await pool.fetchrow(
-        f"UPDATE meal_plans SET "
-        f"name = COALESCE($3, name), "
-        f"week_start = COALESCE($4, week_start), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_PLAN_COLUMNS}",
-        plan_id,
-        owner_id,
-        name,
-        data.week_start,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE meal_plans SET "
+            f"name = COALESCE($3, name), "
+            f"week_start = COALESCE($4, week_start), "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND {clause} RETURNING {_PLAN_COLUMNS}",
+            plan_id,
+            *params,
+            name,
+            data.week_start,
+        )
     return MealPlan(**dict(row)) if row else None
 
 
-async def delete_meal_plan(pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM meal_plans WHERE id = $1 AND owner_id = $2", plan_id, owner_id
-    )
+async def delete_meal_plan(pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM meal_plans WHERE id = $1 AND {clause}", plan_id, *params
+        )
     return result.endswith("1")
 
 
@@ -646,137 +661,152 @@ async def delete_meal_plan(pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uui
 _DAY_COLUMNS = "id, plan_id, day_date, meal_type, notes, sort_order, consumed_at"
 
 
-async def _load_day_recipes(pool: asyncpg.Pool, day_id: uuid.UUID) -> list[RecipeRef]:
-    rows = await pool.fetch(
-        "SELECT r.id, r.name "
-        "FROM meal_plan_day_recipes dr "
-        "JOIN recipes r ON r.id = dr.recipe_id "
-        "WHERE dr.day_id = $1 "
-        "ORDER BY dr.sort_order",
-        day_id,
-    )
+async def _load_day_recipes(
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID
+) -> list[RecipeRef]:
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            "SELECT r.id, r.name "
+            "FROM meal_plan_day_recipes dr "
+            "JOIN recipes r ON r.id = dr.recipe_id "
+            "WHERE dr.day_id = $1 "
+            "ORDER BY dr.sort_order",
+            day_id,
+        )
     return [RecipeRef(**dict(row)) for row in rows]
 
 
-async def _load_days_with_recipes(pool: asyncpg.Pool, plan_id: uuid.UUID) -> list[MealPlanDay]:
+async def _load_days_with_recipes(
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID
+) -> list[MealPlanDay]:
     """Load all days for a plan with their recipes pre-joined."""
-    day_rows = await pool.fetch(
-        f"SELECT {_DAY_COLUMNS} FROM meal_plan_days "
-        f"WHERE plan_id = $1 ORDER BY day_date, sort_order",
-        plan_id,
-    )
-    # Fetch all recipe refs for all days in one query
-    day_ids = [row["id"] for row in day_rows]
-    recipes_by_day: dict[uuid.UUID, list[RecipeRef]] = {did: [] for did in day_ids}
-    if day_ids:
-        recipe_rows = await pool.fetch(
-            "SELECT dr.day_id, r.id, r.name "
-            "FROM meal_plan_day_recipes dr "
-            "JOIN recipes r ON r.id = dr.recipe_id "
-            "WHERE dr.day_id = ANY($1::uuid[]) "
-            "ORDER BY dr.sort_order",
-            day_ids,
+    async with scoped_connection(pool, capability) as conn:
+        day_rows = await conn.fetch(
+            f"SELECT {_DAY_COLUMNS} FROM meal_plan_days "
+            f"WHERE plan_id = $1 ORDER BY day_date, sort_order",
+            plan_id,
         )
-        for rr in recipe_rows:
-            recipes_by_day[rr["day_id"]].append(RecipeRef(id=rr["id"], name=rr["name"]))
+        # Fetch all recipe refs for all days in one query
+        day_ids = [row["id"] for row in day_rows]
+        recipes_by_day: dict[uuid.UUID, list[RecipeRef]] = {did: [] for did in day_ids}
+        if day_ids:
+            recipe_rows = await conn.fetch(
+                "SELECT dr.day_id, r.id, r.name "
+                "FROM meal_plan_day_recipes dr "
+                "JOIN recipes r ON r.id = dr.recipe_id "
+                "WHERE dr.day_id = ANY($1::uuid[]) "
+                "ORDER BY dr.sort_order",
+                day_ids,
+            )
+            for rr in recipe_rows:
+                recipes_by_day[rr["day_id"]].append(RecipeRef(id=rr["id"], name=rr["name"]))
     return [MealPlanDay(**{**dict(row), "recipes": recipes_by_day[row["id"]]}) for row in day_rows]
 
 
-async def list_plan_days(pool: asyncpg.Pool, plan_id: uuid.UUID) -> list[MealPlanDay]:
-    return await _load_days_with_recipes(pool, plan_id)
+async def list_plan_days(
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID
+) -> list[MealPlanDay]:
+    return await _load_days_with_recipes(pool, capability, plan_id)
 
 
 async def upsert_plan_day(
-    pool: asyncpg.Pool, plan_id: uuid.UUID, data: MealPlanDayCreate
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID, data: MealPlanDayCreate
 ) -> MealPlanDay:
     # Get next sort_order for this day_date + meal_type
-    max_order = await pool.fetchval(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM meal_plan_days "
-        "WHERE plan_id = $1 AND day_date = $2 AND meal_type = $3",
-        plan_id,
-        data.day_date,
-        data.meal_type.value,
-    )
-    sort_order = (max_order or -1) + 1
+    async with scoped_connection(pool, capability) as conn:
+        max_order = await conn.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM meal_plan_days "
+            "WHERE plan_id = $1 AND day_date = $2 AND meal_type = $3",
+            plan_id,
+            data.day_date,
+            data.meal_type.value,
+        )
+        sort_order = (max_order or -1) + 1
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                f"INSERT INTO meal_plan_days "
-                f"(id, plan_id, day_date, meal_type, notes, sort_order) "
-                f"VALUES ($1, $2, $3, $4, $5, $6) "
-                f"RETURNING {_DAY_COLUMNS}",
+        row = await conn.fetchrow(
+            f"INSERT INTO meal_plan_days "
+            f"(id, plan_id, day_date, meal_type, notes, sort_order) "
+            f"VALUES ($1, $2, $3, $4, $5, $6) "
+            f"RETURNING {_DAY_COLUMNS}",
+            uuid.uuid4(),
+            plan_id,
+            data.day_date,
+            data.meal_type.value,
+            data.notes,
+            sort_order,
+        )
+        day = dict(row)
+        # Insert initial recipes
+        recipes: list[RecipeRef] = []
+        for i, rid in enumerate(data.recipe_ids):
+            await conn.execute(
+                "INSERT INTO meal_plan_day_recipes (id, day_id, recipe_id, sort_order) "
+                "VALUES ($1, $2, $3, $4)",
                 uuid.uuid4(),
-                plan_id,
-                data.day_date,
-                data.meal_type.value,
-                data.notes,
-                sort_order,
+                day["id"],
+                rid,
+                i,
             )
-            day = dict(row)
-            # Insert initial recipes
-            recipes: list[RecipeRef] = []
-            for i, rid in enumerate(data.recipe_ids):
-                await conn.execute(
-                    "INSERT INTO meal_plan_day_recipes (id, day_id, recipe_id, sort_order) "
-                    "VALUES ($1, $2, $3, $4)",
-                    uuid.uuid4(),
-                    day["id"],
-                    rid,
-                    i,
-                )
-                # Fetch recipe name
-                name_row = await conn.fetchrow("SELECT name FROM recipes WHERE id = $1", rid)
-                recipes.append(RecipeRef(id=rid, name=name_row["name"] if name_row else "Unknown"))
-            day["recipes"] = recipes
+            # Fetch recipe name
+            name_row = await conn.fetchrow("SELECT name FROM recipes WHERE id = $1", rid)
+            recipes.append(RecipeRef(id=rid, name=name_row["name"] if name_row else "Unknown"))
+        day["recipes"] = recipes
     return MealPlanDay(**day)
 
 
 async def update_plan_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, data: MealPlanDayUpdate
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID, data: MealPlanDayUpdate
 ) -> MealPlanDay | None:
-    row = await pool.fetchrow(
-        "UPDATE meal_plan_days d SET "
-        "notes = COALESCE($3, d.notes) "
-        "FROM meal_plans p "
-        "WHERE d.id = $1 AND d.plan_id = p.id AND p.owner_id = $2 "
-        "RETURNING d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order, d.consumed_at",
-        day_id,
-        owner_id,
-        data.notes,
-    )
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE meal_plan_days d SET "
+            f"notes = COALESCE($3, d.notes) "
+            f"FROM meal_plans p "
+            f"WHERE d.id = $1 AND d.plan_id = p.id AND {clause} "
+            f"RETURNING d.id, d.plan_id, d.day_date, d.meal_type, d.notes, "
+            f"d.sort_order, d.consumed_at",
+            day_id,
+            *params,
+            data.notes,
+        )
     if row is None:
         return None
     day = dict(row)
-    day["recipes"] = await _load_day_recipes(pool, day_id)
+    day["recipes"] = await _load_day_recipes(pool, capability, day_id)
     return MealPlanDay(**day)
 
 
-async def delete_plan_day(pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM meal_plan_days d USING meal_plans p "
-        "WHERE d.id = $1 AND d.plan_id = p.id AND p.owner_id = $2",
-        day_id,
-        owner_id,
-    )
+async def delete_plan_day(pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM meal_plan_days d USING meal_plans p "
+            f"WHERE d.id = $1 AND d.plan_id = p.id AND {clause}",
+            day_id,
+            *params,
+        )
     return result.endswith("1")
 
 
 async def get_plan_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID
 ) -> MealPlanDay | None:
     """Fetch a single day (with its recipes), verifying ownership through its plan."""
-    row = await pool.fetchrow(
-        "SELECT d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order, d.consumed_at "
-        "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
-        "WHERE d.id = $1 AND p.owner_id = $2",
-        day_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT d.id, d.plan_id, d.day_date, d.meal_type, d.notes, d.sort_order, "
+            f"d.consumed_at "
+            f"FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+            f"WHERE d.id = $1 AND {clause}",
+            day_id,
+            *params,
+        )
     if row is None:
         return None
     day = dict(row)
-    day["recipes"] = await _load_day_recipes(pool, day_id)
+    day["recipes"] = await _load_day_recipes(pool, capability, day_id)
     return MealPlanDay(**day)
 
 
@@ -786,45 +816,59 @@ async def get_plan_day(
 
 
 async def add_recipe_to_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, recipe_id: uuid.UUID
+    pool: asyncpg.Pool,
+    capability: Capability,
+    day_id: uuid.UUID,
+    recipe_id: uuid.UUID,
 ) -> RecipeRef | None:
-    owns_day = await pool.fetchval(
-        "SELECT 1 FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
-        "WHERE d.id = $1 AND p.owner_id = $2",
-        day_id,
-        owner_id,
-    )
-    if owns_day is None:
-        return None
-    max_order = await pool.fetchval(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM meal_plan_day_recipes WHERE day_id = $1",
-        day_id,
-    )
-    sort_order = (max_order or -1) + 1
-    await pool.execute(
-        "INSERT INTO meal_plan_day_recipes (id, day_id, recipe_id, sort_order) "
-        "VALUES ($1, $2, $3, $4)",
-        uuid.uuid4(),
-        day_id,
-        recipe_id,
-        sort_order,
-    )
-    name_row = await pool.fetchrow("SELECT name FROM recipes WHERE id = $1", recipe_id)
+    async with scoped_connection(pool, capability) as conn:
+        owns_day = await conn.fetchval(
+            "SELECT 1 FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+            "WHERE d.id = $1 AND " + scope_sql(capability, alias="p", start=2)[0],
+            day_id,
+            *scope_sql(capability, alias="p", start=2)[1],
+        )
+        if owns_day is None:
+            return None
+        # Verify the recipe is in the caller's scope (can only add visible recipes).
+        owns_recipe = await conn.fetchval(
+            "SELECT 1 FROM recipes WHERE id = $1 AND " + scope_sql(capability, start=2)[0],
+            recipe_id,
+            *scope_sql(capability, start=2)[1],
+        )
+        if owns_recipe is None:
+            return None
+        max_order = await conn.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM meal_plan_day_recipes WHERE day_id = $1",
+            day_id,
+        )
+        sort_order = (max_order or -1) + 1
+        await conn.execute(
+            "INSERT INTO meal_plan_day_recipes (id, day_id, recipe_id, sort_order) "
+            "VALUES ($1, $2, $3, $4)",
+            uuid.uuid4(),
+            day_id,
+            recipe_id,
+            sort_order,
+        )
+        name_row = await conn.fetchrow("SELECT name FROM recipes WHERE id = $1", recipe_id)
     return RecipeRef(id=recipe_id, name=name_row["name"] if name_row else "Unknown")
 
 
 async def remove_recipe_from_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, recipe_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID, recipe_id: uuid.UUID
 ) -> bool:
-    result = await pool.execute(
-        "DELETE FROM meal_plan_day_recipes dr "
-        "USING meal_plan_days d, meal_plans p "
-        "WHERE dr.day_id = $1 AND dr.recipe_id = $2 "
-        "AND dr.day_id = d.id AND d.plan_id = p.id AND p.owner_id = $3",
-        day_id,
-        recipe_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="p", start=3)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM meal_plan_day_recipes dr "
+            f"USING meal_plan_days d, meal_plans p "
+            f"WHERE dr.day_id = $1 AND dr.recipe_id = $2 "
+            f"AND dr.day_id = d.id AND d.plan_id = p.id AND {clause}",
+            day_id,
+            recipe_id,
+            *params,
+        )
     return result.endswith("1")
 
 
@@ -842,133 +886,141 @@ _RECIPE_LIST_COLUMNS = f"""
 """
 
 
-async def list_recipes(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[RecipeListItem]:
-    rows = await pool.fetch(
-        f"""
-        SELECT {_RECIPE_LIST_COLUMNS}
-          FROM recipes r
-          LEFT JOIN LATERAL (
-              SELECT count(*) AS ingredient_count
-                FROM recipe_ingredients
-               WHERE recipe_id = r.id
-          ) ic ON true
-         WHERE r.owner_id = $1
-         ORDER BY r.updated_at DESC
-        """,
-        owner_id,
-    )
+async def list_recipes(pool: asyncpg.Pool, capability: Capability) -> list[RecipeListItem]:
+    clause, params = scope_sql(capability, alias="r")
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT {_RECIPE_LIST_COLUMNS}
+              FROM recipes r
+              LEFT JOIN LATERAL (
+                  SELECT count(*) AS ingredient_count
+                    FROM recipe_ingredients
+                   WHERE recipe_id = r.id
+              ) ic ON true
+             WHERE {clause}
+             ORDER BY r.updated_at DESC
+            """,
+            *params,
+        )
     return [RecipeListItem(**dict(row)) for row in rows]
 
 
 async def get_recipe(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, recipe_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, recipe_id: uuid.UUID
 ) -> Recipe | None:
-    row = await pool.fetchrow(
-        f"SELECT {_RECIPE_COLUMNS} FROM recipes WHERE id = $1 AND owner_id = $2",
-        recipe_id,
-        owner_id,
-    )
-    if row is None:
-        return None
-    recipe = dict(row)
-    ingredient_rows = await pool.fetch(
-        "SELECT id, recipe_id, name, quantity, unit, notes, category, sort_order "
-        "FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order",
-        recipe_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_RECIPE_COLUMNS} FROM recipes WHERE id = $1 AND {clause}",
+            recipe_id,
+            *params,
+        )
+        if row is None:
+            return None
+        recipe = dict(row)
+        ingredient_rows = await conn.fetch(
+            "SELECT id, recipe_id, name, quantity, unit, notes, category, sort_order "
+            "FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order",
+            recipe_id,
+        )
     recipe["ingredients"] = [RecipeIngredient(**dict(ir)) for ir in ingredient_rows]
     return Recipe(**recipe)
 
 
-async def create_recipe(pool: asyncpg.Pool, owner_id: uuid.UUID, data: RecipeCreate) -> Recipe:
+async def create_recipe(pool: asyncpg.Pool, capability: Capability, data: RecipeCreate) -> Recipe:
     name = data.name.strip()
     if not name:
         raise ValueError("Recipe name must not be empty")
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                f"INSERT INTO recipes "
-                f"(id, owner_id, name, description, instructions, "
-                f"prep_minutes, cook_minutes, servings, source_url) "
-                f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
-                f"RETURNING {_RECIPE_COLUMNS}",
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO recipes "
+            f"(id, owner_id, family_id, name, description, instructions, "
+            f"prep_minutes, cook_minutes, servings, source_url) "
+            f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+            f"RETURNING {_RECIPE_COLUMNS}",
+            uuid.uuid4(),
+            capability.user_id,
+            capability.family_id,
+            name,
+            data.description,
+            data.instructions,
+            data.prep_minutes,
+            data.cook_minutes,
+            data.servings,
+            data.source_url,
+        )
+        recipe = dict(row)
+        ingredients: list[RecipeIngredient] = []
+        for i, ing in enumerate(data.ingredients):
+            ir = await conn.fetchrow(
+                "INSERT INTO recipe_ingredients "
+                "(id, recipe_id, name, quantity, unit, notes, category, sort_order) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+                "RETURNING id, recipe_id, name, quantity, unit, notes, category, sort_order",
                 uuid.uuid4(),
-                owner_id,
-                name,
-                data.description,
-                data.instructions,
-                data.prep_minutes,
-                data.cook_minutes,
-                data.servings,
-                data.source_url,
+                recipe["id"],
+                ing.name.strip(),
+                ing.quantity,
+                ing.unit,
+                ing.notes,
+                ing.category,
+                i,
             )
-            recipe = dict(row)
-            ingredients: list[RecipeIngredient] = []
-            for i, ing in enumerate(data.ingredients):
-                ir = await conn.fetchrow(
-                    "INSERT INTO recipe_ingredients "
-                    "(id, recipe_id, name, quantity, unit, notes, category, sort_order) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-                    "RETURNING id, recipe_id, name, quantity, unit, notes, category, sort_order",
-                    uuid.uuid4(),
-                    recipe["id"],
-                    ing.name.strip(),
-                    ing.quantity,
-                    ing.unit,
-                    ing.notes,
-                    ing.category,
-                    i,
-                )
-                ingredients.append(RecipeIngredient(**dict(ir)))
-            recipe["ingredients"] = ingredients
+            ingredients.append(RecipeIngredient(**dict(ir)))
+        recipe["ingredients"] = ingredients
     return Recipe(**recipe)
 
 
 async def update_recipe(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, recipe_id: uuid.UUID, data: RecipeUpdate
+    pool: asyncpg.Pool, capability: Capability, recipe_id: uuid.UUID, data: RecipeUpdate
 ) -> Recipe | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Recipe name must not be empty")
 
-    row = await pool.fetchrow(
-        f"UPDATE recipes SET "
-        f"name = COALESCE($3, name), "
-        f"description = COALESCE($4, description), "
-        f"instructions = COALESCE($5, instructions), "
-        f"prep_minutes = COALESCE($6, prep_minutes), "
-        f"cook_minutes = COALESCE($7, cook_minutes), "
-        f"servings = COALESCE($8, servings), "
-        f"source_url = COALESCE($9, source_url), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_RECIPE_COLUMNS}",
-        recipe_id,
-        owner_id,
-        name,
-        data.description,
-        data.instructions,
-        data.prep_minutes,
-        data.cook_minutes,
-        data.servings,
-        data.source_url,
-    )
-    if row is None:
-        return None
-    recipe = dict(row)
-    ingredient_rows = await pool.fetch(
-        "SELECT id, recipe_id, name, quantity, unit, notes, category, sort_order "
-        "FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order",
-        recipe_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE recipes SET "
+            f"name = COALESCE($3, name), "
+            f"description = COALESCE($4, description), "
+            f"instructions = COALESCE($5, instructions), "
+            f"prep_minutes = COALESCE($6, prep_minutes), "
+            f"cook_minutes = COALESCE($7, cook_minutes), "
+            f"servings = COALESCE($8, servings), "
+            f"source_url = COALESCE($9, source_url), "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND {clause} RETURNING {_RECIPE_COLUMNS}",
+            recipe_id,
+            *params,
+            name,
+            data.description,
+            data.instructions,
+            data.prep_minutes,
+            data.cook_minutes,
+            data.servings,
+            data.source_url,
+        )
+        if row is None:
+            return None
+        recipe = dict(row)
+        ingredient_rows = await conn.fetch(
+            "SELECT id, recipe_id, name, quantity, unit, notes, category, sort_order "
+            "FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order",
+            recipe_id,
+        )
     recipe["ingredients"] = [RecipeIngredient(**dict(ir)) for ir in ingredient_rows]
     return Recipe(**recipe)
 
 
-async def delete_recipe(pool: asyncpg.Pool, owner_id: uuid.UUID, recipe_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM recipes WHERE id = $1 AND owner_id = $2", recipe_id, owner_id
-    )
+async def delete_recipe(pool: asyncpg.Pool, capability: Capability, recipe_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM recipes WHERE id = $1 AND {clause}", recipe_id, *params
+        )
     return result.endswith("1")
 
 
@@ -986,70 +1038,81 @@ class IngredientUpdate(BaseModel):
 
 
 async def add_ingredient(
-    pool: asyncpg.Pool, recipe_id: uuid.UUID, data: RecipeIngredientCreate
+    pool: asyncpg.Pool, capability: Capability, recipe_id: uuid.UUID, data: RecipeIngredientCreate
 ) -> RecipeIngredient:
     name = data.name.strip()
     if not name:
         raise ValueError("Ingredient name must not be empty")
-    max_order = await pool.fetchval(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM recipe_ingredients WHERE recipe_id = $1",
-        recipe_id,
-    )
-    sort_order = (max_order or -1) + 1
-    row = await pool.fetchrow(
-        "INSERT INTO recipe_ingredients "
-        "(id, recipe_id, name, quantity, unit, notes, category, sort_order) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
-        "RETURNING id, recipe_id, name, quantity, unit, notes, category, sort_order",
-        uuid.uuid4(),
-        recipe_id,
-        name,
-        data.quantity,
-        data.unit,
-        data.notes,
-        data.category,
-        sort_order,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        owns = await conn.fetchval(
+            f"SELECT 1 FROM recipes WHERE id = $1 AND {clause}", recipe_id, *params
+        )
+        if owns is None:
+            raise ValueError("Recipe not found")
+        max_order = await conn.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM recipe_ingredients WHERE recipe_id = $1",
+            recipe_id,
+        )
+        sort_order = (max_order or -1) + 1
+        row = await conn.fetchrow(
+            "INSERT INTO recipe_ingredients "
+            "(id, recipe_id, name, quantity, unit, notes, category, sort_order) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+            "RETURNING id, recipe_id, name, quantity, unit, notes, category, sort_order",
+            uuid.uuid4(),
+            recipe_id,
+            name,
+            data.quantity,
+            data.unit,
+            data.notes,
+            data.category,
+            sort_order,
+        )
     return RecipeIngredient(**dict(row))
 
 
 async def update_ingredient(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, ingredient_id: uuid.UUID, data: IngredientUpdate
+    pool: asyncpg.Pool, capability: Capability, ingredient_id: uuid.UUID, data: IngredientUpdate
 ) -> RecipeIngredient | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Ingredient name must not be empty")
-    row = await pool.fetchrow(
-        "UPDATE recipe_ingredients i SET "
-        "name = COALESCE($3, i.name), "
-        "quantity = COALESCE($4, i.quantity), "
-        "unit = COALESCE($5, i.unit), "
-        "notes = COALESCE($6, i.notes), "
-        "category = COALESCE($7, i.category) "
-        "FROM recipes r "
-        "WHERE i.id = $1 AND i.recipe_id = r.id AND r.owner_id = $2 "
-        "RETURNING i.id, i.recipe_id, i.name, i.quantity, i.unit, i.notes, i.category, "
-        "i.sort_order",
-        ingredient_id,
-        owner_id,
-        name,
-        data.quantity,
-        data.unit,
-        data.notes,
-        data.category,
-    )
+    clause, params = scope_sql(capability, alias="r", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE recipe_ingredients i SET "
+            f"name = COALESCE($3, i.name), "
+            f"quantity = COALESCE($4, i.quantity), "
+            f"unit = COALESCE($5, i.unit), "
+            f"notes = COALESCE($6, i.notes), "
+            f"category = COALESCE($7, i.category) "
+            f"FROM recipes r "
+            f"WHERE i.id = $1 AND i.recipe_id = r.id AND {clause} "
+            f"RETURNING i.id, i.recipe_id, i.name, i.quantity, i.unit, i.notes, i.category, "
+            f"i.sort_order",
+            ingredient_id,
+            *params,
+            name,
+            data.quantity,
+            data.unit,
+            data.notes,
+            data.category,
+        )
     return RecipeIngredient(**dict(row)) if row else None
 
 
 async def delete_ingredient(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, ingredient_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, ingredient_id: uuid.UUID
 ) -> bool:
-    result = await pool.execute(
-        "DELETE FROM recipe_ingredients i USING recipes r "
-        "WHERE i.id = $1 AND i.recipe_id = r.id AND r.owner_id = $2",
-        ingredient_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="r", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM recipe_ingredients i USING recipes r "
+            f"WHERE i.id = $1 AND i.recipe_id = r.id AND {clause}",
+            ingredient_id,
+            *params,
+        )
     return result.endswith("1")
 
 
@@ -1070,94 +1133,108 @@ _ITEM_COLUMNS = (
 
 
 async def list_shopping_lists(
-    pool: asyncpg.Pool, owner_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability
 ) -> list[ShoppingListListItem]:
-    rows = await pool.fetch(
-        f"""
-        SELECT {_LIST_LIST_COLUMNS}
-          FROM shopping_lists l
-          LEFT JOIN LATERAL (
-              SELECT count(*) AS item_total,
-                     count(*) FILTER (WHERE purchased) AS item_purchased
-                FROM shopping_list_items
-               WHERE list_id = l.id
-          ) ic ON true
-         WHERE l.owner_id = $1
-         ORDER BY l.updated_at DESC
-        """,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="l")
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT {_LIST_LIST_COLUMNS}
+              FROM shopping_lists l
+              LEFT JOIN LATERAL (
+                  SELECT count(*) AS item_total,
+                         count(*) FILTER (WHERE purchased) AS item_purchased
+                    FROM shopping_list_items
+                   WHERE list_id = l.id
+              ) ic ON true
+             WHERE {clause}
+             ORDER BY l.updated_at DESC
+            """,
+            *params,
+        )
     return [ShoppingListListItem(**dict(row)) for row in rows]
 
 
 async def get_shopping_list(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, list_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, list_id: uuid.UUID
 ) -> ShoppingList | None:
-    row = await pool.fetchrow(
-        f"SELECT {_LIST_COLUMNS} FROM shopping_lists WHERE id = $1 AND owner_id = $2",
-        list_id,
-        owner_id,
-    )
-    if row is None:
-        return None
-    slist = dict(row)
-    item_rows = await pool.fetch(
-        f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
-        list_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_LIST_COLUMNS} FROM shopping_lists WHERE id = $1 AND {clause}",
+            list_id,
+            *params,
+        )
+        if row is None:
+            return None
+        slist = dict(row)
+        item_rows = await conn.fetch(
+            f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items "
+            f"WHERE list_id = $1 ORDER BY sort_order",
+            list_id,
+        )
     slist["items"] = [ShoppingListItem(**dict(ir)) for ir in item_rows]
     return ShoppingList(**slist)
 
 
 async def create_shopping_list(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, data: ShoppingListCreate
+    pool: asyncpg.Pool, capability: Capability, data: ShoppingListCreate
 ) -> ShoppingList:
     name = data.name.strip()
     if not name:
         raise ValueError("Shopping list name must not be empty")
-    row = await pool.fetchrow(
-        f"INSERT INTO shopping_lists (id, owner_id, name, plan_id) "
-        f"VALUES ($1, $2, $3, $4) RETURNING {_LIST_COLUMNS}",
-        uuid.uuid4(),
-        owner_id,
-        name,
-        data.plan_id,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO shopping_lists (id, owner_id, family_id, name, plan_id) "
+            f"VALUES ($1, $2, $3, $4, $5) RETURNING {_LIST_COLUMNS}",
+            uuid.uuid4(),
+            capability.user_id,
+            capability.family_id,
+            name,
+            data.plan_id,
+        )
     result = dict(row)
     result["items"] = []
     return ShoppingList(**result)
 
 
 async def update_shopping_list(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, list_id: uuid.UUID, data: ShoppingListUpdate
+    pool: asyncpg.Pool, capability: Capability, list_id: uuid.UUID, data: ShoppingListUpdate
 ) -> ShoppingList | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Shopping list name must not be empty")
-    row = await pool.fetchrow(
-        f"UPDATE shopping_lists SET "
-        f"name = COALESCE($3, name), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_LIST_COLUMNS}",
-        list_id,
-        owner_id,
-        name,
-    )
-    if row is None:
-        return None
-    result = dict(row)
-    item_rows = await pool.fetch(
-        f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items WHERE list_id = $1 ORDER BY sort_order",
-        list_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE shopping_lists SET "
+            f"name = COALESCE($3, name), "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND {clause} RETURNING {_LIST_COLUMNS}",
+            list_id,
+            *params,
+            name,
+        )
+        if row is None:
+            return None
+        result = dict(row)
+        item_rows = await conn.fetch(
+            f"SELECT {_ITEM_COLUMNS} FROM shopping_list_items "
+            f"WHERE list_id = $1 ORDER BY sort_order",
+            list_id,
+        )
     result["items"] = [ShoppingListItem(**dict(ir)) for ir in item_rows]
     return ShoppingList(**result)
 
 
-async def delete_shopping_list(pool: asyncpg.Pool, owner_id: uuid.UUID, list_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM shopping_lists WHERE id = $1 AND owner_id = $2", list_id, owner_id
-    )
+async def delete_shopping_list(
+    pool: asyncpg.Pool, capability: Capability, list_id: uuid.UUID
+) -> bool:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM shopping_lists WHERE id = $1 AND {clause}", list_id, *params
+        )
     return result.endswith("1")
 
 
@@ -1167,73 +1244,84 @@ async def delete_shopping_list(pool: asyncpg.Pool, owner_id: uuid.UUID, list_id:
 
 
 async def add_list_item(
-    pool: asyncpg.Pool, list_id: uuid.UUID, data: ShoppingListItemCreate
+    pool: asyncpg.Pool, capability: Capability, list_id: uuid.UUID, data: ShoppingListItemCreate
 ) -> ShoppingListItem:
     name = data.name.strip()
     if not name:
         raise ValueError("Item name must not be empty")
-    max_order = await pool.fetchval(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM shopping_list_items WHERE list_id = $1",
-        list_id,
-    )
-    sort_order = (max_order or -1) + 1
-    row = await pool.fetchrow(
-        "INSERT INTO shopping_list_items "
-        "(id, list_id, name, quantity, unit, category, sort_order, "
-        "packages, store_product_id, store_name, package_label) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
-        f"RETURNING {_ITEM_COLUMNS}",
-        uuid.uuid4(),
-        list_id,
-        name,
-        data.quantity,
-        data.unit,
-        data.category,
-        sort_order,
-        data.packages,
-        data.store_product_id,
-        data.store_name,
-        data.package_label,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        owns = await conn.fetchval(
+            f"SELECT 1 FROM shopping_lists WHERE id = $1 AND {clause}", list_id, *params
+        )
+        if owns is None:
+            raise ValueError("Shopping list not found")
+        max_order = await conn.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM shopping_list_items WHERE list_id = $1",
+            list_id,
+        )
+        sort_order = (max_order or -1) + 1
+        row = await conn.fetchrow(
+            "INSERT INTO shopping_list_items "
+            "(id, list_id, name, quantity, unit, category, sort_order, "
+            "packages, store_product_id, store_name, package_label) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
+            f"RETURNING {_ITEM_COLUMNS}",
+            uuid.uuid4(),
+            list_id,
+            name,
+            data.quantity,
+            data.unit,
+            data.category,
+            sort_order,
+            data.packages,
+            data.store_product_id,
+            data.store_name,
+            data.package_label,
+        )
     return ShoppingListItem(**dict(row))
 
 
 async def update_list_item(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID, data: ShoppingListItemUpdate
+    pool: asyncpg.Pool, capability: Capability, item_id: uuid.UUID, data: ShoppingListItemUpdate
 ) -> ShoppingListItem | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Item name must not be empty")
-    row = await pool.fetchrow(
-        "UPDATE shopping_list_items it SET "
-        "name = COALESCE($3, it.name), "
-        "quantity = COALESCE($4, it.quantity), "
-        "unit = COALESCE($5, it.unit), "
-        "category = COALESCE($6, it.category), "
-        "purchased = COALESCE($7, it.purchased) "
-        "FROM shopping_lists l "
-        "WHERE it.id = $1 AND it.list_id = l.id AND l.owner_id = $2 "
-        "RETURNING it.id, it.list_id, it.name, it.quantity, it.unit, it.category, "
-        "it.purchased, it.sort_order, it.packages, it.store_product_id, it.store_name, "
-        "it.package_label",
-        item_id,
-        owner_id,
-        name,
-        data.quantity,
-        data.unit,
-        data.category,
-        data.purchased,
-    )
+    clause, params = scope_sql(capability, alias="l", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE shopping_list_items it SET "
+            f"name = COALESCE($3, it.name), "
+            f"quantity = COALESCE($4, it.quantity), "
+            f"unit = COALESCE($5, it.unit), "
+            f"category = COALESCE($6, it.category), "
+            f"purchased = COALESCE($7, it.purchased) "
+            f"FROM shopping_lists l "
+            f"WHERE it.id = $1 AND it.list_id = l.id AND {clause} "
+            f"RETURNING it.id, it.list_id, it.name, it.quantity, it.unit, it.category, "
+            f"it.purchased, it.sort_order, it.packages, it.store_product_id, it.store_name, "
+            f"it.package_label",
+            item_id,
+            *params,
+            name,
+            data.quantity,
+            data.unit,
+            data.category,
+            data.purchased,
+        )
     return ShoppingListItem(**dict(row)) if row else None
 
 
-async def delete_list_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM shopping_list_items it USING shopping_lists l "
-        "WHERE it.id = $1 AND it.list_id = l.id AND l.owner_id = $2",
-        item_id,
-        owner_id,
-    )
+async def delete_list_item(pool: asyncpg.Pool, capability: Capability, item_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, alias="l", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM shopping_list_items it USING shopping_lists l "
+            f"WHERE it.id = $1 AND it.list_id = l.id AND {clause}",
+            item_id,
+            *params,
+        )
     return result.endswith("1")
 
 
@@ -1244,27 +1332,32 @@ async def delete_list_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uui
 _PANTRY_COLUMNS = "id, owner_id, name, quantity, unit, category, updated_at"
 
 
-async def list_pantry_items(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[PantryItem]:
-    rows = await pool.fetch(
-        f"SELECT {_PANTRY_COLUMNS} FROM pantry_items WHERE owner_id = $1 ORDER BY name",
-        owner_id,
-    )
+async def list_pantry_items(pool: asyncpg.Pool, capability: Capability) -> list[PantryItem]:
+    clause, params = scope_sql(capability)
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"SELECT {_PANTRY_COLUMNS} FROM pantry_items WHERE {clause} ORDER BY name",
+            *params,
+        )
     return [PantryItem(**dict(row)) for row in rows]
 
 
 async def _find_matching_pantry_row(
-    executor, owner_id: uuid.UUID, name: str, dimension: str
+    executor, capability: Capability, name: str, dimension: str
 ) -> asyncpg.Record | None:
-    """Find the owner's pantry row for `name` whose unit shares `dimension`, if any.
+    """Find the caller's pantry row for `name` whose unit shares `dimension`, if any.
 
     Uniqueness per (owner, normalized name, dimension) is enforced here in
     code rather than a DB constraint, since "dimension" is derived from the
-    free-text unit via :func:`canonicalize`, not a stored column.
+    free-text unit via :func:`canonicalize`, not a stored column. ``executor``
+    must be a connection with the RLS GUCs already set (i.e. inside a
+    :func:`scoped_connection`).
     """
+    clause, params = scope_sql(capability)
     rows = await executor.fetch(
-        "SELECT id, quantity, unit FROM pantry_items "
-        "WHERE owner_id = $1 AND lower(trim(name)) = $2",
-        owner_id,
+        f"SELECT id, quantity, unit FROM pantry_items "
+        f"WHERE {clause} AND lower(trim(name)) = ${len(params) + 1}",
+        *params,
         name.strip().lower(),
     )
     for row in rows:
@@ -1274,7 +1367,7 @@ async def _find_matching_pantry_row(
 
 
 async def upsert_pantry_item(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, data: PantryItemCreate
+    pool: asyncpg.Pool, capability: Capability, data: PantryItemCreate
 ) -> PantryItem:
     """Insert a pantry item, or add its quantity onto an existing (owner, name, dimension) match.
 
@@ -1286,95 +1379,105 @@ async def upsert_pantry_item(
     if not name:
         raise ValueError("Pantry item name must not be empty")
     _, dimension, _ = canonicalize(None, data.unit)
-    match = await _find_matching_pantry_row(pool, owner_id, name, dimension)
+    async with scoped_connection(pool, capability) as conn:
+        match = await _find_matching_pantry_row(conn, capability, name, dimension)
 
-    if match is None:
-        row = await pool.fetchrow(
-            f"INSERT INTO pantry_items (id, owner_id, name, quantity, unit, category) "
-            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_PANTRY_COLUMNS}",
-            uuid.uuid4(),
-            owner_id,
+        if match is None:
+            row = await conn.fetchrow(
+                f"INSERT INTO pantry_items "
+                f"(id, owner_id, family_id, name, quantity, unit, category) "
+                f"VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {_PANTRY_COLUMNS}",
+                uuid.uuid4(),
+                capability.user_id,
+                capability.family_id,
+                name,
+                data.quantity,
+                data.unit,
+                data.category,
+            )
+            return PantryItem(**dict(row))
+
+        if match["quantity"] is None and data.quantity is None:
+            merged_qty, merged_unit = None, match["unit"] or data.unit
+        else:
+            existing_canonical, _, _ = canonicalize(match["quantity"] or 0.0, match["unit"])
+            added_canonical, _, _ = canonicalize(data.quantity or 0.0, data.unit)
+            total = (existing_canonical or 0.0) + (added_canonical or 0.0)
+            merged_unit = match["unit"] or data.unit
+            factor = to_canonical_unit_factor(merged_unit)
+            merged_qty, merged_unit = format_display(total / factor, merged_unit)
+
+        row = await conn.fetchrow(
+            f"UPDATE pantry_items SET quantity = $2, unit = $3, category = $4, updated_at = now() "
+            f"WHERE id = $1 RETURNING {_PANTRY_COLUMNS}",
+            match["id"],
+            merged_qty,
+            merged_unit,
+            data.category,
+        )
+    return PantryItem(**dict(row))
+
+
+async def update_pantry_item(
+    pool: asyncpg.Pool, capability: Capability, item_id: uuid.UUID, data: PantryItemUpdate
+) -> PantryItem | None:
+    name = data.name.strip() if data.name is not None else None
+    if data.name is not None and not name:
+        raise ValueError("Pantry item name must not be empty")
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE pantry_items SET "
+            f"name = COALESCE($3, name), "
+            f"quantity = COALESCE($4, quantity), "
+            f"unit = COALESCE($5, unit), "
+            f"category = COALESCE($6, category), "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND {clause} RETURNING {_PANTRY_COLUMNS}",
+            item_id,
+            *params,
             name,
             data.quantity,
             data.unit,
             data.category,
         )
-        return PantryItem(**dict(row))
-
-    if match["quantity"] is None and data.quantity is None:
-        merged_qty, merged_unit = None, match["unit"] or data.unit
-    else:
-        existing_canonical, _, _ = canonicalize(match["quantity"] or 0.0, match["unit"])
-        added_canonical, _, _ = canonicalize(data.quantity or 0.0, data.unit)
-        total = (existing_canonical or 0.0) + (added_canonical or 0.0)
-        merged_unit = match["unit"] or data.unit
-        factor = to_canonical_unit_factor(merged_unit)
-        merged_qty, merged_unit = format_display(total / factor, merged_unit)
-
-    row = await pool.fetchrow(
-        f"UPDATE pantry_items SET quantity = $2, unit = $3, category = $4, updated_at = now() "
-        f"WHERE id = $1 RETURNING {_PANTRY_COLUMNS}",
-        match["id"],
-        merged_qty,
-        merged_unit,
-        data.category,
-    )
-    return PantryItem(**dict(row))
-
-
-async def update_pantry_item(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID, data: PantryItemUpdate
-) -> PantryItem | None:
-    name = data.name.strip() if data.name is not None else None
-    if data.name is not None and not name:
-        raise ValueError("Pantry item name must not be empty")
-    row = await pool.fetchrow(
-        f"UPDATE pantry_items SET "
-        f"name = COALESCE($3, name), "
-        f"quantity = COALESCE($4, quantity), "
-        f"unit = COALESCE($5, unit), "
-        f"category = COALESCE($6, category), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_PANTRY_COLUMNS}",
-        item_id,
-        owner_id,
-        name,
-        data.quantity,
-        data.unit,
-        data.category,
-    )
     return PantryItem(**dict(row)) if row else None
 
 
-async def delete_pantry_item(pool: asyncpg.Pool, owner_id: uuid.UUID, item_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM pantry_items WHERE id = $1 AND owner_id = $2", item_id, owner_id
-    )
+async def delete_pantry_item(
+    pool: asyncpg.Pool, capability: Capability, item_id: uuid.UUID
+) -> bool:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM pantry_items WHERE id = $1 AND {clause}", item_id, *params
+        )
     return result.endswith("1")
 
 
 async def _add_to_pantry(
-    executor, owner_id: uuid.UUID, name: str, quantity: float | None, unit: str | None
+    executor, capability: Capability, name: str, quantity: float | None, unit: str | None
 ) -> None:
-    """Add `quantity unit` of `name` into the owner's pantry (upsert-add), best-effort.
+    """Add `quantity unit` of `name` into the caller's pantry (upsert-add), best-effort.
 
-    `executor` is a pool or an open connection (both share asyncpg's
-    fetch/fetchrow/execute interface). A no-op when `quantity` is None or
+    `executor` must be a connection with the RLS GUCs already set (i.e.
+    inside a :func:`scoped_connection`). A no-op when `quantity` is None or
     `name` is blank — there's nothing quantifiable to add.
     """
     name = name.strip()
     if quantity is None or not name:
         return
     _, dimension, _ = canonicalize(None, unit)
-    match = await _find_matching_pantry_row(executor, owner_id, name, dimension)
+    match = await _find_matching_pantry_row(executor, capability, name, dimension)
     added_canonical, _, _ = canonicalize(quantity, unit)
 
     if match is None:
         await executor.execute(
-            "INSERT INTO pantry_items (id, owner_id, name, quantity, unit, category) "
-            "VALUES ($1, $2, $3, $4, $5, '')",
+            "INSERT INTO pantry_items (id, owner_id, family_id, name, quantity, unit, category) "
+            "VALUES ($1, $2, $3, $4, $5, $6, '')",
             uuid.uuid4(),
-            owner_id,
+            capability.user_id,
+            capability.family_id,
             name,
             quantity,
             unit,
@@ -1395,17 +1498,17 @@ async def _add_to_pantry(
 
 
 async def _deduct_from_pantry(
-    conn, owner_id: uuid.UUID, name: str, quantity: float | None, unit: str | None
+    conn, capability: Capability, name: str, quantity: float | None, unit: str | None
 ) -> ConsumeReportLine:
-    """Subtract `quantity unit` of `name` from the owner's pantry, clamped at 0.
+    """Subtract `quantity unit` of `name` from the caller's pantry, clamped at 0.
 
-    Runs on an open transaction connection. Returns a report line: "deducted"
-    (enough stock, or nothing was needed), "insufficient" (stock existed but
-    ran out, clamped to 0), or "not_tracked" (no matching pantry row, or the
-    matching row itself has no quantity to draw down).
+    Runs on an open scoped-connection transaction. Returns a report line:
+    "deducted" (enough stock, or nothing was needed), "insufficient" (stock
+    existed but ran out, clamped to 0), or "not_tracked" (no matching pantry
+    row, or the matching row itself has no quantity to draw down).
     """
     needed_canonical, dimension, _ = canonicalize(quantity, unit)
-    match = await _find_matching_pantry_row(conn, owner_id, name, dimension)
+    match = await _find_matching_pantry_row(conn, capability, name, dimension)
     if match is None:
         return ConsumeReportLine(name=name, status="not_tracked", deducted_quantity=None, unit=unit)
 
@@ -1448,75 +1551,73 @@ async def _day_recipe_ingredients(conn, day_id: uuid.UUID):
 
 
 async def consume_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID, force: bool = False
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID, force: bool = False
 ) -> tuple[MealPlanDay, list[ConsumeReportLine]] | None:
     """Mark a day consumed, deducting every ingredient of every recipe on it from pantry.
 
-    Returns None if the day isn't found or isn't owned by `owner_id`. Raises
-    :class:`DayAlreadyConsumed` when the day is already marked consumed and
-    `force` is False.
+    Returns None if the day isn't found or isn't in the caller's scope.
+    Raises :class:`DayAlreadyConsumed` when the day is already marked
+    consumed and `force` is False.
     """
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            day_row = await conn.fetchrow(
-                "SELECT d.id, d.consumed_at "
-                "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
-                "WHERE d.id = $1 AND p.owner_id = $2 "
-                "FOR UPDATE OF d",
-                day_id,
-                owner_id,
-            )
-            if day_row is None:
-                return None
-            if day_row["consumed_at"] is not None and not force:
-                raise DayAlreadyConsumed(day_id)
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        day_row = await conn.fetchrow(
+            f"SELECT d.id, d.consumed_at "
+            f"FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+            f"WHERE d.id = $1 AND {clause} "
+            f"FOR UPDATE OF d",
+            day_id,
+            *params,
+        )
+        if day_row is None:
+            return None
+        if day_row["consumed_at"] is not None and not force:
+            raise DayAlreadyConsumed(day_id)
 
-            ingredient_rows = await _day_recipe_ingredients(conn, day_id)
-            report = [
-                await _deduct_from_pantry(conn, owner_id, ing["name"], ing["quantity"], ing["unit"])
-                for ing in ingredient_rows
-            ]
-            await conn.execute(
-                "UPDATE meal_plan_days SET consumed_at = now() WHERE id = $1", day_id
-            )
+        ingredient_rows = await _day_recipe_ingredients(conn, day_id)
+        report = [
+            await _deduct_from_pantry(conn, capability, ing["name"], ing["quantity"], ing["unit"])
+            for ing in ingredient_rows
+        ]
+        await conn.execute("UPDATE meal_plan_days SET consumed_at = now() WHERE id = $1", day_id)
 
-    day = await get_plan_day(pool, owner_id, day_id)
+    day = await get_plan_day(pool, capability, day_id)
     assert day is not None  # verified ownership above, inside the same transaction
     return day, report
 
 
 async def unconsume_day(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, day_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, day_id: uuid.UUID
 ) -> MealPlanDay | None:
     """Clear `consumed_at` and best-effort restore the day's ingredients to pantry.
 
     A no-op restoration (but still returns the day) when the day was never
     consumed — there's nothing to credit back. Returns None if the day isn't
-    found or isn't owned by `owner_id`.
+    found or isn't in the caller's scope.
     """
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            day_row = await conn.fetchrow(
-                "SELECT d.id, d.consumed_at "
-                "FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
-                "WHERE d.id = $1 AND p.owner_id = $2 "
-                "FOR UPDATE OF d",
-                day_id,
-                owner_id,
-            )
-            if day_row is None:
-                return None
-            if day_row["consumed_at"] is not None:
-                ingredient_rows = await _day_recipe_ingredients(conn, day_id)
-                for ing in ingredient_rows:
-                    await _add_to_pantry(conn, owner_id, ing["name"], ing["quantity"], ing["unit"])
-            await conn.execute("UPDATE meal_plan_days SET consumed_at = NULL WHERE id = $1", day_id)
+    clause, params = scope_sql(capability, alias="p", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        day_row = await conn.fetchrow(
+            f"SELECT d.id, d.consumed_at "
+            f"FROM meal_plan_days d JOIN meal_plans p ON p.id = d.plan_id "
+            f"WHERE d.id = $1 AND {clause} "
+            f"FOR UPDATE OF d",
+            day_id,
+            *params,
+        )
+        if day_row is None:
+            return None
+        if day_row["consumed_at"] is not None:
+            ingredient_rows = await _day_recipe_ingredients(conn, day_id)
+            for ing in ingredient_rows:
+                await _add_to_pantry(conn, capability, ing["name"], ing["quantity"], ing["unit"])
+        await conn.execute("UPDATE meal_plan_days SET consumed_at = NULL WHERE id = $1", day_id)
 
-    return await get_plan_day(pool, owner_id, day_id)
+    return await get_plan_day(pool, capability, day_id)
 
 
 async def commit_list_to_pantry(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, list_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, list_id: uuid.UUID
 ) -> list[CommitToPantryLine] | None:
     """Add a shopping list's purchased items into pantry stock (upsert-add).
 
@@ -1527,33 +1628,30 @@ async def commit_list_to_pantry(
     not 8). Items without package data keep crediting their raw
     quantity/unit.
 
-    Returns None if the list isn't found or isn't owned by `owner_id`.
+    Returns None if the list isn't found or isn't in the caller's scope.
     """
-    slist = await get_shopping_list(pool, owner_id, list_id)
+    slist = await get_shopping_list(pool, capability, list_id)
     if slist is None:
         return None
 
     added: list[CommitToPantryLine] = []
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            for item in slist.items:
-                if not item.purchased:
-                    continue
-                credit_qty, credit_unit = item.quantity, item.unit
-                if item.packages is not None and item.store_product_id is not None:
-                    product = await conn.fetchrow(
-                        "SELECT package_quantity, package_unit FROM store_products WHERE id = $1",
-                        item.store_product_id,
-                    )
-                    if product is not None:
-                        credit_qty = item.packages * product["package_quantity"]
-                        credit_unit = product["package_unit"]
-                if credit_qty is None:
-                    continue
-                await _add_to_pantry(conn, owner_id, item.name, credit_qty, credit_unit)
-                added.append(
-                    CommitToPantryLine(name=item.name, quantity=credit_qty, unit=credit_unit)
+    async with scoped_connection(pool, capability) as conn:
+        for item in slist.items:
+            if not item.purchased:
+                continue
+            credit_qty, credit_unit = item.quantity, item.unit
+            if item.packages is not None and item.store_product_id is not None:
+                product = await conn.fetchrow(
+                    "SELECT package_quantity, package_unit FROM store_products WHERE id = $1",
+                    item.store_product_id,
                 )
+                if product is not None:
+                    credit_qty = item.packages * product["package_quantity"]
+                    credit_unit = product["package_unit"]
+            if credit_qty is None:
+                continue
+            await _add_to_pantry(conn, capability, item.name, credit_qty, credit_unit)
+            added.append(CommitToPantryLine(name=item.name, quantity=credit_qty, unit=credit_unit))
     return added
 
 
@@ -1568,84 +1666,97 @@ _PRODUCT_COLUMNS = (
 )
 
 
-async def list_stores(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[Store]:
-    rows = await pool.fetch(
-        f"SELECT {_STORE_COLUMNS} FROM stores WHERE owner_id = $1 ORDER BY name", owner_id
-    )
+async def list_stores(pool: asyncpg.Pool, capability: Capability) -> list[Store]:
+    clause, params = scope_sql(capability)
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"SELECT {_STORE_COLUMNS} FROM stores WHERE {clause} ORDER BY name", *params
+        )
     return [Store(**dict(row)) for row in rows]
 
 
-async def get_store(pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID) -> Store | None:
-    row = await pool.fetchrow(
-        f"SELECT {_STORE_COLUMNS} FROM stores WHERE id = $1 AND owner_id = $2",
-        store_id,
-        owner_id,
-    )
+async def get_store(
+    pool: asyncpg.Pool, capability: Capability, store_id: uuid.UUID
+) -> Store | None:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_STORE_COLUMNS} FROM stores WHERE id = $1 AND {clause}",
+            store_id,
+            *params,
+        )
     return Store(**dict(row)) if row else None
 
 
-async def create_store(pool: asyncpg.Pool, owner_id: uuid.UUID, data: StoreCreate) -> Store:
+async def create_store(pool: asyncpg.Pool, capability: Capability, data: StoreCreate) -> Store:
     name = data.name.strip()
     if not name:
         raise ValueError("Store name must not be empty")
-    row = await pool.fetchrow(
-        f"INSERT INTO stores (id, owner_id, name, notes) "
-        f"VALUES ($1, $2, $3, $4) RETURNING {_STORE_COLUMNS}",
-        uuid.uuid4(),
-        owner_id,
-        name,
-        data.notes,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO stores (id, owner_id, family_id, name, notes) "
+            f"VALUES ($1, $2, $3, $4, $5) RETURNING {_STORE_COLUMNS}",
+            uuid.uuid4(),
+            capability.user_id,
+            capability.family_id,
+            name,
+            data.notes,
+        )
     return Store(**dict(row))
 
 
 async def update_store(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID, data: StoreUpdate
+    pool: asyncpg.Pool, capability: Capability, store_id: uuid.UUID, data: StoreUpdate
 ) -> Store | None:
     name = data.name.strip() if data.name is not None else None
     if data.name is not None and not name:
         raise ValueError("Store name must not be empty")
-    row = await pool.fetchrow(
-        f"UPDATE stores SET "
-        f"name = COALESCE($3, name), "
-        f"notes = COALESCE($4, notes), "
-        f"updated_at = now() "
-        f"WHERE id = $1 AND owner_id = $2 RETURNING {_STORE_COLUMNS}",
-        store_id,
-        owner_id,
-        name,
-        data.notes,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE stores SET "
+            f"name = COALESCE($3, name), "
+            f"notes = COALESCE($4, notes), "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND {clause} RETURNING {_STORE_COLUMNS}",
+            store_id,
+            *params,
+            name,
+            data.notes,
+        )
     return Store(**dict(row)) if row else None
 
 
-async def delete_store(pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID) -> bool:
-    result = await pool.execute(
-        "DELETE FROM stores WHERE id = $1 AND owner_id = $2", store_id, owner_id
-    )
+async def delete_store(pool: asyncpg.Pool, capability: Capability, store_id: uuid.UUID) -> bool:
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM stores WHERE id = $1 AND {clause}", store_id, *params
+        )
     return result.endswith("1")
 
 
 async def list_store_products(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, store_id: uuid.UUID
 ) -> list[StoreProduct] | None:
-    """Returns None if the store isn't found or isn't owned by `owner_id`."""
-    store = await get_store(pool, owner_id, store_id)
+    """Returns None if the store isn't found or isn't in the caller's scope."""
+    store = await get_store(pool, capability, store_id)
     if store is None:
         return None
-    rows = await pool.fetch(
-        f"SELECT {_PRODUCT_COLUMNS} FROM store_products "
-        f"WHERE store_id = $1 ORDER BY ingredient_name",
-        store_id,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"SELECT {_PRODUCT_COLUMNS} FROM store_products "
+            f"WHERE store_id = $1 ORDER BY ingredient_name",
+            store_id,
+        )
     return [StoreProduct(**dict(row)) for row in rows]
 
 
 async def add_store_product(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, store_id: uuid.UUID, data: StoreProductCreate
+    pool: asyncpg.Pool, capability: Capability, store_id: uuid.UUID, data: StoreProductCreate
 ) -> StoreProduct | None:
-    """Returns None if the store isn't found or isn't owned by `owner_id`."""
-    store = await get_store(pool, owner_id, store_id)
+    """Returns None if the store isn't found or isn't in the caller's scope."""
+    store = await get_store(pool, capability, store_id)
     if store is None:
         return None
     ingredient_name = data.ingredient_name.strip()
@@ -1654,25 +1765,26 @@ async def add_store_product(
         raise ValueError("Ingredient name must not be empty")
     if not product_name:
         raise ValueError("Product name must not be empty")
-    row = await pool.fetchrow(
-        f"INSERT INTO store_products "
-        f"(id, store_id, ingredient_name, product_name, package_quantity, package_unit, "
-        f"price_cents, notes) "
-        f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {_PRODUCT_COLUMNS}",
-        uuid.uuid4(),
-        store_id,
-        ingredient_name,
-        product_name,
-        data.package_quantity,
-        data.package_unit,
-        data.price_cents,
-        data.notes,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"INSERT INTO store_products "
+            f"(id, store_id, ingredient_name, product_name, package_quantity, package_unit, "
+            f"price_cents, notes) "
+            f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {_PRODUCT_COLUMNS}",
+            uuid.uuid4(),
+            store_id,
+            ingredient_name,
+            product_name,
+            data.package_quantity,
+            data.package_unit,
+            data.price_cents,
+            data.notes,
+        )
     return StoreProduct(**dict(row))
 
 
 async def update_store_product(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, product_id: uuid.UUID, data: StoreProductUpdate
+    pool: asyncpg.Pool, capability: Capability, product_id: uuid.UUID, data: StoreProductUpdate
 ) -> StoreProduct | None:
     ingredient_name = data.ingredient_name.strip() if data.ingredient_name is not None else None
     product_name = data.product_name.strip() if data.product_name is not None else None
@@ -1680,40 +1792,44 @@ async def update_store_product(
         raise ValueError("Ingredient name must not be empty")
     if data.product_name is not None and not product_name:
         raise ValueError("Product name must not be empty")
-    row = await pool.fetchrow(
-        "UPDATE store_products sp SET "
-        "ingredient_name = COALESCE($3, sp.ingredient_name), "
-        "product_name = COALESCE($4, sp.product_name), "
-        "package_quantity = COALESCE($5, sp.package_quantity), "
-        "package_unit = COALESCE($6, sp.package_unit), "
-        "price_cents = COALESCE($7, sp.price_cents), "
-        "notes = COALESCE($8, sp.notes), "
-        "updated_at = now() "
-        "FROM stores st "
-        "WHERE sp.id = $1 AND sp.store_id = st.id AND st.owner_id = $2 "
-        "RETURNING sp.id, sp.store_id, sp.ingredient_name, sp.product_name, "
-        "sp.package_quantity, sp.package_unit, sp.price_cents, sp.notes",
-        product_id,
-        owner_id,
-        ingredient_name,
-        product_name,
-        data.package_quantity,
-        data.package_unit,
-        data.price_cents,
-        data.notes,
-    )
+    clause, params = scope_sql(capability, alias="st", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE store_products sp SET "
+            f"ingredient_name = COALESCE($3, sp.ingredient_name), "
+            f"product_name = COALESCE($4, sp.product_name), "
+            f"package_quantity = COALESCE($5, sp.package_quantity), "
+            f"package_unit = COALESCE($6, sp.package_unit), "
+            f"price_cents = COALESCE($7, sp.price_cents), "
+            f"notes = COALESCE($8, sp.notes), "
+            f"updated_at = now() "
+            f"FROM stores st "
+            f"WHERE sp.id = $1 AND sp.store_id = st.id AND {clause} "
+            f"RETURNING sp.id, sp.store_id, sp.ingredient_name, sp.product_name, "
+            f"sp.package_quantity, sp.package_unit, sp.price_cents, sp.notes",
+            product_id,
+            *params,
+            ingredient_name,
+            product_name,
+            data.package_quantity,
+            data.package_unit,
+            data.price_cents,
+            data.notes,
+        )
     return StoreProduct(**dict(row)) if row else None
 
 
 async def delete_store_product(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, product_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, product_id: uuid.UUID
 ) -> bool:
-    result = await pool.execute(
-        "DELETE FROM store_products sp USING stores st "
-        "WHERE sp.id = $1 AND sp.store_id = st.id AND st.owner_id = $2",
-        product_id,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, alias="st", start=2)
+    async with scoped_connection(pool, capability) as conn:
+        result = await conn.execute(
+            f"DELETE FROM store_products sp USING stores st "
+            f"WHERE sp.id = $1 AND sp.store_id = st.id AND {clause}",
+            product_id,
+            *params,
+        )
     return result.endswith("1")
 
 
@@ -1723,29 +1839,33 @@ async def delete_store_product(
 
 
 async def _owned_plan_ids(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, requested_ids: list[uuid.UUID]
+    pool: asyncpg.Pool, capability: Capability, requested_ids: list[uuid.UUID]
 ) -> list[uuid.UUID]:
-    rows = await pool.fetch(
-        "SELECT id FROM meal_plans WHERE id = ANY($1::uuid[]) AND owner_id = $2",
-        requested_ids,
-        owner_id,
-    )
+    clause, params = scope_sql(capability, start=2)
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"SELECT id FROM meal_plans WHERE id = ANY($1::uuid[]) AND {clause}",
+            requested_ids,
+            *params,
+        )
     return [row["id"] for row in rows]
 
 
-async def _future_plan_ids(pool: asyncpg.Pool, owner_id: uuid.UUID) -> list[uuid.UUID]:
+async def _future_plan_ids(pool: asyncpg.Pool, capability: Capability) -> list[uuid.UUID]:
     today = date.today()
     this_monday = today - timedelta(days=today.weekday())
-    rows = await pool.fetch(
-        "SELECT id FROM meal_plans WHERE owner_id = $1 AND week_start >= $2",
-        owner_id,
-        this_monday,
-    )
+    clause, params = scope_sql(capability, start=1)
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            f"SELECT id FROM meal_plans WHERE {clause} AND week_start >= ${len(params) + 1}",
+            *params,
+            this_monday,
+        )
     return [row["id"] for row in rows]
 
 
 async def _subtract_pantry(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, items: list[AggregatedIngredient]
+    pool: asyncpg.Pool, capability: Capability, items: list[AggregatedIngredient]
 ) -> list[AggregatedIngredient]:
     """Subtract pantry on-hand from aggregated needed quantities.
 
@@ -1754,9 +1874,11 @@ async def _subtract_pantry(
     (fully covered by pantry stock). Lines with no quantity (can't be
     reduced) pass through unchanged.
     """
-    pantry_rows = await pool.fetch(
-        "SELECT name, quantity, unit FROM pantry_items WHERE owner_id = $1", owner_id
-    )
+    clause, params = scope_sql(capability)
+    async with scoped_connection(pool, capability) as conn:
+        pantry_rows = await conn.fetch(
+            f"SELECT name, quantity, unit FROM pantry_items WHERE {clause}", *params
+        )
     on_hand: dict[tuple[str, str], float] = {}
     for row in pantry_rows:
         canonical_qty, dimension, _ = canonicalize(row["quantity"], row["unit"])
@@ -1788,35 +1910,39 @@ async def _subtract_pantry(
 
 async def _map_to_store_products(
     pool: asyncpg.Pool,
-    owner_id: uuid.UUID,
+    capability: Capability,
     items: list[AggregatedIngredient],
     store_id: uuid.UUID | None,
 ) -> list[ShoppingListItemCreate]:
     """Map aggregated ingredient lines to a matching store product, when one exists.
 
     "Best match" when no `store_id` preference is given is the cheapest
-    product across the owner's stores (nulls-last), an arbitrary but
+    product across the caller's stores (nulls-last), an arbitrary but
     deterministic tie-break when price isn't recorded.
     """
     if store_id is not None:
-        product_rows = await pool.fetch(
-            "SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
-            "sp.package_unit, st.name AS store_name "
-            "FROM store_products sp JOIN stores st ON st.id = sp.store_id "
-            "WHERE sp.store_id = $1 AND st.owner_id = $2 "
-            "ORDER BY sp.price_cents NULLS LAST",
-            store_id,
-            owner_id,
-        )
+        clause, params = scope_sql(capability, alias="st", start=2)
+        async with scoped_connection(pool, capability) as conn:
+            product_rows = await conn.fetch(
+                f"SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
+                f"sp.package_unit, st.name AS store_name "
+                f"FROM store_products sp JOIN stores st ON st.id = sp.store_id "
+                f"WHERE sp.store_id = $1 AND {clause} "
+                f"ORDER BY sp.price_cents NULLS LAST",
+                store_id,
+                *params,
+            )
     else:
-        product_rows = await pool.fetch(
-            "SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
-            "sp.package_unit, st.name AS store_name "
-            "FROM store_products sp JOIN stores st ON st.id = sp.store_id "
-            "WHERE st.owner_id = $1 "
-            "ORDER BY sp.price_cents NULLS LAST",
-            owner_id,
-        )
+        clause, params = scope_sql(capability, alias="st", start=1)
+        async with scoped_connection(pool, capability) as conn:
+            product_rows = await conn.fetch(
+                f"SELECT sp.id, sp.ingredient_name, sp.product_name, sp.package_quantity, "
+                f"sp.package_unit, st.name AS store_name "
+                f"FROM store_products sp JOIN stores st ON st.id = sp.store_id "
+                f"WHERE {clause} "
+                f"ORDER BY sp.price_cents NULLS LAST",
+                *params,
+            )
     products_by_name: dict[str, asyncpg.Record] = {}
     for row in product_rows:
         products_by_name.setdefault(row["ingredient_name"].strip().lower(), row)
@@ -1859,7 +1985,7 @@ async def _map_to_store_products(
 
 
 async def generate_shopping_list(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, data: GenerateListRequest
+    pool: asyncpg.Pool, capability: Capability, data: GenerateListRequest
 ) -> ShoppingList:
     """Generate an aggregated shopping list from one plan, a selection, or all future plans.
 
@@ -1870,26 +1996,27 @@ async def generate_shopping_list(
     preferring `store_id` if given -> insert the shopping_lists row + items.
     """
     if data.plan_ids:
-        plan_ids = await _owned_plan_ids(pool, owner_id, data.plan_ids)
+        plan_ids = await _owned_plan_ids(pool, capability, data.plan_ids)
         if not plan_ids:
             raise ValueError("No matching meal plans found")
     else:
-        plan_ids = await _future_plan_ids(pool, owner_id)
+        plan_ids = await _future_plan_ids(pool, capability)
         if not plan_ids:
             raise ValueError("No future meal plans found")
 
     # One row per day-recipe link joined to its ingredients — deliberately
     # not DISTINCT, so a recipe assigned to N days contributes N sets of
     # ingredients for aggregate() to sum.
-    rows = await pool.fetch(
-        "SELECT ri.name, ri.quantity, ri.unit, ri.category "
-        "FROM meal_plan_day_recipes dr "
-        "JOIN meal_plan_days d ON d.id = dr.day_id "
-        "JOIN recipe_ingredients ri ON ri.recipe_id = dr.recipe_id "
-        "WHERE d.plan_id = ANY($1::uuid[]) "
-        "ORDER BY ri.category, ri.name",
-        plan_ids,
-    )
+    async with scoped_connection(pool, capability) as conn:
+        rows = await conn.fetch(
+            "SELECT ri.name, ri.quantity, ri.unit, ri.category "
+            "FROM meal_plan_day_recipes dr "
+            "JOIN meal_plan_days d ON d.id = dr.day_id "
+            "JOIN recipe_ingredients ri ON ri.recipe_id = dr.recipe_id "
+            "WHERE d.plan_id = ANY($1::uuid[]) "
+            "ORDER BY ri.category, ri.name",
+            plan_ids,
+        )
     if not rows:
         raise ValueError("No recipes assigned to the selected plans")
 
@@ -1900,21 +2027,21 @@ async def generate_shopping_list(
     if data.deduct_pantry:
         # An empty result here is a legitimate outcome (pantry already covers
         # everything needed), not an error — the list is created with 0 items.
-        aggregated = await _subtract_pantry(pool, owner_id, aggregated)
+        aggregated = await _subtract_pantry(pool, capability, aggregated)
 
-    mapped = await _map_to_store_products(pool, owner_id, aggregated, data.store_id)
+    mapped = await _map_to_store_products(pool, capability, aggregated, data.store_id)
 
     name = data.name
     if not name:
         if len(plan_ids) == 1:
-            plan = await get_meal_plan(pool, owner_id, plan_ids[0])
+            plan = await get_meal_plan(pool, capability, plan_ids[0])
             name = f"Shopping list for {plan.name}" if plan else "Shopping list"
         else:
             name = f"Shopping list for {len(plan_ids)} plans"
 
     slist = await create_shopping_list(
         pool,
-        owner_id,
+        capability,
         ShoppingListCreate(
             name=name,
             plan_id=plan_ids[0] if len(plan_ids) == 1 else None,
@@ -1923,7 +2050,7 @@ async def generate_shopping_list(
 
     items: list[ShoppingListItem] = []
     for entry in mapped:
-        item = await add_list_item(pool, slist.id, entry)
+        item = await add_list_item(pool, capability, slist.id, entry)
         items.append(item)
 
     slist.items = items
@@ -1931,10 +2058,10 @@ async def generate_shopping_list(
 
 
 async def generate_shopping_list_from_plan(
-    pool: asyncpg.Pool, owner_id: uuid.UUID, plan_id: uuid.UUID
+    pool: asyncpg.Pool, capability: Capability, plan_id: uuid.UUID
 ) -> ShoppingList:
     """Backwards-compatible single-plan wrapper over :func:`generate_shopping_list`."""
-    return await generate_shopping_list(pool, owner_id, GenerateListRequest(plan_ids=[plan_id]))
+    return await generate_shopping_list(pool, capability, GenerateListRequest(plan_ids=[plan_id]))
 
 
 # ------------------------------------------------------------------
@@ -1956,7 +2083,7 @@ async def list_plans(
     request: Request,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    plans = await list_meal_plans(_pool(request), capability.user_id)
+    plans = await list_meal_plans(_pool(request), capability)
     return [p.model_dump(mode="json") for p in plans]
 
 
@@ -1967,7 +2094,7 @@ async def create_plan(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        plan = await create_meal_plan(_pool(request), capability.user_id, body)
+        plan = await create_meal_plan(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return plan.model_dump(mode="json")
@@ -1979,7 +2106,7 @@ async def get_plan(
     plan_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     return plan.model_dump(mode="json")
@@ -1993,7 +2120,7 @@ async def update_plan(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        plan = await update_meal_plan(_pool(request), capability.user_id, plan_id, body)
+        plan = await update_meal_plan(_pool(request), capability, plan_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if plan is None:
@@ -2007,7 +2134,7 @@ async def delete_plan(
     plan_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_meal_plan(_pool(request), capability.user_id, plan_id):
+    if not await delete_meal_plan(_pool(request), capability, plan_id):
         raise HTTPException(status_code=404, detail="Meal plan not found")
 
 
@@ -2020,7 +2147,7 @@ async def list_days(
     plan_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     days = await list_plan_days(_pool(request), plan_id)
@@ -2034,7 +2161,7 @@ async def create_day(
     body: MealPlanDayCreate,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    plan = await get_meal_plan(_pool(request), capability.user_id, plan_id)
+    plan = await get_meal_plan(_pool(request), capability, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Meal plan not found")
     day = await upsert_plan_day(_pool(request), plan_id, body)
@@ -2048,7 +2175,7 @@ async def update_day(
     body: MealPlanDayUpdate,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    day = await update_plan_day(_pool(request), capability.user_id, day_id, body)
+    day = await update_plan_day(_pool(request), capability, day_id, body)
     if day is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return day.model_dump(mode="json")
@@ -2065,7 +2192,7 @@ async def add_recipe_to_day_endpoint(
     body: DayRecipeAction,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    ref = await add_recipe_to_day(_pool(request), capability.user_id, day_id, body.recipe_id)
+    ref = await add_recipe_to_day(_pool(request), capability, day_id, body.recipe_id)
     if ref is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return ref.model_dump(mode="json")
@@ -2078,7 +2205,7 @@ async def remove_recipe_from_day_endpoint(
     recipe_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await remove_recipe_from_day(_pool(request), capability.user_id, day_id, recipe_id):
+    if not await remove_recipe_from_day(_pool(request), capability, day_id, recipe_id):
         raise HTTPException(status_code=404, detail="Recipe not found on this day")
 
 
@@ -2088,7 +2215,7 @@ async def delete_day(
     day_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_plan_day(_pool(request), capability.user_id, day_id):
+    if not await delete_plan_day(_pool(request), capability, day_id):
         raise HTTPException(status_code=404, detail="Day not found")
 
 
@@ -2102,7 +2229,7 @@ async def generate_list(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await generate_shopping_list_from_plan(_pool(request), capability.user_id, plan_id)
+        slist = await generate_shopping_list_from_plan(_pool(request), capability, plan_id)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2115,7 +2242,7 @@ async def generate_list_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await generate_shopping_list(_pool(request), capability.user_id, body)
+        slist = await generate_shopping_list(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2129,7 +2256,7 @@ async def list_recipe_list(
     request: Request,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    recipes = await list_recipes(_pool(request), capability.user_id)
+    recipes = await list_recipes(_pool(request), capability)
     return [r.model_dump(mode="json") for r in recipes]
 
 
@@ -2140,7 +2267,7 @@ async def create_recipe_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        recipe = await create_recipe(_pool(request), capability.user_id, body)
+        recipe = await create_recipe(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return recipe.model_dump(mode="json")
@@ -2152,7 +2279,7 @@ async def get_recipe_endpoint(
     recipe_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    recipe = await get_recipe(_pool(request), capability.user_id, recipe_id)
+    recipe = await get_recipe(_pool(request), capability, recipe_id)
     if recipe is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
     return recipe.model_dump(mode="json")
@@ -2166,7 +2293,7 @@ async def update_recipe_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        recipe = await update_recipe(_pool(request), capability.user_id, recipe_id, body)
+        recipe = await update_recipe(_pool(request), capability, recipe_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if recipe is None:
@@ -2180,7 +2307,7 @@ async def delete_recipe_endpoint(
     recipe_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_recipe(_pool(request), capability.user_id, recipe_id):
+    if not await delete_recipe(_pool(request), capability, recipe_id):
         raise HTTPException(status_code=404, detail="Recipe not found")
 
 
@@ -2194,7 +2321,7 @@ async def add_recipe_ingredient(
     body: RecipeIngredientCreate,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    recipe = await get_recipe(_pool(request), capability.user_id, recipe_id)
+    recipe = await get_recipe(_pool(request), capability, recipe_id)
     if recipe is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
     try:
@@ -2212,9 +2339,7 @@ async def update_recipe_ingredient(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        ingredient = await update_ingredient(
-            _pool(request), capability.user_id, ingredient_id, body
-        )
+        ingredient = await update_ingredient(_pool(request), capability, ingredient_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if ingredient is None:
@@ -2228,7 +2353,7 @@ async def delete_recipe_ingredient(
     ingredient_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_ingredient(_pool(request), capability.user_id, ingredient_id):
+    if not await delete_ingredient(_pool(request), capability, ingredient_id):
         raise HTTPException(status_code=404, detail="Ingredient not found")
 
 
@@ -2240,7 +2365,7 @@ async def list_shopping(
     request: Request,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    lists = await list_shopping_lists(_pool(request), capability.user_id)
+    lists = await list_shopping_lists(_pool(request), capability)
     return [item.model_dump(mode="json") for item in lists]
 
 
@@ -2251,7 +2376,7 @@ async def create_shopping(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await create_shopping_list(_pool(request), capability.user_id, body)
+        slist = await create_shopping_list(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return slist.model_dump(mode="json")
@@ -2263,7 +2388,7 @@ async def get_shopping(
     list_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> dict:
-    slist = await get_shopping_list(_pool(request), capability.user_id, list_id)
+    slist = await get_shopping_list(_pool(request), capability, list_id)
     if slist is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     return slist.model_dump(mode="json")
@@ -2277,7 +2402,7 @@ async def update_shopping(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        slist = await update_shopping_list(_pool(request), capability.user_id, list_id, body)
+        slist = await update_shopping_list(_pool(request), capability, list_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if slist is None:
@@ -2291,7 +2416,7 @@ async def delete_shopping(
     list_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_shopping_list(_pool(request), capability.user_id, list_id):
+    if not await delete_shopping_list(_pool(request), capability, list_id):
         raise HTTPException(status_code=404, detail="Shopping list not found")
 
 
@@ -2305,7 +2430,7 @@ async def add_list_item_endpoint(
     body: ShoppingListItemCreate,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    slist = await get_shopping_list(_pool(request), capability.user_id, list_id)
+    slist = await get_shopping_list(_pool(request), capability, list_id)
     if slist is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     try:
@@ -2323,7 +2448,7 @@ async def update_list_item_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await update_list_item(_pool(request), capability.user_id, item_id, body)
+        item = await update_list_item(_pool(request), capability, item_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if item is None:
@@ -2337,7 +2462,7 @@ async def delete_list_item_endpoint(
     item_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_list_item(_pool(request), capability.user_id, item_id):
+    if not await delete_list_item(_pool(request), capability, item_id):
         raise HTTPException(status_code=404, detail="Item not found")
 
 
@@ -2349,7 +2474,7 @@ async def list_pantry_endpoint(
     request: Request,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    items = await list_pantry_items(_pool(request), capability.user_id)
+    items = await list_pantry_items(_pool(request), capability)
     return [item.model_dump(mode="json") for item in items]
 
 
@@ -2360,7 +2485,7 @@ async def upsert_pantry_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await upsert_pantry_item(_pool(request), capability.user_id, body)
+        item = await upsert_pantry_item(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return item.model_dump(mode="json")
@@ -2374,7 +2499,7 @@ async def update_pantry_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        item = await update_pantry_item(_pool(request), capability.user_id, item_id, body)
+        item = await update_pantry_item(_pool(request), capability, item_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if item is None:
@@ -2388,7 +2513,7 @@ async def delete_pantry_endpoint(
     item_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_pantry_item(_pool(request), capability.user_id, item_id):
+    if not await delete_pantry_item(_pool(request), capability, item_id):
         raise HTTPException(status_code=404, detail="Pantry item not found")
 
 
@@ -2404,7 +2529,7 @@ async def consume_day_endpoint(
 ) -> dict:
     force = body.force if body is not None else False
     try:
-        result = await consume_day(_pool(request), capability.user_id, day_id, force=force)
+        result = await consume_day(_pool(request), capability, day_id, force=force)
     except DayAlreadyConsumed as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     if result is None:
@@ -2419,7 +2544,7 @@ async def unconsume_day_endpoint(
     day_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    day = await unconsume_day(_pool(request), capability.user_id, day_id)
+    day = await unconsume_day(_pool(request), capability, day_id)
     if day is None:
         raise HTTPException(status_code=404, detail="Day not found")
     return day.model_dump(mode="json")
@@ -2434,7 +2559,7 @@ async def commit_to_pantry_endpoint(
     list_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
-    added = await commit_list_to_pantry(_pool(request), capability.user_id, list_id)
+    added = await commit_list_to_pantry(_pool(request), capability, list_id)
     if added is None:
         raise HTTPException(status_code=404, detail="Shopping list not found")
     return CommitToPantryResponse(added=added).model_dump(mode="json")
@@ -2448,7 +2573,7 @@ async def list_stores_endpoint(
     request: Request,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    stores = await list_stores(_pool(request), capability.user_id)
+    stores = await list_stores(_pool(request), capability)
     return [store.model_dump(mode="json") for store in stores]
 
 
@@ -2459,7 +2584,7 @@ async def create_store_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        store = await create_store(_pool(request), capability.user_id, body)
+        store = await create_store(_pool(request), capability, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return store.model_dump(mode="json")
@@ -2473,7 +2598,7 @@ async def update_store_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        store = await update_store(_pool(request), capability.user_id, store_id, body)
+        store = await update_store(_pool(request), capability, store_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if store is None:
@@ -2487,7 +2612,7 @@ async def delete_store_endpoint(
     store_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_store(_pool(request), capability.user_id, store_id):
+    if not await delete_store(_pool(request), capability, store_id):
         raise HTTPException(status_code=404, detail="Store not found")
 
 
@@ -2500,7 +2625,7 @@ async def list_store_products_endpoint(
     store_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "view")),  # noqa: B008
 ) -> list[dict]:
-    products = await list_store_products(_pool(request), capability.user_id, store_id)
+    products = await list_store_products(_pool(request), capability, store_id)
     if products is None:
         raise HTTPException(status_code=404, detail="Store not found")
     return [product.model_dump(mode="json") for product in products]
@@ -2514,7 +2639,7 @@ async def add_store_product_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        product = await add_store_product(_pool(request), capability.user_id, store_id, body)
+        product = await add_store_product(_pool(request), capability, store_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if product is None:
@@ -2530,7 +2655,7 @@ async def update_store_product_endpoint(
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> dict:
     try:
-        product = await update_store_product(_pool(request), capability.user_id, product_id, body)
+        product = await update_store_product(_pool(request), capability, product_id, body)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if product is None:
@@ -2544,7 +2669,7 @@ async def delete_store_product_endpoint(
     product_id: uuid.UUID,
     capability: Capability = Depends(require_permission("meals", "edit")),  # noqa: B008
 ) -> None:
-    if not await delete_store_product(_pool(request), capability.user_id, product_id):
+    if not await delete_store_product(_pool(request), capability, product_id):
         raise HTTPException(status_code=404, detail="Store product not found")
 
 
@@ -2592,7 +2717,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
     Mirrors ``workflows.py:_register_search_tools``'s shape (a plain
     function taking the agent plus its dependencies, called from
     ``build_agent``), but every tool here is ``@agent.tool`` (not
-    ``tool_plain``) and scopes its query by ``ctx.deps.user_id`` — identical
+    ``tool_plain``) and scopes its query by ``_cap(ctx.deps)`` — identical
     bounds to the HTTP API, so RBAC is inherited: `AgentDeps` is only ever
     built after the `require_chat` role gate, and restricted users can't
     reach chat (and therefore these tools) at all. Never call this on the
@@ -2612,12 +2737,12 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
     def _unavailable(name: str) -> str:
         return f"{name} is unavailable: no database is configured."
 
-    async def _resolve_plan_ids(owner_id: uuid.UUID, plans: list[str]) -> list[uuid.UUID] | str:
+    async def _resolve_plan_ids(capability: Capability, plans: list[str]) -> list[uuid.UUID] | str:
         """Resolve a mixed list of plan UUIDs and/or names (case-insensitive) to UUIDs.
 
         Returns an error string instead of a list if any entry can't be resolved.
         """
-        all_plans = await _list_meal_plans_fn(database.pool, owner_id)  # type: ignore[union-attr]
+        all_plans = await _list_meal_plans_fn(database.pool, capability)  # type: ignore[union-attr]
         by_name = {p.name.strip().lower(): p.id for p in all_plans}
         resolved: list[uuid.UUID] = []
         for entry in plans:
@@ -2646,7 +2771,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("search_recipes")}]
         try:
-            recipes = await _recipes_fn(database.pool, _cap(ctx.deps).user_id)
+            recipes = await _recipes_fn(database.pool, _cap(ctx.deps))
         except Exception as error:
             logger.bind(query=query).warning(f"search_recipes failed: {error}")
             return [{"error": f"search_recipes failed: {error}"}]
@@ -2664,9 +2789,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("get_recipe")}
         try:
-            recipe = await _get_recipe_fn(
-                database.pool, _cap(ctx.deps).user_id, uuid.UUID(recipe_id)
-            )
+            recipe = await _get_recipe_fn(database.pool, _cap(ctx.deps), uuid.UUID(recipe_id))
         except ValueError as error:
             return {"error": f"get_recipe failed: {error}"}
         except Exception as error:
@@ -2696,7 +2819,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         try:
             recipe = await _create_recipe_fn(
                 database.pool,
-                ctx.deps.user_id,
+                _cap(ctx.deps),
                 RecipeCreate(
                     name=name,
                     description=description,
@@ -2732,7 +2855,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         try:
             recipe = await _update_recipe_fn(
                 database.pool,
-                ctx.deps.user_id,
+                _cap(ctx.deps),
                 uuid.UUID(recipe_id),
                 RecipeUpdate(
                     name=name,
@@ -2758,7 +2881,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_meal_plans")}]
         try:
-            plans = await _list_meal_plans_fn(database.pool, _cap(ctx.deps).user_id)
+            plans = await _list_meal_plans_fn(database.pool, _cap(ctx.deps))
         except Exception as error:
             logger.warning(f"list_meal_plans failed: {error}")
             return [{"error": f"list_meal_plans failed: {error}"}]
@@ -2775,7 +2898,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": _unavailable("get_meal_plan")}
         try:
             plan_uuid = uuid.UUID(plan_id)
-            plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, plan_uuid)
+            plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps), plan_uuid)
         except ValueError as error:
             return {"error": f"get_meal_plan failed: {error}"}
         except Exception as error:
@@ -2783,7 +2906,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": f"get_meal_plan failed: {error}"}
         if plan is None:
             return {"error": f"No meal plan found with id {plan_id}."}
-        days = await list_plan_days(database.pool, plan_uuid)
+        days = await list_plan_days(database.pool, _cap(ctx.deps), plan_uuid)
         return {**plan.model_dump(mode="json"), "days": [d.model_dump(mode="json") for d in days]}
 
     @agent.tool
@@ -2798,7 +2921,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": _unavailable("create_meal_plan")}
         try:
             data = MealPlanCreate(name=name, week_start=date.fromisoformat(week_start))
-            plan = await _create_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, data)
+            plan = await _create_meal_plan_fn(database.pool, _cap(ctx.deps), data)
         except ValueError as error:
             return {"error": f"create_meal_plan failed: {error}"}
         except Exception as error:
@@ -2832,12 +2955,12 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"assign_recipe_to_day failed: {error}"}
 
-        plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps).user_id, plan_uuid)
+        plan = await _get_meal_plan_fn(database.pool, _cap(ctx.deps), plan_uuid)
         if plan is None:
             return {"error": f"No meal plan found with id {plan_id}."}
 
         try:
-            days = await list_plan_days(database.pool, plan_uuid)
+            days = await list_plan_days(database.pool, _cap(ctx.deps), plan_uuid)
             existing = next(
                 (d for d in days if d.day_date == parsed_date and d.meal_type == meal_type),
                 None,
@@ -2845,6 +2968,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             if existing is None:
                 day = await upsert_plan_day(
                     database.pool,
+                    _cap(ctx.deps),
                     plan_uuid,
                     MealPlanDayCreate(
                         day_date=parsed_date, meal_type=meal_type_enum, recipe_ids=[recipe_uuid]
@@ -2852,11 +2976,11 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 )
             else:
                 ref = await add_recipe_to_day(
-                    database.pool, ctx.deps.user_id, existing.id, recipe_uuid
+                    database.pool, _cap(ctx.deps), existing.id, recipe_uuid
                 )
                 if ref is None:
                     return {"error": "assign_recipe_to_day failed: day not found."}
-                day = await get_plan_day(database.pool, _cap(ctx.deps).user_id, existing.id)
+                day = await get_plan_day(database.pool, _cap(ctx.deps), existing.id)
         except Exception as error:
             logger.bind(plan_id=plan_id).warning(f"assign_recipe_to_day failed: {error}")
             return {"error": f"assign_recipe_to_day failed: {error}"}
@@ -2872,7 +2996,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return {"error": _unavailable("remove_recipe_from_day")}
         try:
             removed = await _remove_recipe_from_day_fn(
-                database.pool, ctx.deps.user_id, uuid.UUID(day_id), uuid.UUID(recipe_id)
+                database.pool, _cap(ctx.deps), uuid.UUID(day_id), uuid.UUID(recipe_id)
             )
         except ValueError as error:
             return {"error": f"remove_recipe_from_day failed: {error}"}
@@ -2903,7 +3027,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"mark_meal_consumed failed: {error}"}
         try:
-            result = await consume_day(database.pool, _cap(ctx.deps).user_id, day_uuid, force=force)
+            result = await consume_day(database.pool, _cap(ctx.deps), day_uuid, force=force)
         except DayAlreadyConsumed:
             return {
                 "error": "That day is already marked consumed. Pass force=true to re-consume it."
@@ -2926,7 +3050,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("unmark_meal_consumed")}
         try:
-            day = await unconsume_day(database.pool, _cap(ctx.deps).user_id, uuid.UUID(day_id))
+            day = await unconsume_day(database.pool, _cap(ctx.deps), uuid.UUID(day_id))
         except ValueError as error:
             return {"error": f"unmark_meal_consumed failed: {error}"}
         except Exception as error:
@@ -2964,7 +3088,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         try:
             plan_ids: list[uuid.UUID] | None = None
             if plans:
-                resolved = await _resolve_plan_ids(ctx.deps.user_id, plans)
+                resolved = await _resolve_plan_ids(_cap(ctx.deps), plans)
                 if isinstance(resolved, str):
                     return {"error": resolved}
                 plan_ids = resolved
@@ -2975,7 +3099,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
                 store_id=uuid.UUID(store_id) if store_id else None,
                 name=name,
             )
-            slist = await _generate_shopping_list_fn(database.pool, _cap(ctx.deps).user_id, request)
+            slist = await _generate_shopping_list_fn(database.pool, _cap(ctx.deps), request)
         except ValueError as error:
             return {"error": f"generate_shopping_list failed: {error}"}
         except Exception as error:
@@ -2989,7 +3113,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_shopping_lists")}]
         try:
-            lists = await _list_shopping_lists_fn(database.pool, _cap(ctx.deps).user_id)
+            lists = await _list_shopping_lists_fn(database.pool, _cap(ctx.deps))
         except Exception as error:
             logger.warning(f"list_shopping_lists failed: {error}")
             return [{"error": f"list_shopping_lists failed: {error}"}]
@@ -3001,9 +3125,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return {"error": _unavailable("get_shopping_list")}
         try:
-            slist = await _get_shopping_list_fn(
-                database.pool, _cap(ctx.deps).user_id, uuid.UUID(list_id)
-            )
+            slist = await _get_shopping_list_fn(database.pool, _cap(ctx.deps), uuid.UUID(list_id))
         except ValueError as error:
             return {"error": f"get_shopping_list failed: {error}"}
         except Exception as error:
@@ -3029,12 +3151,13 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             list_uuid = uuid.UUID(list_id)
         except ValueError as error:
             return {"error": f"add_shopping_item failed: {error}"}
-        slist = await _get_shopping_list_fn(database.pool, _cap(ctx.deps).user_id, list_uuid)
+        slist = await _get_shopping_list_fn(database.pool, _cap(ctx.deps), list_uuid)
         if slist is None:
             return {"error": f"No shopping list found with id {list_id}."}
         try:
             item = await add_list_item(
                 database.pool,
+                _cap(ctx.deps),
                 list_uuid,
                 ShoppingListItemCreate(name=name, quantity=quantity, unit=unit, category=category),
             )
@@ -3055,7 +3178,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         try:
             item = await update_list_item(
                 database.pool,
-                ctx.deps.user_id,
+                _cap(ctx.deps),
                 uuid.UUID(item_id),
                 ShoppingListItemUpdate(purchased=purchased),
             )
@@ -3076,7 +3199,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("get_pantry")}]
         try:
-            items = await list_pantry_items(database.pool, _cap(ctx.deps).user_id)
+            items = await list_pantry_items(database.pool, _cap(ctx.deps))
         except Exception as error:
             logger.warning(f"get_pantry failed: {error}")
             return [{"error": f"get_pantry failed: {error}"}]
@@ -3100,7 +3223,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         try:
             item = await upsert_pantry_item(
                 database.pool,
-                ctx.deps.user_id,
+                _cap(ctx.deps),
                 PantryItemCreate(name=name, quantity=quantity, unit=unit, category=category),
             )
         except ValueError as error:
@@ -3118,7 +3241,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         if database is None:
             return [{"error": _unavailable("list_stores")}]
         try:
-            stores = await _list_stores_fn(database.pool, _cap(ctx.deps).user_id)
+            stores = await _list_stores_fn(database.pool, _cap(ctx.deps))
         except Exception as error:
             logger.warning(f"list_stores failed: {error}")
             return [{"error": f"list_stores failed: {error}"}]
@@ -3131,7 +3254,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             return [{"error": _unavailable("list_store_products")}]
         try:
             products = await _list_store_products_fn(
-                database.pool, ctx.deps.user_id, uuid.UUID(store_id)
+                database.pool, _cap(ctx.deps), uuid.UUID(store_id)
             )
         except ValueError as error:
             return [{"error": f"list_store_products failed: {error}"}]
@@ -3166,9 +3289,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
         except ValueError as error:
             return {"error": f"upsert_store_product failed: {error}"}
         try:
-            existing = await _list_store_products_fn(
-                database.pool, _cap(ctx.deps).user_id, store_uuid
-            )
+            existing = await _list_store_products_fn(database.pool, _cap(ctx.deps), store_uuid)
         except Exception as error:
             logger.bind(store_id=store_id).warning(f"upsert_store_product failed: {error}")
             return {"error": f"upsert_store_product failed: {error}"}
@@ -3187,7 +3308,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             if match is not None:
                 product = await update_store_product(
                     database.pool,
-                    ctx.deps.user_id,
+                    _cap(ctx.deps),
                     match.id,
                     StoreProductUpdate(
                         product_name=product_name,
@@ -3199,7 +3320,7 @@ def register_meal_tools(agent: Agent[AgentDeps, str], database: Database | None)
             else:
                 product = await add_store_product(
                     database.pool,
-                    ctx.deps.user_id,
+                    _cap(ctx.deps),
                     store_uuid,
                     StoreProductCreate(
                         ingredient_name=ingredient_name,

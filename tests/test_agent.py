@@ -23,6 +23,12 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from cherryai_api.agent import AgentDeps, stream_turn
+from cherryai_api.authz import Capability
+
+
+def _cap(user_id: uuid.UUID) -> Capability:
+    """Personal-context capability for tests (no family)."""
+    return Capability(user_id=user_id, family_id=None, role=None, scopes=frozenset())
 
 
 class _FakeMemory:
@@ -268,8 +274,8 @@ async def test_get_pantry_tool_scopes_to_deps_user(pool, make_user, monkeypatch)
 
     seen: dict = {}
 
-    async def fake_list_pantry_items(pool_arg, owner_id):
-        seen["owner_id"] = owner_id
+    async def fake_list_pantry_items(pool_arg, capability):
+        seen["capability"] = capability
         return []
 
     monkeypatch.setattr(meals_mod, "list_pantry_items", fake_list_pantry_items)
@@ -281,7 +287,7 @@ async def test_get_pantry_tool_scopes_to_deps_user(pool, make_user, monkeypatch)
     model = FunctionModel(function=_sequential_tool_responder([("get_pantry", {})]))
     await agent.run("what's in my pantry?", deps=deps, model=model)
 
-    assert seen["owner_id"] == deps.user_id
+    assert seen["capability"].user_id == deps.user_id
 
 
 @pytest.mark.asyncio
@@ -309,7 +315,7 @@ async def test_get_recipe_tool_is_owner_scoped(pool, make_user):
 
     alice = await make_user("ztest-agent-recipe-alice@example.com")
     bob = await make_user("ztest-agent-recipe-bob@example.com")
-    recipe = await create_recipe(pool, alice["id"], RecipeCreate(name="Ztest Agent Recipe"))
+    recipe = await create_recipe(pool, _cap(alice["id"]), RecipeCreate(name="Ztest Agent Recipe"))
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     model = FunctionModel(
@@ -351,7 +357,7 @@ async def test_create_recipe_tool_persists_to_database(pool, make_user):
     returned = _tool_returns(result)[0]
     assert returned["name"] == "Ztest Agent Pasta"
     assert returned["ingredients"][0]["name"] == "Ztest Agent Noodles"
-    recipes = await list_recipes(pool, user["id"])
+    recipes = await list_recipes(pool, _cap(user["id"]))
     assert any(r.name == "Ztest Agent Pasta" for r in recipes)
 
 
@@ -363,7 +369,7 @@ async def test_update_recipe_tool_persists_change(pool, make_user):
     from cherryai_api.settings import Settings
 
     user = await make_user("ztest-agent-update-recipe@example.com")
-    recipe = await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Old Name"))
+    recipe = await create_recipe(pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Old Name"))
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
@@ -373,7 +379,7 @@ async def test_update_recipe_tool_persists_change(pool, make_user):
     result = await agent.run("rename that recipe", deps=deps, model=model)
 
     assert _tool_returns(result)[0]["name"] == "Ztest Agent New Name"
-    updated = await get_recipe(pool, user["id"], recipe.id)
+    updated = await get_recipe(pool, _cap(user["id"]), recipe.id)
     assert updated is not None and updated.name == "Ztest Agent New Name"
 
 
@@ -404,10 +410,12 @@ async def test_assign_and_get_meal_plan_and_remove_recipe_tools(pool, make_user)
     user = await make_user("ztest-agent-assign@example.com")
     plan = await create_meal_plan(
         pool,
-        user["id"],
+        _cap(user["id"]),
         MealPlanCreate(name="Ztest Agent Assign Plan", week_start=date(2026, 7, 20)),
     )
-    recipe = await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Assign Recipe"))
+    recipe = await create_recipe(
+        pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Assign Recipe")
+    )
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
@@ -468,17 +476,24 @@ async def test_mark_and_unmark_meal_consumed_tools(pool, make_user):
     user = await make_user("ztest-agent-consume@example.com")
     plan = await create_meal_plan(
         pool,
-        user["id"],
+        _cap(user["id"]),
         MealPlanCreate(name="Ztest Agent Consume Plan", week_start=date(2026, 7, 20)),
     )
-    recipe = await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Consume Recipe"))
-    await add_ingredient(
-        pool, recipe.id, RecipeIngredientCreate(name="Ztest Agent Flour", quantity=1.0, unit="cup")
+    recipe = await create_recipe(
+        pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Consume Recipe")
     )
-    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
-    await add_recipe_to_day(pool, user["id"], day.id, recipe.id)
+    await add_ingredient(
+        pool,
+        _cap(user["id"]),
+        recipe.id,
+        RecipeIngredientCreate(name="Ztest Agent Flour", quantity=1.0, unit="cup"),
+    )
+    day = await upsert_plan_day(
+        pool, _cap(user["id"]), plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20))
+    )
+    await add_recipe_to_day(pool, _cap(user["id"]), day.id, recipe.id)
     await upsert_pantry_item(
-        pool, user["id"], PantryItemCreate(name="Ztest Agent Flour", quantity=5.0, unit="cup")
+        pool, _cap(user["id"]), PantryItemCreate(name="Ztest Agent Flour", quantity=5.0, unit="cup")
     )
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
@@ -535,17 +550,22 @@ async def test_generate_shopping_list_tool_resolves_plan_names_case_insensitivel
     user = await make_user("ztest-agent-generate-name@example.com")
     plan = await create_meal_plan(
         pool,
-        user["id"],
+        _cap(user["id"]),
         MealPlanCreate(name="Ztest Agent Name Plan", week_start=date(2026, 7, 20)),
     )
-    recipe = await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Name Recipe"))
+    recipe = await create_recipe(
+        pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Name Recipe")
+    )
     await add_ingredient(
         pool,
+        _cap(user["id"]),
         recipe.id,
         RecipeIngredientCreate(name="Ztest Agent Name Milk", quantity=1.0, unit="gal"),
     )
-    day = await upsert_plan_day(pool, plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20)))
-    await add_recipe_to_day(pool, user["id"], day.id, recipe.id)
+    day = await upsert_plan_day(
+        pool, _cap(user["id"]), plan.id, MealPlanDayCreate(day_date=date(2026, 7, 20))
+    )
+    await add_recipe_to_day(pool, _cap(user["id"]), day.id, recipe.id)
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
@@ -583,7 +603,7 @@ async def test_shopping_list_tools_round_trip(pool, make_user):
 
     user = await make_user("ztest-agent-shopping@example.com")
     slist = await create_shopping_list(
-        pool, user["id"], ShoppingListCreate(name="Ztest Agent List")
+        pool, _cap(user["id"]), ShoppingListCreate(name="Ztest Agent List")
     )
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
@@ -620,7 +640,7 @@ async def test_store_tools_round_trip(pool, make_user):
     from cherryai_api.settings import Settings
 
     user = await make_user("ztest-agent-stores@example.com")
-    store = await create_store(pool, user["id"], StoreCreate(name="Ztest Agent Store"))
+    store = await create_store(pool, _cap(user["id"]), StoreCreate(name="Ztest Agent Store"))
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
@@ -688,7 +708,7 @@ async def test_set_pantry_item_tool_writes_to_database(pool, make_user):
     returned = _tool_returns(result)[0]
     assert returned["name"] == "Ztest Agent Rice"
     assert returned["quantity"] == 2.0
-    items = await list_pantry_items(pool, user["id"])
+    items = await list_pantry_items(pool, _cap(user["id"]))
     assert any(i.name == "Ztest Agent Rice" and i.quantity == 2.0 for i in items)
 
 
@@ -700,8 +720,8 @@ async def test_search_recipes_tool_filters_by_name(pool, make_user):
     from cherryai_api.settings import Settings
 
     user = await make_user("ztest-agent-search-recipes@example.com")
-    await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Tacos"))
-    await create_recipe(pool, user["id"], RecipeCreate(name="Ztest Agent Salad"))
+    await create_recipe(pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Tacos"))
+    await create_recipe(pool, _cap(user["id"]), RecipeCreate(name="Ztest Agent Salad"))
 
     agent = build_agent(Settings(ollama_api_key="x"), database=_DatabaseStub(pool))
     deps = AgentDeps(memory=_FakeMemory(), user_id=user["id"])
