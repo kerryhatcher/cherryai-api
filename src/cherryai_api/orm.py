@@ -32,6 +32,9 @@ def sqlalchemy_url() -> str:
     providers like DigitalOcean supply) to ``ssl``: SQLAlchemy's asyncpg
     dialect forwards unrecognized query params straight through as kwargs to
     ``asyncpg.connect()``, which has no ``sslmode`` parameter, only ``ssl``.
+
+    Uses the superuser ``database_url`` — this is the migration connection.
+    Runtime queries use ``app_sqlalchemy_url()`` instead.
     """
     url = get_settings().database_url
     if url.startswith("postgresql://"):
@@ -43,7 +46,24 @@ def sqlalchemy_url() -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-engine = create_async_engine(sqlalchemy_url())
+def app_sqlalchemy_url() -> str:
+    """Return the runtime (non-superuser) SQLAlchemy URL.
+
+    Falls back to ``sqlalchemy_url()`` when ``app_database_url`` is unset,
+    so existing deployments without the app role continue to work.
+    """
+    settings = get_settings()
+    url = settings.app_database_url or settings.database_url
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    if "sslmode" in query:
+        query["ssl"] = query.pop("sslmode")
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+engine = create_async_engine(app_sqlalchemy_url())
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
 

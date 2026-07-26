@@ -36,6 +36,14 @@ class Settings(BaseSettings):
         default="postgresql://cherryai:cherryai_dev@localhost:5432/cherryai",
         repr=False,
     )
+    # Non-superuser connection for runtime operations so Postgres RLS
+    # policies actually take effect (superusers are unconditionally
+    # exempt). Defaults to database_url for backward compatibility;
+    # set to a NOSUPERUSER NOBYPASSRLS role in dev/prod to enable RLS.
+    app_database_url: str = Field(
+        default="",
+        repr=False,
+    )
     # Run `alembic upgrade head` in-process at API startup, before the
     # asyncpg pool opens or the agent is built (see db_migrations.py). The
     # DO App Platform PRE_DEPLOY migration job proved unreliable, so this is
@@ -105,6 +113,12 @@ class Settings(BaseSettings):
     def asyncpg_dsn(self) -> str:
         """Return a DSN asyncpg accepts (it rejects the ``+driver`` suffix)."""
         return self.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+    @property
+    def app_asyncpg_dsn(self) -> str:
+        """Return the runtime (non-superuser) DSN, falling back to asyncpg_dsn."""
+        base = self.app_database_url or self.database_url
+        return base.replace("postgresql+asyncpg://", "postgresql://")
 
 
 @lru_cache

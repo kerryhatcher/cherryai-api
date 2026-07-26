@@ -180,6 +180,17 @@ async def delete_family(
     ``'keep_personal'`` converts them to the organizer's personal rows first,
     suffixing colliding wiki slugs (spec §3)."""
     if content == "keep_personal":
+        # Stamp RLS GUCs so the UPDATEs below pass the wiki_entries RLS policy.
+        # The delete-family route checks the caller's role but doesn't call
+        # get_capability, so the ORM's after_begin listener has no validated
+        # family id to stamp — and without it, the RLS WITH CHECK policy
+        # rejects the reassignment UPDATEs (fail-closed).
+        await session.execute(
+            text(
+                "SELECT set_config('app.user_id', :u, true), set_config('app.family_id', :f, true)"
+            ),
+            {"u": str(organizer_id), "f": str(family_id)},
+        )
         # De-conflict wiki slugs against the organizer's personal pages.
         await session.execute(
             text(

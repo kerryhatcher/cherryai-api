@@ -20,7 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
 from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users_app, require_chat
-from cherryai_api.authz import assert_rls_enforced
+from cherryai_api.authz import Capability, assert_rls_enforced
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
@@ -441,7 +441,13 @@ async def send_message(
         raise HTTPException(status_code=400, detail="Message content is empty")
 
     memory = build_memory(user.memory_dataset, str(session_id))
-    deps = AgentDeps(memory=memory, user_id=user.id)
+    cap = Capability(
+        user_id=user.id,
+        family_id=None,
+        role=None,
+        scopes=frozenset(),
+    )
+    deps = AgentDeps(memory=memory, user_id=user.id, capability=cap)
 
     was_empty = await db.is_session_empty(session_id)
     await db.add_message(session_id, "user", prompt)

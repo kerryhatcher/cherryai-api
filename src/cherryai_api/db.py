@@ -169,9 +169,15 @@ def make_session_title(first_user_message: str) -> str:
     return collapsed[:_SESSION_TITLE_MAX] or "New chat"
 
 
-def build_database() -> Database:
-    """Construct the Database using the asyncpg-compatible DSN from settings."""
-    return Database(get_settings().asyncpg_dsn)
+def build_database(*, use_app_role: bool = True) -> Database:
+    """Construct the Database.
+
+    When ``use_app_role`` is True (the default), uses ``app_asyncpg_dsn`` so
+    RLS policies take effect on the asyncpg pool. Tests pass ``False`` to
+    get the superuser connection they need for DDL.
+    """
+    dsn = get_settings().app_asyncpg_dsn if use_app_role else get_settings().asyncpg_dsn
+    return Database(dsn)
 
 
 def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:  # pragma: no cover

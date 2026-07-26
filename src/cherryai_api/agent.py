@@ -25,6 +25,7 @@ from pydantic_ai.messages import TextPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
+from cherryai_api.authz import Capability
 from cherryai_api.calendar import (
     create_event as create_calendar_event_fn,
 )
@@ -63,10 +64,11 @@ from cherryai_api.workflows import WorkflowRuntime, fire_and_forget_triage
 
 @dataclass
 class AgentDeps:
-    """Per-request context: whose memory, and which user's data to search."""
+    """Per-request context: whose memory, which user's data to search."""
 
     memory: CogneeMemory
     user_id: uuid.UUID
+    capability: Capability | None = None
 
 
 # Tracks how many times search_memory has run within a single agent turn so a
@@ -311,7 +313,13 @@ def build_agent(
         if database is None:
             return "search_wiki is unavailable: no database is configured."
         try:
-            hits = await search_entries(database.pool, ctx.deps.user_id, query)
+            cap = ctx.deps.capability or Capability(
+                user_id=ctx.deps.user_id,
+                family_id=None,
+                role=None,
+                scopes=frozenset(),
+            )
+            hits = await search_entries(database.pool, cap, query)
         except Exception as error:
             logger.bind(query=query).warning(f"search_wiki failed: {error}")
             return f"search_wiki failed: {error}"
