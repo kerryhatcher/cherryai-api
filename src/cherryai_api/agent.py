@@ -260,15 +260,19 @@ def build_agent(
         deps_type=AgentDeps,
     )
 
-    @agent.tool_plain
-    async def web_search(query: str) -> str:
+    @agent.tool
+    async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:
         """Search the web for current information. Returns compact text results."""
+        if ctx.deps.capability and not ctx.deps.capability.has("web"):
+            return "Web search is not available for this account."
         logger.bind(query=query).debug("web_search")
         return await run_web_search(query, settings)
 
-    @agent.tool_plain
-    async def web_fetch(url: str) -> str:
+    @agent.tool
+    async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
         """Fetch a URL and return its readable text, truncated sensibly."""
+        if ctx.deps.capability and not ctx.deps.capability.has("web"):
+            return "Web fetch is not available for this account."
         logger.bind(url=url).debug("web_fetch")
         try:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:

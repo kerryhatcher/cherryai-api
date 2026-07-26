@@ -19,8 +19,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from cherryai_api.admin import router as admin_router
 from cherryai_api.agent import AgentDeps, build_agent, run_turn, stream_turn, strip_leaked_reasoning
+from cherryai_api.agent_audit import log_tool_call
 from cherryai_api.auth import auth_backend, current_verified_user, fastapi_users_app, require_chat
-from cherryai_api.authz import Capability, assert_rls_enforced
+from cherryai_api.authz import Capability, assert_rls_enforced, get_capability
 from cherryai_api.calendar import router as calendar_router
 from cherryai_api.contacts import router as contacts_router
 from cherryai_api.db import build_database, make_session_title
@@ -427,8 +428,15 @@ async def send_message(
     session_id: uuid.UUID,
     body: SendMessageRequest,
     user: User = Depends(require_chat),  # noqa: B008
+    capability: Capability = Depends(get_capability),  # noqa: B008
 ):
     """Persist the user message and stream the assistant reply as SSE."""
+    # Chat gate: child sessions with chat disabled get 403.
+    if not capability.has("chat"):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "module_disabled", "module": "chat"},
+        )
     db = app.state.db
     agent = app.state.agent
 
@@ -441,13 +449,12 @@ async def send_message(
         raise HTTPException(status_code=400, detail="Message content is empty")
 
     memory = build_memory(user.memory_dataset, str(session_id))
-    cap = Capability(
-        user_id=user.id,
-        family_id=None,
-        role=None,
-        scopes=frozenset(),
-    )
-    deps = AgentDeps(memory=memory, user_id=user.id, capability=cap)
+    deps = AgentDeps(memory=memory, user_id=user.id, capability=capability)
+
+    # Audit: log agent activity for child sessions.
+    is_child = capability.role == "child" if capability.role else False
+    if is_child:
+        await log_tool_call(db.pool, session_id, user.id, "chat.message", body.content[:100])
 
     was_empty = await db.is_session_empty(session_id)
     await db.add_message(session_id, "user", prompt)
