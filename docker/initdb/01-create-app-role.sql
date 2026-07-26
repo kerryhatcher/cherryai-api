@@ -9,6 +9,8 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'cherryai_app') THEN
         CREATE ROLE cherryai_app LOGIN PASSWORD 'cherryai_app_dev' NOSUPERUSER NOBYPASSRLS;
+        -- IMPORTANT: For production, DO's secret encryption strips special
+        -- characters. Use only alphanumeric (a-zA-Z0-9) passwords.
     END IF;
 END
 $$;

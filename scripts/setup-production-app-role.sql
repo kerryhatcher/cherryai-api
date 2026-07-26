@@ -23,6 +23,9 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'cherryai_app') THEN
         CREATE ROLE cherryai_app LOGIN PASSWORD 'CHANGE_ME_TO_A_STRONG_PASSWORD' NOSUPERUSER NOBYPASSRLS;
+        -- IMPORTANT: DO's secret encryption strips special characters from SECRET
+        -- type env vars. The password MUST be alphanumeric only (a-zA-Z0-9).
+        -- DO NOT use characters like / + = in the password.
     ELSE
         RAISE NOTICE 'Role cherryai_app already exists — skipping creation.';
     END IF;
