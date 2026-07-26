@@ -38,6 +38,11 @@ services:
     envs:
       - key: DATABASE_URL
         type: SECRET
+      # Runtime non-superuser connection for RLS enforcement. Must be a
+      # NOSUPERUSER NOBYPASSRLS role (see scripts/setup-production-app-role.sql).
+      # Migrations still use DATABASE_URL (superuser); this is for runtime queries.
+      - key: APP_DATABASE_URL
+        type: SECRET
       - key: AUTH_SECRET
         type: SECRET
       - key: AUTH_COOKIE_SECURE

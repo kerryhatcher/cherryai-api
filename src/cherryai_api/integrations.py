@@ -114,6 +114,10 @@ class ValidateResult(BaseModel):
     detail: str = ""
 
 
+class IntegrationsStatus(BaseModel):
+    fastmail_configured: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -189,6 +193,16 @@ async def _validate_fastmail_creds(username: str, app_password: str) -> tuple[bo
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+
+
+@router.get("/status", response_model=IntegrationsStatus)
+async def integrations_status(
+    user: User = Depends(current_verified_user),  # noqa: B008
+    session: AsyncSession = Depends(get_async_session),  # noqa: B008
+) -> IntegrationsStatus:
+    """Lightweight status check — which integrations does the user have configured?"""
+    cred = await get_active_credential_for_user(session, user.id)
+    return IntegrationsStatus(fastmail_configured=cred is not None)
 
 
 @router.get("/fastmail", response_model=list[FastmailCredentialOut])

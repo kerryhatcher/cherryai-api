@@ -53,7 +53,13 @@ async def test_create_list_rename_delete_family(actor, api_client):
     fam_id = created.json()["id"]
 
     listed = (await api_client.get("/api/families")).json()
-    assert [f for f in listed if f["id"] == fam_id][0]["role"] == "organizer"
+    match = [f for f in listed if f["id"] == fam_id][0]
+    assert match["role"] == "organizer"
+    assert match["perm_wiki"] == "edit"
+    assert match["perm_meals"] == "edit"
+    assert match["perm_planner"] == "edit"
+    assert match["chat_enabled"] is True
+    assert match["web_enabled"] is True
 
     renamed = await api_client.patch(f"/api/families/{fam_id}", json={"name": "Ztest Renamed"})
     assert renamed.status_code == 200

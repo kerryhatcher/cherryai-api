@@ -375,11 +375,16 @@ class ActiveFamily(BaseModel):
 
 
 class MembershipOut(BaseModel):
-    """A family the caller belongs to, with their role in it."""
+    """A family the caller belongs to, with their role and per-module permissions."""
 
     id: uuid.UUID
     name: str
     role: str
+    perm_wiki: str = PERM_NONE
+    perm_meals: str = PERM_NONE
+    perm_planner: str = PERM_NONE
+    chat_enabled: bool = True
+    web_enabled: bool = True
 
 
 class MemberAdd(BaseModel):
@@ -420,6 +425,8 @@ class MemberOut(BaseModel):
     """A family member's role and per-module permissions/gates."""
 
     user_id: uuid.UUID
+    display_name: str = ""
+    email: str = ""
     role: str
     perm_wiki: str
     perm_meals: str
@@ -449,7 +456,16 @@ async def list_my_families(
 ):
     """List every family the caller belongs to, with their role in each."""
     return [
-        MembershipOut(id=family.id, name=family.name, role=m.role)
+        MembershipOut(
+            id=family.id,
+            name=family.name,
+            role=m.role,
+            perm_wiki=m.perm_wiki,
+            perm_meals=m.perm_meals,
+            perm_planner=m.perm_planner,
+            chat_enabled=m.chat_enabled,
+            web_enabled=m.web_enabled,
+        )
         for family, m in await list_memberships(session, user.id)
     ]
 
@@ -462,7 +478,19 @@ async def create_family_route(
 ):
     """Create a family with the caller as its organizer."""
     family = await create_family(session, name=payload.name, organizer_id=user.id)
-    return MembershipOut(id=family.id, name=family.name, role=FAMILY_ROLE_ORGANIZER)
+    membership = await get_membership(session, family.id, user.id)
+    if membership is None:
+        raise HTTPException(status_code=500)  # pragma: no cover
+    return MembershipOut(
+        id=family.id,
+        name=family.name,
+        role=FAMILY_ROLE_ORGANIZER,
+        perm_wiki=membership.perm_wiki,
+        perm_meals=membership.perm_meals,
+        perm_planner=membership.perm_planner,
+        chat_enabled=membership.chat_enabled,
+        web_enabled=membership.web_enabled,
+    )
 
 
 @families_router.post("/active", status_code=204)
@@ -534,15 +562,26 @@ async def list_members_route(
         (FAMILY_ROLE_ORGANIZER, FAMILY_ROLE_ADMIN, FAMILY_ROLE_ADULT, FAMILY_ROLE_CHILD),
     )
     rows = (
-        (
-            await session.execute(
-                select(FamilyMembership).where(FamilyMembership.family_id == family_id)
-            )
+        await session.execute(
+            select(FamilyMembership, User.display_name, User.email)
+            .join(User, User.id == FamilyMembership.user_id)
+            .where(FamilyMembership.family_id == family_id)
         )
-        .scalars()
-        .all()
-    )
-    return [MemberOut.model_validate(m, from_attributes=True) for m in rows]
+    ).all()
+    return [
+        MemberOut(
+            user_id=m.FamilyMembership.user_id,
+            display_name=m.display_name,
+            email=m.email,
+            role=m.FamilyMembership.role,
+            perm_wiki=m.FamilyMembership.perm_wiki,
+            perm_meals=m.FamilyMembership.perm_meals,
+            perm_planner=m.FamilyMembership.perm_planner,
+            chat_enabled=m.FamilyMembership.chat_enabled,
+            web_enabled=m.FamilyMembership.web_enabled,
+        )
+        for m in rows
+    ]
 
 
 @families_router.post("/{family_id}/members", status_code=201, response_model=MemberOut)
