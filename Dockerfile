@@ -23,4 +23,3 @@ EXPOSE 8000
 # The migration job (see .do/app.yaml) overrides this with
 # `uv run alembic upgrade head` using the same image.
 CMD ["uv", "run", "cherryai", "serve", "--host", "0.0.0.0", "--port", "8000"]
-# force cache invalidation Sun Jul 26 05:30:33 PM EDT 2026
