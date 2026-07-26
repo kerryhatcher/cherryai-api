@@ -70,7 +70,7 @@ class Database:
         from cherryai_api.email import _ensure_approvals_table
         from cherryai_api.feedback import CREATE_FEEDBACK_TABLE
         from cherryai_api.meals import CREATE_MEALS_TABLES, MEALS_MIGRATIONS
-        from cherryai_api.planner import CREATE_PLANNER_TABLES
+        from cherryai_api.planner import CREATE_PLANNER_TABLES, PLANNER_MIGRATIONS
         from cherryai_api.wiki import CREATE_WIKI_TABLE
         from cherryai_api.workflows import ensure_workflow_columns
 
@@ -83,6 +83,8 @@ class Database:
             for migration in MEALS_MIGRATIONS:
                 await conn.execute(migration)
             await conn.execute(CREATE_PLANNER_TABLES)
+            for migration in PLANNER_MIGRATIONS:
+                await conn.execute(migration)
         await _ensure_approvals_table(self._pool)
         # Job-state columns + stale-'running' cleanup (crash recovery); needs its
         # own connection since ensure_workflow_columns acquires from the pool.
